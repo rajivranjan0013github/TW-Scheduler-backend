@@ -1,6 +1,12 @@
 import mongoose from 'mongoose';
 
 const ScheduledPostSchema = new mongoose.Schema({
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true,
+    index: true,
+  },
   socialAccountIds: [{
     type: mongoose.Schema.Types.ObjectId,
     ref: 'SocialAccount',

@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import SocialAccount from '../models/SocialAccount.js';
 import Folder from '../models/Folder.js';
+import User from '../models/User.js';
 
 let isConnected = false;
 
@@ -20,6 +21,14 @@ const seedDatabase = async () => {
       console.log(`🧹 Cleaned up ${cleanupResult.deletedCount} legacy mock social accounts from MongoDB.`);
     }
 
+    // Find the first user to associate seeded data with
+    const firstUser = await User.findOne().sort({ createdAt: 1 });
+    if (!firstUser) {
+      console.log('⚠️ No users found in database. Skipping seed (data will be created on first login).');
+      return;
+    }
+    const seedUserId = firstUser._id;
+
     // 2. Seed/Sync real accounts from environment variables if present
     const igToken = process.env.META_INSTAGRAM_ACCESS_TOKEN?.trim();
     const igAccountId = process.env.META_INSTAGRAM_BUSINESS_ACCOUNT_ID?.trim();
@@ -29,8 +38,9 @@ const seedDatabase = async () => {
     if (igToken && igAccountId) {
       console.log('🔄 Syncing real Instagram Business Account credentials from env to MongoDB...');
       await SocialAccount.findOneAndUpdate(
-        { platform: 'instagram', accountId: igAccountId },
+        { userId: seedUserId, platform: 'instagram', accountId: igAccountId },
         { 
+          userId: seedUserId,
           platform: 'instagram', 
           accountId: igAccountId, 
           accessToken: igToken, 
@@ -44,8 +54,9 @@ const seedDatabase = async () => {
     if (fbToken && fbPageId) {
       console.log('🔄 Syncing real Facebook Page credentials from env to MongoDB...');
       await SocialAccount.findOneAndUpdate(
-        { platform: 'facebook', accountId: fbPageId },
+        { userId: seedUserId, platform: 'facebook', accountId: fbPageId },
         { 
+          userId: seedUserId,
           platform: 'facebook', 
           accountId: fbPageId, 
           accessToken: fbToken, 
@@ -57,14 +68,14 @@ const seedDatabase = async () => {
       );
     }
 
-    // 3. Seed Folders if empty
-    const folderCount = await Folder.countDocuments();
+    // 3. Seed Folders if this user has none
+    const folderCount = await Folder.countDocuments({ userId: seedUserId });
     if (folderCount === 0) {
       console.log('🌱 Seeding default folders in MongoDB...');
       await Folder.insertMany([
-        { name: 'Summer Reels' },
-        { name: 'Product Launches' },
-        { name: 'Behind The Scenes' }
+        { userId: seedUserId, name: 'Summer Reels' },
+        { userId: seedUserId, name: 'Product Launches' },
+        { userId: seedUserId, name: 'Behind The Scenes' }
       ]);
     }
   } catch (error) {

@@ -1,6 +1,12 @@
 import mongoose from 'mongoose';
 
 const MediaSchema = new mongoose.Schema({
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true,
+    index: true,
+  },
   folderId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Folder',

@@ -94,7 +94,8 @@ export const publishPostJob = async (postId) => {
             account.accountId,
             mainMedia.url,
             mainMedia.type,
-            post.caption
+            post.caption,
+            account.authProvider
           );
         } else if (account.platform === 'facebook') {
           publishedId = await publishToFacebook(
@@ -123,6 +124,7 @@ export const publishPostJob = async (postId) => {
 
   } catch (error) {
     console.error(`❌ Error publishing post ${postId}:`, error.message);
+    console.error(error.stack);
     if (post) {
       if (!isConnected) {
         post.status = 'failed';

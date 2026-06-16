@@ -16,6 +16,8 @@ import accountRoutes from './src/routes/accounts.js';
 import mediaRoutes from './src/routes/media.js';
 import schedulerRoutes from './src/routes/scheduler.js';
 import commentRoutes from './src/routes/comments.js';
+import { protect } from './src/middleware/auth.js';
+import ScheduledPost from './src/models/ScheduledPost.js';
 
 // Configure __dirname for ES Modules
 const __filename = fileURLToPath(import.meta.url);
@@ -47,9 +49,14 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Direct hook endpoint to trigger background publishing for testing manually
-app.post('/api/scheduler/publish-now/:id', async (req, res) => {
+// Direct hook endpoint to trigger background publishing (now protected)
+app.post('/api/scheduler/publish-now/:id', protect, async (req, res) => {
   try {
+    // Verify the post belongs to the requesting user
+    const post = await ScheduledPost.findOne({ _id: req.params.id, userId: req.user._id });
+    if (!post) {
+      return res.status(404).json({ message: 'Post not found' });
+    }
     await publishPostJob(req.params.id);
     res.status(200).json({ message: 'Publishing triggered successfully' });
   } catch (error) {

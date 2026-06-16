@@ -29,7 +29,7 @@ router.get('/folders', protect, async (req, res) => {
     if (!isConnected) {
       return res.status(200).json(mockStore.folders);
     }
-    const folders = await Folder.find();
+    const folders = await Folder.find({ userId: req.user._id });
     res.status(200).json(folders);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -55,7 +55,7 @@ router.post('/folders', protect, authorize('owner', 'admin', 'editor'), async (r
       return res.status(201).json(newFolder);
     }
 
-    const folder = await Folder.create({ name, parentFolderId: parentFolderId || null });
+    const folder = await Folder.create({ userId: req.user._id, name, parentFolderId: parentFolderId || null });
     res.status(201).json(folder);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -83,14 +83,14 @@ router.delete('/folders/:id', protect, authorize('owner', 'admin'), async (req, 
       return res.status(200).json({ message: 'Folder deleted successfully' });
     }
 
-    const folder = await Folder.findById(id);
+    const folder = await Folder.findOne({ _id: id, userId: req.user._id });
     if (!folder) {
       return res.status(404).json({ message: 'Folder not found' });
     }
 
-    await Folder.findByIdAndDelete(id);
+    await Folder.deleteOne({ _id: id, userId: req.user._id });
     // Update media referencing this folder to null
-    await Media.updateMany({ folderId: id }, { folderId: null });
+    await Media.updateMany({ userId: req.user._id, folderId: id }, { folderId: null });
     res.status(200).json({ message: 'Folder deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -121,8 +121,7 @@ router.get('/', protect, async (req, res) => {
       filtered.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
       return res.status(200).json(filtered);
     }
-
-    const query = {};
+    const query = { userId: req.user._id };
     if (folderId) {
       query.folderId = folderId === 'root' ? null : folderId;
     }
@@ -177,6 +176,7 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
     }
 
     const media = await Media.create({
+      userId: req.user._id,
       folderId: folderId && folderId !== 'null' ? folderId : null,
       name: req.file.originalname,
       type: mediaType,
@@ -213,13 +213,13 @@ router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => 
       return res.status(200).json({ message: 'Media asset deleted successfully' });
     }
 
-    const media = await Media.findById(id);
+    const media = await Media.findOne({ _id: id, userId: req.user._id });
     if (!media) {
       return res.status(404).json({ message: 'Media not found' });
     }
 
     await deleteFile(media.storageKey);
-    await Media.findByIdAndDelete(id);
+    await Media.deleteOne({ _id: id, userId: req.user._id });
     res.status(200).json({ message: 'Media asset deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });

@@ -1,6 +1,12 @@
 import mongoose from 'mongoose';
 
 const SocialAccountSchema = new mongoose.Schema({
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true,
+    index: true,
+  },
   platform: {
     type: String,
     enum: ['instagram', 'facebook'],
@@ -9,7 +15,6 @@ const SocialAccountSchema = new mongoose.Schema({
   accountId: {
     type: String,
     required: true,
-    unique: true,
   },
   name: {
     type: String,
@@ -22,6 +27,14 @@ const SocialAccountSchema = new mongoose.Schema({
     type: String,
     required: true,
   },
+  authProvider: {
+    type: String,
+    enum: ['facebook', 'instagram'],
+    default: 'facebook',
+  },
+  tokenExpiresAt: {
+    type: Date,
+  },
   avatarUrl: {
     type: String,
   },
@@ -30,5 +43,8 @@ const SocialAccountSchema = new mongoose.Schema({
     default: true,
   },
 }, { timestamps: true });
+
+// Same platform account can be connected by different users, but not duplicated for the same user
+SocialAccountSchema.index({ userId: 1, accountId: 1 }, { unique: true });
 
 export default mongoose.models.SocialAccount || mongoose.model('SocialAccount', SocialAccountSchema);

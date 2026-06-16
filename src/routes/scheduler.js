@@ -18,7 +18,7 @@ router.get('/', protect, async (req, res) => {
       return res.status(200).json(sorted);
     }
 
-    const posts = await ScheduledPost.find()
+    const posts = await ScheduledPost.find({ userId: req.user._id })
       .populate('socialAccountIds')
       .populate('mediaIds')
       .sort({ scheduledAt: 1 });
@@ -56,6 +56,7 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
     }
 
     const post = await ScheduledPost.create({
+      userId: req.user._id,
       socialAccountIds,
       mediaIds,
       caption,
@@ -111,6 +112,7 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
           createdPosts.push(newPost);
         } else {
           const post = await ScheduledPost.create({
+            userId: req.user._id,
             socialAccountIds: [accountId],
             mediaIds: [mediaId],
             caption: caption || '',
@@ -162,7 +164,7 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
       return res.status(200).json(post);
     }
 
-    const post = await ScheduledPost.findById(id);
+    const post = await ScheduledPost.findOne({ _id: id, userId: req.user._id });
     if (!post) {
       return res.status(404).json({ message: 'Post not found' });
     }
@@ -176,7 +178,7 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
     
     await post.save();
     
-    const populated = await ScheduledPost.findById(id)
+    const populated = await ScheduledPost.findOne({ _id: id, userId: req.user._id })
       .populate('socialAccountIds')
       .populate('mediaIds');
       
@@ -204,12 +206,12 @@ router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req
       return res.status(200).json({ message: 'Scheduled post removed successfully' });
     }
 
-    const post = await ScheduledPost.findById(id);
+    const post = await ScheduledPost.findOne({ _id: id, userId: req.user._id });
     if (!post) {
       return res.status(404).json({ message: 'Post not found' });
     }
 
-    await ScheduledPost.findByIdAndDelete(id);
+    await ScheduledPost.deleteOne({ _id: id, userId: req.user._id });
     res.status(200).json({ message: 'Scheduled post removed successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
