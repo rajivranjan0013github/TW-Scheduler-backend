@@ -626,6 +626,41 @@ router.post('/instagram-callback', protect, authorize('owner', 'admin'), async (
   }
 });
 
+// @desc    Get recent 25 published posts for all channels of the logged in user
+// @route   GET /api/accounts/posts/recent
+// @access  Private
+router.get('/posts/recent', protect, async (req, res) => {
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      return res.status(503).json({ message: 'Database disconnected.' });
+    }
+
+    const posts = await PublishedPost.find({ userId: req.user._id })
+      .sort({ publishedAt: -1 })
+      .limit(25);
+
+    const result = posts.map(post => ({
+      id: post.metaPostId,
+      accountId: post.accountId,
+      content: post.content,
+      createdAt: post.publishedAt,
+      permalink: post.permalink,
+      mediaUrl: post.mediaUrl,
+      videoUrl: post.videoUrl,
+      mediaType: post.mediaType,
+      views: post.latestViews || 0,
+      likes: post.latestLikes || 0,
+      comments: post.latestComments || 0,
+      lastSyncedAt: post.lastSyncedAt,
+    }));
+
+    res.status(200).json(result);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // @desc    Get published posts for a specific account (cached-first, 2h staleness)
 // @route   GET /api/accounts/:id/posts
 // @access  Private

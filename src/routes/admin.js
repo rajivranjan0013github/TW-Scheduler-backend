@@ -69,6 +69,13 @@ const getCampaignMetrics = async (campaign) => {
       avatarUrl: plain.avatarUrl || '',
       isConnected: Boolean(plain.isConnected),
       tokenExpiresAt: plain.tokenExpiresAt || null,
+      user: plain.userId && typeof plain.userId === 'object'
+        ? {
+          _id: plain.userId._id,
+          name: plain.userId.name || '',
+          email: plain.userId.email || '',
+        }
+        : null,
     };
   });
 
@@ -81,10 +88,15 @@ const getCampaignMetrics = async (campaign) => {
       last7DaysPosts: 0,
       thisMonthPosts: 0,
       lifetimeViews: 0,
+      lifetimeAccountInsight: 0,
       todayViews: 0,
+      todayAccountInsight: 0,
       yesterdayViews: 0,
+      yesterdayAccountInsight: 0,
       last7DaysViews: 0,
+      last7DaysAccountInsight: 0,
       thisMonthViews: 0,
+      thisMonthAccountInsight: 0,
       latestLikes: 0,
       latestComments: 0,
       todayLikes: 0,
@@ -122,10 +134,15 @@ const getCampaignMetrics = async (campaign) => {
       last7DaysPosts: 0,
       thisMonthPosts: 0,
       lifetimeViews: 0,
+      lifetimeAccountInsight: 0,
       todayViews: 0,
+      todayAccountInsight: 0,
       yesterdayViews: 0,
+      yesterdayAccountInsight: 0,
       last7DaysViews: 0,
+      last7DaysAccountInsight: 0,
       thisMonthViews: 0,
+      thisMonthAccountInsight: 0,
       latestLikes: 0,
       latestComments: 0,
       todayLikes: 0,
@@ -140,6 +157,57 @@ const getCampaignMetrics = async (campaign) => {
     },
   ]));
 
+  const accountInsights = await Insight.find({ accountId: { $in: accountIds } }).lean();
+  const accountInsightTotals = accountInsights.reduce((map, insight) => {
+    const accountId = toKey(insight.accountId);
+    if (!map.has(accountId)) {
+      map.set(accountId, {
+        lifetimeAccountInsight: 0,
+        todayAccountInsight: 0,
+        yesterdayAccountInsight: 0,
+        last7DaysAccountInsight: 0,
+        thisMonthAccountInsight: 0,
+      });
+    }
+
+    const totals = map.get(accountId);
+    const value = Number(insight.value || 0);
+    const insightDate = insight.dateStr ? new Date(`${insight.dateStr}T00:00:00.000Z`) : null;
+
+    totals.lifetimeAccountInsight += value;
+    if (insight.dateStr === dateKey(todayStart)) totals.todayAccountInsight += value;
+    if (insight.dateStr === dateKey(yesterdayStart)) totals.yesterdayAccountInsight += value;
+    if (insightDate && insightDate >= sevenDaysAgo) totals.last7DaysAccountInsight += value;
+    if (insightDate && insightDate >= monthStart) totals.thisMonthAccountInsight += value;
+
+    return map;
+  }, new Map());
+
+  accountRowsMap.forEach((row, accountId) => {
+    const totals = accountInsightTotals.get(accountId);
+    if (!totals) return;
+
+    row.lifetimeAccountInsight = totals.lifetimeAccountInsight;
+    row.todayAccountInsight = totals.todayAccountInsight;
+    row.yesterdayAccountInsight = totals.yesterdayAccountInsight;
+    row.last7DaysAccountInsight = totals.last7DaysAccountInsight;
+    row.thisMonthAccountInsight = totals.thisMonthAccountInsight;
+  });
+
+  const accountInsightSummary = Array.from(accountInsightTotals.values()).reduce((sum, item) => ({
+    lifetimeAccountInsight: sum.lifetimeAccountInsight + item.lifetimeAccountInsight,
+    todayAccountInsight: sum.todayAccountInsight + item.todayAccountInsight,
+    yesterdayAccountInsight: sum.yesterdayAccountInsight + item.yesterdayAccountInsight,
+    last7DaysAccountInsight: sum.last7DaysAccountInsight + item.last7DaysAccountInsight,
+    thisMonthAccountInsight: sum.thisMonthAccountInsight + item.thisMonthAccountInsight,
+  }), {
+    lifetimeAccountInsight: 0,
+    todayAccountInsight: 0,
+    yesterdayAccountInsight: 0,
+    last7DaysAccountInsight: 0,
+    thisMonthAccountInsight: 0,
+  });
+
   if (posts.length === 0) {
     return {
       accounts: accountIds.length,
@@ -149,10 +217,15 @@ const getCampaignMetrics = async (campaign) => {
       last7DaysPosts: 0,
       thisMonthPosts: 0,
       lifetimeViews: 0,
+      lifetimeAccountInsight: accountInsightSummary.lifetimeAccountInsight,
       todayViews: 0,
+      todayAccountInsight: accountInsightSummary.todayAccountInsight,
       yesterdayViews: 0,
+      yesterdayAccountInsight: accountInsightSummary.yesterdayAccountInsight,
       last7DaysViews: 0,
+      last7DaysAccountInsight: accountInsightSummary.last7DaysAccountInsight,
       thisMonthViews: 0,
+      thisMonthAccountInsight: accountInsightSummary.thisMonthAccountInsight,
       latestLikes: 0,
       latestComments: 0,
       todayLikes: 0,
@@ -321,10 +394,15 @@ const getCampaignMetrics = async (campaign) => {
     last7DaysPosts: 0,
     thisMonthPosts: 0,
     lifetimeViews: 0,
+    lifetimeAccountInsight: Array.from(accountInsightTotals.values()).reduce((sum, item) => sum + item.lifetimeAccountInsight, 0),
     todayViews: 0,
+    todayAccountInsight: Array.from(accountInsightTotals.values()).reduce((sum, item) => sum + item.todayAccountInsight, 0),
     yesterdayViews: 0,
+    yesterdayAccountInsight: Array.from(accountInsightTotals.values()).reduce((sum, item) => sum + item.yesterdayAccountInsight, 0),
     last7DaysViews: 0,
+    last7DaysAccountInsight: Array.from(accountInsightTotals.values()).reduce((sum, item) => sum + item.last7DaysAccountInsight, 0),
     thisMonthViews: 0,
+    thisMonthAccountInsight: Array.from(accountInsightTotals.values()).reduce((sum, item) => sum + item.thisMonthAccountInsight, 0),
     latestLikes: 0,
     latestComments: 0,
     todayLikes: 0,
@@ -561,7 +639,11 @@ router.get('/campaigns', protect, authorize('owner', 'admin'), async (req, res) 
     }
 
     const campaigns = await Campaign.find()
-      .populate('accountIds', 'name username platform avatarUrl isConnected tokenExpiresAt userId')
+      .populate({
+        path: 'accountIds',
+        select: 'name username platform avatarUrl isConnected tokenExpiresAt userId',
+        populate: { path: 'userId', select: 'name email' },
+      })
       .populate('createdBy', 'name email')
       .sort({ updatedAt: -1 });
 
@@ -597,7 +679,11 @@ router.post('/campaigns', protect, authorize('owner', 'admin'), async (req, res)
     });
 
     const populated = await Campaign.findById(campaign._id)
-      .populate('accountIds', 'name username platform avatarUrl isConnected tokenExpiresAt userId')
+      .populate({
+        path: 'accountIds',
+        select: 'name username platform avatarUrl isConnected tokenExpiresAt userId',
+        populate: { path: 'userId', select: 'name email' },
+      })
       .populate('createdBy', 'name email');
 
     res.status(201).json(await serializeCampaign(populated));
@@ -640,7 +726,11 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
     await campaign.save();
 
     const populated = await Campaign.findById(campaign._id)
-      .populate('accountIds', 'name username platform avatarUrl isConnected tokenExpiresAt userId')
+      .populate({
+        path: 'accountIds',
+        select: 'name username platform avatarUrl isConnected tokenExpiresAt userId',
+        populate: { path: 'userId', select: 'name email' },
+      })
       .populate('createdBy', 'name email');
 
     res.status(200).json(await serializeCampaign(populated));
