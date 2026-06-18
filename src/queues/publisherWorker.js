@@ -6,6 +6,7 @@ import ScheduledPost from '../models/ScheduledPost.js';
 import SocialAccount from '../models/SocialAccount.js';
 import Media from '../models/Media.js';
 import { publishToInstagram, publishToFacebook } from '../services/metaService.js';
+import { publishToYoutube } from '../services/youtubeService.js';
 
 // Setup BullMQ worker if Redis is connected
 let worker = null;
@@ -105,6 +106,13 @@ export const publishPostJob = async (postId) => {
             mainMedia?.type,
             post.caption
           );
+        } else if (account.platform === 'youtube') {
+          publishedId = await publishToYoutube({
+            account,
+            media: mainMedia,
+            caption: post.caption,
+            specifics: post.platformSpecifics,
+          });
         } else {
           throw new Error(`Unsupported social platform: ${account.platform}`);
         }

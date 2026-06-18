@@ -9,7 +9,7 @@ const SocialAccountSchema = new mongoose.Schema({
   },
   platform: {
     type: String,
-    enum: ['instagram', 'facebook'],
+    enum: ['instagram', 'facebook', 'youtube'],
     required: true,
   },
   accountId: {
@@ -29,14 +29,22 @@ const SocialAccountSchema = new mongoose.Schema({
   },
   authProvider: {
     type: String,
-    enum: ['facebook', 'instagram'],
+    enum: ['facebook', 'instagram', 'youtube'],
     default: 'facebook',
+  },
+  refreshToken: {
+    type: String,
   },
   tokenExpiresAt: {
     type: Date,
   },
+  scopes: [String],
   avatarUrl: {
     type: String,
+  },
+  metadata: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {},
   },
   isConnected: {
     type: Boolean,

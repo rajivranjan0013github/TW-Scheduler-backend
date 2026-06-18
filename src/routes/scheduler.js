@@ -3,6 +3,7 @@ import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import ScheduledPost from '../models/ScheduledPost.js';
 import { protect, authorize } from '../middleware/auth.js';
+import { addPostToQueue, removePostFromQueue } from '../queues/publisherQueue.js';
 
 const router = express.Router();
 
@@ -63,6 +64,7 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
       scheduledAt: scheduledDate,
       platformSpecifics: platformSpecifics || { type: 'reels' },
     });
+    await addPostToQueue(post);
 
     res.status(201).json(post);
   } catch (error) {
@@ -74,7 +76,7 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
 // @route   POST /api/scheduler/bulk
 // @access  Private (Owner, Admin, Editor)
 router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
-  const { socialAccountIds, mediaIds, caption, startDate, intervalHours, type } = req.body;
+  const { socialAccountIds, mediaIds, caption, startDate, intervalHours, type, platformSpecifics } = req.body;
 
   if (!socialAccountIds || !mediaIds || mediaIds.length === 0) {
     return res.status(400).json({ message: 'Must select social accounts and at least one media file' });
@@ -104,7 +106,7 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
             caption: caption || '',
             scheduledAt: scheduledTime,
             status: 'scheduled',
-            platformSpecifics: { type: type || 'reels' },
+            platformSpecifics: platformSpecifics || { type: type || 'reels' },
             createdAt: new Date(),
             updatedAt: new Date(),
           };
@@ -117,8 +119,9 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
             mediaIds: [mediaId],
             caption: caption || '',
             scheduledAt: scheduledTime,
-            platformSpecifics: { type: type || 'reels' },
+            platformSpecifics: platformSpecifics || { type: type || 'reels' },
           });
+          await addPostToQueue(post);
           createdPosts.push(post);
         }
 
@@ -177,6 +180,11 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
     if (status) post.status = status;
     
     await post.save();
+
+    await removePostFromQueue(post._id);
+    if (post.status === 'scheduled') {
+      await addPostToQueue(post);
+    }
     
     const populated = await ScheduledPost.findOne({ _id: id, userId: req.user._id })
       .populate('socialAccountIds')
@@ -211,6 +219,7 @@ router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req
       return res.status(404).json({ message: 'Post not found' });
     }
 
+    await removePostFromQueue(post._id);
     await ScheduledPost.deleteOne({ _id: id, userId: req.user._id });
     res.status(200).json({ message: 'Scheduled post removed successfully' });
   } catch (error) {

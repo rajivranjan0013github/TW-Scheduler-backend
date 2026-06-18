@@ -3,6 +3,7 @@ import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import SocialAccount from '../models/SocialAccount.js';
 import { protect, authorize } from '../middleware/auth.js';
+import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount } from '../services/youtubeService.js';
 
 const router = express.Router();
 const insightSkipCache = new Map();
@@ -177,6 +178,54 @@ router.post('/connect', protect, authorize('owner', 'admin'), async (req, res) =
 
     res.status(201).json(account);
   } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Get YouTube OAuth URL
+// @route   GET /api/accounts/youtube/auth-url
+// @access  Private (Owner, Admin)
+router.get('/youtube/auth-url', protect, authorize('owner', 'admin'), async (req, res) => {
+  try {
+    const url = getYoutubeAuthUrl();
+    res.status(200).json({ url });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Callback from YouTube OAuth to connect a channel
+// @route   POST /api/accounts/youtube-callback
+// @access  Private (Owner, Admin)
+router.post('/youtube-callback', protect, authorize('owner', 'admin'), async (req, res) => {
+  const { code } = req.body;
+  if (!code) {
+    return res.status(400).json({ message: 'Authorization code is required' });
+  }
+
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      return res.status(503).json({ message: 'Database disconnected. YouTube channel connection requires MongoDB.' });
+    }
+
+    const accountPayload = await exchangeYoutubeCodeForAccount(code, req.user._id);
+    const account = await SocialAccount.findOneAndUpdate(
+      {
+        userId: req.user._id,
+        platform: 'youtube',
+        accountId: accountPayload.accountId,
+      },
+      accountPayload,
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    res.status(200).json({
+      message: `Successfully connected YouTube channel "${account.name}".`,
+      account,
+    });
+  } catch (error) {
+    console.error('❌ YouTube callback handler error:', error.message);
     res.status(500).json({ message: error.message });
   }
 });
