@@ -76,11 +76,12 @@ router.post('/login', async (req, res) => {
     let user = await User.findOne({ email });
 
     if (!user) {
+      const userCount = await User.countDocuments();
       user = await User.create({
         email,
         name,
         avatar,
-        role: 'owner',
+        role: userCount === 0 ? 'owner' : 'editor',
         googleId,
       });
     }
