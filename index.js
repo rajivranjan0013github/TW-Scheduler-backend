@@ -15,7 +15,6 @@ import authRoutes from './src/routes/auth.js';
 import accountRoutes from './src/routes/accounts.js';
 import mediaRoutes from './src/routes/media.js';
 import schedulerRoutes from './src/routes/scheduler.js';
-import commentRoutes from './src/routes/comments.js';
 import { protect } from './src/middleware/auth.js';
 import ScheduledPost from './src/models/ScheduledPost.js';
 
@@ -38,7 +37,6 @@ app.use('/api/auth', authRoutes);
 app.use('/api/accounts', accountRoutes);
 app.use('/api/media', mediaRoutes);
 app.use('/api/scheduler', schedulerRoutes);
-app.use('/api/comments', commentRoutes);
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
@@ -82,7 +80,7 @@ const startServer = async () => {
   connectRedis();
 
   // 3. Initialize background worker & queue engines
-  initQueue();
+  await initQueue();
   initWorker();
 
   // 4. Listen on PORT

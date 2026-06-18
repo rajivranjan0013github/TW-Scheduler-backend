@@ -6,10 +6,14 @@ import ScheduledPost from '../models/ScheduledPost.js';
 import SocialAccount from '../models/SocialAccount.js';
 import Media from '../models/Media.js';
 import { publishToInstagram, publishToFacebook } from '../services/metaService.js';
+import { runFeedSync } from './feedSyncWorker.js';
+import { runInsightSync } from './insightSyncWorker.js';
 import { publishToYoutube } from '../services/youtubeService.js';
 
-// Setup BullMQ worker if Redis is connected
+// Setup BullMQ workers if Redis is connected
 let worker = null;
+let feedSyncWorker = null;
+let insightSyncWorker = null;
 
 export const initWorker = () => {
   const connection = getRedisConnection();
@@ -27,6 +31,34 @@ export const initWorker = () => {
 
     worker.on('failed', (job, err) => {
       console.error(`❌ Job ${job.id} failed with error: ${err.message}`);
+    });
+
+    // Feed Sync Worker — processes feed-sync jobs every 2 hours
+    feedSyncWorker = new Worker('feed-sync-queue', async (job) => {
+      console.log('🔄 [BullMQ] Feed sync job triggered...');
+      await runFeedSync();
+    }, { connection });
+
+    feedSyncWorker.on('completed', (job) => {
+      console.log(`✅ Feed sync job ${job.id} completed.`);
+    });
+
+    feedSyncWorker.on('failed', (job, err) => {
+      console.error(`❌ Feed sync job ${job.id} failed: ${err.message}`);
+    });
+
+    // Insight Sync Worker — processes insight-sync jobs daily
+    insightSyncWorker = new Worker('insight-sync-queue', async (job) => {
+      console.log('📊 [BullMQ] Insight sync job triggered...');
+      await runInsightSync();
+    }, { connection });
+
+    insightSyncWorker.on('completed', (job) => {
+      console.log(`✅ Insight sync job ${job.id} completed.`);
+    });
+
+    insightSyncWorker.on('failed', (job, err) => {
+      console.error(`❌ Insight sync job ${job.id} failed: ${err.message}`);
     });
   }
 };

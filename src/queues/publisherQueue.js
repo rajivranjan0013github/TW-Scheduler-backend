@@ -4,11 +4,17 @@ import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import ScheduledPost from '../models/ScheduledPost.js';
 import { publishPostJob } from './publisherWorker.js';
+import { runFeedSync } from './feedSyncWorker.js';
+import { runInsightSync } from './insightSyncWorker.js';
 
 let publishQueue = null;
+let feedSyncQueue = null;
+let insightSyncQueue = null;
 let intervalFallbackId = null;
+let feedSyncIntervalId = null;
+let insightSyncIntervalId = null;
 
-export const initQueue = () => {
+export const initQueue = async () => {
   const connection = getRedisConnection();
 
   if (connection) {
@@ -20,9 +26,32 @@ export const initQueue = () => {
       }
     });
     console.log('📦 BullMQ Publisher Queue initialized.');
+
+    // Feed Sync Queue — runs every 2 hours
+    feedSyncQueue = new Queue('feed-sync-queue', {
+      connection,
+      defaultJobOptions: { removeOnComplete: true, removeOnFail: false },
+    });
+    await feedSyncQueue.add('feed-sync', {}, {
+      repeat: { pattern: '0 */2 * * *' }, // Every 2 hours
+      jobId: 'feed-sync-repeatable',
+    });
+    console.log('📦 BullMQ Feed Sync Queue initialized (every 2 hours).');
+
+    // Insight Sync Queue — runs daily at 2:00 AM IST (20:30 UTC)
+    insightSyncQueue = new Queue('insight-sync-queue', {
+      connection,
+      defaultJobOptions: { removeOnComplete: true, removeOnFail: false },
+    });
+    await insightSyncQueue.add('insight-sync', {}, {
+      repeat: { pattern: '30 20 * * *' }, // 20:30 UTC = 2:00 AM IST
+      jobId: 'insight-sync-repeatable',
+    });
+    console.log('📦 BullMQ Insight Sync Queue initialized (daily at 2:00 AM IST).');
   } else {
     console.log('⏰ Starting Sandbox local interval fallback scheduler (runs every 10 seconds).');
     startIntervalFallback();
+    startSyncFallbacks();
   }
 };
 
@@ -102,4 +131,34 @@ const startIntervalFallback = () => {
       }
     }
   }, 10000); // 10 seconds check
+};
+
+/**
+ * Fallback interval-based sync schedulers for when Redis is not available.
+ * Feed sync: every 2 hours, Insight sync: every 24 hours.
+ */
+const startSyncFallbacks = () => {
+  // Feed Sync fallback — every 2 hours
+  if (feedSyncIntervalId) clearInterval(feedSyncIntervalId);
+  feedSyncIntervalId = setInterval(async () => {
+    console.log('🔄 [Fallback] Running scheduled feed sync...');
+    try {
+      await runFeedSync();
+    } catch (err) {
+      console.error('❌ [Fallback] Feed sync error:', err.message);
+    }
+  }, 2 * 60 * 60 * 1000); // 2 hours
+  console.log('⏰ Fallback Feed Sync interval started (every 2 hours).');
+
+  // Insight Sync fallback — every 24 hours
+  if (insightSyncIntervalId) clearInterval(insightSyncIntervalId);
+  insightSyncIntervalId = setInterval(async () => {
+    console.log('📊 [Fallback] Running scheduled insight sync...');
+    try {
+      await runInsightSync();
+    } catch (err) {
+      console.error('❌ [Fallback] Insight sync error:', err.message);
+    }
+  }, 24 * 60 * 60 * 1000); // 24 hours
+  console.log('⏰ Fallback Insight Sync interval started (every 24 hours).');
 };
