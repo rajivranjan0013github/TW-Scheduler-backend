@@ -10,6 +10,7 @@
 import SocialAccount from '../models/SocialAccount.js';
 import PublishedPost from '../models/PublishedPost.js';
 import { getDBStatus } from '../config/db.js';
+import { fetchYoutubeVideos } from '../services/youtubeService.js';
 
 /**
  * Fetches the latest published posts from a Facebook Page via Meta Graph API.
@@ -73,11 +74,9 @@ const fetchInstagramPosts = async (account) => {
 export const runFeedSync = async () => {
   const isConnected = getDBStatus();
   if (!isConnected) {
-    console.log('⚠️ [Feed Sync] Skipping — database not connected.');
     return;
   }
 
-  console.log('🔄 [Feed Sync] Starting feed sync for all connected accounts...');
   const startTime = Date.now();
 
   try {
@@ -100,6 +99,8 @@ export const runFeedSync = async () => {
           posts = await fetchFacebookPosts(account);
         } else if (account.platform === 'instagram') {
           posts = await fetchInstagramPosts(account);
+        } else if (account.platform === 'youtube') {
+          posts = await fetchYoutubeVideos(account);
         }
 
         // Upsert each post into PublishedPost
@@ -140,7 +141,6 @@ export const runFeedSync = async () => {
     }
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`✅ [Feed Sync] Complete in ${elapsed}s — ${accountsProcessed} accounts synced, ${accountsFailed} failed, ${totalNewPosts} new posts, ${totalUpdatedPosts} updated posts.`);
   } catch (error) {
     console.error('❌ [Feed Sync] Critical error:', error.message);
   }

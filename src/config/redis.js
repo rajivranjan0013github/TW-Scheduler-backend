@@ -10,7 +10,6 @@ const redisPassword = process.env.REDIS_PASSWORD || null;
 
 export const connectRedis = () => {
   if (process.env.DEMO_MODE === 'true' || !process.env.REDIS_HOST) {
-    console.log('⚠️ Running queue scheduler in Sandboxed In-Memory Mode (No Redis).');
     return null;
   }
 
@@ -27,7 +26,6 @@ export const connectRedis = () => {
     redisConnection = new IORedis(opts);
 
     redisConnection.on('connect', () => {
-      console.log('🔌 Redis connected successfully.');
       isRedisConnected = true;
     });
 

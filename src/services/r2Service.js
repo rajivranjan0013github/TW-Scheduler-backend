@@ -23,12 +23,10 @@ if (useR2) {
         secretAccessKey: secretAccessKey,
       },
     });
-    console.log('☁️ Cloudflare R2 client initialized.');
   } catch (error) {
     console.error('❌ Failed to initialize Cloudflare R2 client:', error.message);
   }
 } else {
-  console.log('📁 Cloudflare R2 credentials not set. Uploads will be saved locally to tw-backend/public/uploads.');
 }
 
 /**

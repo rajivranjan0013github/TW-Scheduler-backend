@@ -25,7 +25,6 @@ export const initQueue = async () => {
         removeOnFail: false,
       }
     });
-    console.log('📦 BullMQ Publisher Queue initialized.');
 
     // Feed Sync Queue — runs every 2 hours
     feedSyncQueue = new Queue('feed-sync-queue', {
@@ -36,7 +35,6 @@ export const initQueue = async () => {
       repeat: { pattern: '0 */2 * * *' }, // Every 2 hours
       jobId: 'feed-sync-repeatable',
     });
-    console.log('📦 BullMQ Feed Sync Queue initialized (every 2 hours).');
 
     // Insight Sync Queue — runs daily at 2:00 AM IST (20:30 UTC)
     insightSyncQueue = new Queue('insight-sync-queue', {
@@ -47,9 +45,7 @@ export const initQueue = async () => {
       repeat: { pattern: '30 20 * * *' }, // 20:30 UTC = 2:00 AM IST
       jobId: 'insight-sync-repeatable',
     });
-    console.log('📦 BullMQ Insight Sync Queue initialized (daily at 2:00 AM IST).');
   } else {
-    console.log('⏰ Starting Sandbox local interval fallback scheduler (runs every 10 seconds).');
     startIntervalFallback();
     startSyncFallbacks();
   }
@@ -62,9 +58,7 @@ export const addPostToQueue = async (post) => {
       { postId: post._id }, 
       { delay: Math.max(0, delay), jobId: post._id.toString() }
     );
-    console.log(`✉️ Added post ${post._id} to BullMQ queue with delay: ${Math.max(0, delay)}ms`);
   } else {
-    console.log(`✉️ Sandbox scheduler will pick up post ${post._id} at ${post.scheduledAt}`);
   }
 };
 
@@ -73,7 +67,6 @@ export const removePostFromQueue = async (postId) => {
     const job = await publishQueue.getJob(postId.toString());
     if (job) {
       await job.remove();
-      console.log(`🗑️ Removed post ${postId} from BullMQ queue`);
     }
   }
 };
@@ -93,7 +86,6 @@ const startIntervalFallback = () => {
       );
 
       for (const post of postsToPublish) {
-        console.log(`⚙️ [Sandbox] Starting publication for post: ${post._id}`);
         post.status = 'publishing';
         
         // Run publishing job simulation
@@ -116,7 +108,6 @@ const startIntervalFallback = () => {
         for (const post of postsToPublish) {
           post.status = 'publishing';
           await post.save();
-          console.log(`⚙️ [DB Cron] Starting publication for post: ${post._id}`);
           
           setTimeout(async () => {
             try {
@@ -141,24 +132,20 @@ const startSyncFallbacks = () => {
   // Feed Sync fallback — every 2 hours
   if (feedSyncIntervalId) clearInterval(feedSyncIntervalId);
   feedSyncIntervalId = setInterval(async () => {
-    console.log('🔄 [Fallback] Running scheduled feed sync...');
     try {
       await runFeedSync();
     } catch (err) {
       console.error('❌ [Fallback] Feed sync error:', err.message);
     }
   }, 2 * 60 * 60 * 1000); // 2 hours
-  console.log('⏰ Fallback Feed Sync interval started (every 2 hours).');
 
   // Insight Sync fallback — every 24 hours
   if (insightSyncIntervalId) clearInterval(insightSyncIntervalId);
   insightSyncIntervalId = setInterval(async () => {
-    console.log('📊 [Fallback] Running scheduled insight sync...');
     try {
       await runInsightSync();
     } catch (err) {
       console.error('❌ [Fallback] Insight sync error:', err.message);
     }
   }, 24 * 60 * 60 * 1000); // 24 hours
-  console.log('⏰ Fallback Insight Sync interval started (every 24 hours).');
 };

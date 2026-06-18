@@ -18,13 +18,11 @@ const seedDatabase = async () => {
       ]
     });
     if (cleanupResult.deletedCount > 0) {
-      console.log(`🧹 Cleaned up ${cleanupResult.deletedCount} legacy mock social accounts from MongoDB.`);
     }
 
     // Find the first user to associate seeded data with
     const firstUser = await User.findOne().sort({ createdAt: 1 });
     if (!firstUser) {
-      console.log('⚠️ No users found in database. Skipping seed (data will be created on first login).');
       return;
     }
     const seedUserId = firstUser._id;
@@ -36,7 +34,6 @@ const seedDatabase = async () => {
     const fbPageId = process.env.META_FACEBOOK_PAGE_ID?.trim();
 
     if (igToken && igAccountId) {
-      console.log('🔄 Syncing real Instagram Business Account credentials from env to MongoDB...');
       await SocialAccount.findOneAndUpdate(
         { userId: seedUserId, platform: 'instagram', accountId: igAccountId },
         { 
@@ -52,7 +49,6 @@ const seedDatabase = async () => {
       );
     }
     if (fbToken && fbPageId) {
-      console.log('🔄 Syncing real Facebook Page credentials from env to MongoDB...');
       await SocialAccount.findOneAndUpdate(
         { userId: seedUserId, platform: 'facebook', accountId: fbPageId },
         { 
@@ -71,7 +67,6 @@ const seedDatabase = async () => {
     // 3. Seed Folders if this user has none
     const folderCount = await Folder.countDocuments({ userId: seedUserId });
     if (folderCount === 0) {
-      console.log('🌱 Seeding default folders in MongoDB...');
       await Folder.insertMany([
         { userId: seedUserId, name: 'Summer Reels' },
         { userId: seedUserId, name: 'Product Launches' },
@@ -88,16 +83,13 @@ export const connectDB = async () => {
   
 
   if (!mongoUri) {
-    console.log('⚠️ MONGODB_URI is not defined in .env. Database operations will use In-Memory Sandbox/Demo mode.');
     return false;
   }
 
-  console.log('⏳ Connecting to MongoDB...');
   try {
     const conn = await mongoose.connect(mongoUri, {
       serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
     });
-    console.log(`🔌 MongoDB Connected: ${conn.connection.host}`);
     isConnected = true;
 
     // Run database seeder
@@ -106,7 +98,6 @@ export const connectDB = async () => {
     return true;
   } catch (error) {
     console.error(`❌ MongoDB Connection Error: ${error.message}`);
-    console.log('⚠️ Running backend database operations in In-Memory Sandbox/Demo mode.');
     isConnected = false;
     return false;
   }

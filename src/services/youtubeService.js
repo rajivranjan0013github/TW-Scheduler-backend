@@ -138,7 +138,6 @@ export const publishToYoutube = async ({ account, media, caption, specifics }) =
   const accessToken = await getFreshYoutubeAccessToken(account);
   const metadata = buildYoutubeMetadata({ caption, specifics });
 
-  console.log(`🤖 [YouTube Service] Starting upload for channel: ${account.name} (${account.accountId})`);
 
   const mediaRes = await fetch(media.url);
   if (!mediaRes.ok || !mediaRes.body) {
@@ -185,6 +184,80 @@ export const publishToYoutube = async ({ account, media, caption, specifics }) =
     throw new Error(uploadData.error?.message || 'YouTube video upload failed.');
   }
 
-  console.log(`🎉 YouTube video uploaded successfully! ID: ${uploadData.id}`);
   return uploadData.id;
 };
+
+export const fetchYoutubeVideos = async (account) => {
+  const accessToken = await getFreshYoutubeAccessToken(account);
+  const channelId = account.accountId;
+  const uploadsPlaylistId = channelId.replace(/^UC/, 'UU');
+
+
+  // 1. Fetch playlist items
+  const playlistItemsUrl = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId=${uploadsPlaylistId}&maxResults=25`;
+  const playlistRes = await fetch(playlistItemsUrl, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+
+  const playlistData = await playlistRes.json();
+  if (!playlistRes.ok) {
+    throw new Error(playlistData.error?.message || `YouTube playlist items fetch failed (status ${playlistRes.status})`);
+  }
+
+  const items = playlistData.items || [];
+  if (items.length === 0) {
+    return [];
+  }
+
+  const videoIds = items.map(item => item.contentDetails?.videoId).filter(Boolean);
+  if (videoIds.length === 0) {
+    return [];
+  }
+
+  // 2. Fetch video details & statistics
+  const videosUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics,status&id=${videoIds.join(',')}`;
+  const videosRes = await fetch(videosUrl, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+
+  const videosData = await videosRes.json();
+  if (!videosRes.ok) {
+    throw new Error(videosData.error?.message || `YouTube video details fetch failed (status ${videosRes.status})`);
+  }
+
+  return (videosData.items || []).map(video => {
+    const snippet = video.snippet || {};
+    const stats = video.statistics || {};
+    const thumbnails = snippet.thumbnails || {};
+    const mediaUrl = thumbnails.maxres?.url || thumbnails.high?.url || thumbnails.medium?.url || thumbnails.default?.url || '';
+
+    return {
+      // For API route mapping in accounts.js
+      id: video.id,
+      createdAt: snippet.publishedAt,
+      views: Number(stats.viewCount) || 0,
+      likes: Number(stats.likeCount) || 0,
+      comments: Number(stats.commentCount) || 0,
+
+      // For feedSyncWorker.js DB upsert
+      metaPostId: video.id,
+      platform: 'youtube',
+      publishedAt: new Date(snippet.publishedAt),
+      latestViews: Number(stats.viewCount) || 0,
+      latestLikes: Number(stats.likeCount) || 0,
+      latestComments: Number(stats.commentCount) || 0,
+
+      // Shared fields
+      content: snippet.title || '',
+      mediaUrl,
+      videoUrl: `https://www.youtube.com/watch?v=${video.id}`,
+      mediaType: 'VIDEO',
+      permalink: `https://www.youtube.com/watch?v=${video.id}`,
+    };
+  });
+};
+

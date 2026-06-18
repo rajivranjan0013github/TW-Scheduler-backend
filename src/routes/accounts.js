@@ -6,7 +6,7 @@ import Insight from '../models/Insight.js';
 import PublishedPost from '../models/PublishedPost.js';
 import PostInsight from '../models/PostInsight.js';
 import { protect, authorize } from '../middleware/auth.js';
-import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount } from '../services/youtubeService.js';
+import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount, fetchYoutubeVideos } from '../services/youtubeService.js';
 
 const router = express.Router();
 const insightSkipCache = new Map();
@@ -362,7 +362,6 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
   }
 
   try {
-    console.log('🤖 [Meta OAuth] Exchanging authorization code for user access token...');
     
     // 1. Exchange authorization code for short-lived user token
     const tokenExchangeUrl = `https://graph.facebook.com/v20.0/oauth/access_token` +
@@ -382,7 +381,6 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
     const shortLivedToken = exchangeData.access_token;
 
     // 2. Upgrade to long-lived user token (60 days)
-    console.log('🤖 [Meta OAuth] Upgrading user token to long-lived (60 days)...');
     const upgradeUrl = `https://graph.facebook.com/v20.0/oauth/access_token` +
       `?grant_type=fb_exchange_token` +
       `&client_id=${appId}` +
@@ -405,7 +403,6 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
       const debugUrl = `https://graph.facebook.com/debug_token?input_token=${longLivedUserToken}&access_token=${appId}|${appSecret}`;
       const debugRes = await fetch(debugUrl);
       const debugData = await debugRes.json();
-      console.log('🤖 [Meta OAuth] Token Info:', JSON.stringify(debugData));
       
       if (debugData?.data?.granular_scopes) {
         for (const gs of debugData.data.granular_scopes) {
@@ -421,11 +418,9 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
     }
 
     // 3. Fetch user's Facebook Pages and Page Access Tokens
-    console.log('🤖 [Meta OAuth] Fetching associated Facebook Pages...');
     const pagesUrl = `https://graph.facebook.com/v20.0/me/accounts?access_token=${longLivedUserToken}`;
     const pagesRes = await fetch(pagesUrl);
     const pagesData = await pagesRes.json();
-    console.log('🤖 [Meta OAuth] pagesData response:', JSON.stringify(pagesData));
 
     if (!pagesRes.ok) {
       console.error('❌ Fetching Facebook Pages Failed:', pagesData);
@@ -437,7 +432,6 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
     // Fallback: if pagesList is empty or missing targetPageIds, fetch them directly
     for (const pageId of targetPageIds) {
       if (!pagesList.some(p => p.id === pageId)) {
-        console.log(`🤖 [Meta OAuth] Fallback: Fetching Page ${pageId} details directly...`);
         try {
           const directPageUrl = `https://graph.facebook.com/v20.0/${pageId}?fields=name,username,access_token&access_token=${longLivedUserToken}`;
           const directPageRes = await fetch(directPageUrl);
@@ -449,7 +443,6 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
               username: directPageData.username,
               access_token: directPageData.access_token
             });
-            console.log(`🤖 [Meta OAuth] Fallback: Successfully retrieved Page "${directPageData.name}" directly.`);
           } else {
             console.warn(`⚠️ [Meta OAuth] Fallback: Failed to fetch Page ${pageId} directly:`, directPageData);
           }
@@ -471,7 +464,6 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
       // Get page avatar from metadata or fallback
       const pagePicUrl = `https://graph.facebook.com/v20.0/${pageId}/picture?type=normal&access_token=${pageAccessToken}`;
 
-      console.log(`🤖 [Meta OAuth] Registering Facebook Page: "${pageName}" (${pageId})`);
       
       // Upsert Facebook Page in database
       let fbAccount = await SocialAccount.findOneAndUpdate(
@@ -491,14 +483,12 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
       connectedAccounts.push(fbAccount);
 
       // Find linked Instagram Business Account ID
-      console.log(`🤖 [Meta OAuth] Searching for linked Instagram accounts for Facebook Page ID: ${pageId}...`);
       const igCheckUrl = `https://graph.facebook.com/v20.0/${pageId}?fields=instagram_business_account&access_token=${pageAccessToken}`;
       const igCheckRes = await fetch(igCheckUrl);
       const igCheckData = await igCheckRes.json();
 
       if (igCheckRes.ok && igCheckData.instagram_business_account) {
         const igAccountId = igCheckData.instagram_business_account.id;
-        console.log(`🤖 [Meta OAuth] Linked Instagram Business Account found ID: ${igAccountId}. Fetching profile details...`);
 
         // Fetch Instagram Account details
         const igDetailUrl = `https://graph.facebook.com/v20.0/${igAccountId}?fields=name,username,profile_picture_url&access_token=${pageAccessToken}`;
@@ -556,7 +546,6 @@ router.post('/instagram-callback', protect, authorize('owner', 'admin'), async (
   }
 
   try {
-    console.log('🤖 [Instagram OAuth] Exchanging authorization code for short-lived token...');
 
     const form = new URLSearchParams();
     form.append('client_id', appId);
@@ -577,7 +566,6 @@ router.post('/instagram-callback', protect, authorize('owner', 'admin'), async (
       return res.status(400).json({ message: tokenData.error_message || tokenData.error?.message || 'Instagram token exchange failed' });
     }
 
-    console.log('🤖 [Instagram OAuth] Upgrading token to long-lived token...');
     const upgradeUrl = `https://graph.instagram.com/access_token` +
       `?grant_type=ig_exchange_token` +
       `&client_secret=${encodeURIComponent(appSecret)}` +
@@ -785,6 +773,8 @@ router.get('/:id/posts', protect, async (req, res) => {
           message: apiData.error?.message || 'Meta API returned an error fetching posts' 
         });
       }
+    } else if (account.platform === 'youtube') {
+      posts = await fetchYoutubeVideos(account);
     }
 
     // Upsert fetched posts into PublishedPost cache

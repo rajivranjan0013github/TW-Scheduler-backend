@@ -21,12 +21,10 @@ export const initWorker = () => {
   if (connection) {
     worker = new Worker('publishing-queue', async (job) => {
       const { postId } = job.data;
-      console.log(`👷 BullMQ Worker processing post: ${postId}`);
       await publishPostJob(postId);
     }, { connection });
 
     worker.on('completed', (job) => {
-      console.log(`✅ Job ${job.id} completed successfully.`);
     });
 
     worker.on('failed', (job, err) => {
@@ -35,12 +33,10 @@ export const initWorker = () => {
 
     // Feed Sync Worker — processes feed-sync jobs every 2 hours
     feedSyncWorker = new Worker('feed-sync-queue', async (job) => {
-      console.log('🔄 [BullMQ] Feed sync job triggered...');
       await runFeedSync();
     }, { connection });
 
     feedSyncWorker.on('completed', (job) => {
-      console.log(`✅ Feed sync job ${job.id} completed.`);
     });
 
     feedSyncWorker.on('failed', (job, err) => {
@@ -49,12 +45,10 @@ export const initWorker = () => {
 
     // Insight Sync Worker — processes insight-sync jobs daily
     insightSyncWorker = new Worker('insight-sync-queue', async (job) => {
-      console.log('📊 [BullMQ] Insight sync job triggered...');
       await runInsightSync();
     }, { connection });
 
     insightSyncWorker.on('completed', (job) => {
-      console.log(`✅ Insight sync job ${job.id} completed.`);
     });
 
     insightSyncWorker.on('failed', (job, err) => {
@@ -85,7 +79,6 @@ export const publishPostJob = async (postId) => {
     }
 
     const format = (post.platformSpecifics?.type || 'reels').toLowerCase();
-    console.log(`📡 Publishing [${format.toUpperCase()}] post: "${post.caption.substring(0, 30)}..." to accounts:`, post.socialAccountIds);
 
     // Verify social account and media exist
     let accounts = [];
@@ -111,7 +104,6 @@ export const publishPostJob = async (postId) => {
       await new Promise(resolve => setTimeout(resolve, 3000));
       post.status = 'published';
       post.updatedAt = new Date();
-      console.log(`✨ [Sandbox] [${format.toUpperCase()}] Post ${postId} successfully published to Meta!`);
     } else {
       // Call actual Meta API for each connected account
       for (const account of accounts) {
@@ -159,7 +151,6 @@ export const publishPostJob = async (postId) => {
       post.status = 'published';
       post.publishResponseId = JSON.stringify(publishResponses);
       await post.save();
-      console.log(`✨ [DB] [${format.toUpperCase()}] Post ${postId} successfully published to Meta! Responses:`, publishResponses);
     }
 
   } catch (error) {

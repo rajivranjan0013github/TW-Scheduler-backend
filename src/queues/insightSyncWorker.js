@@ -56,11 +56,9 @@ const extractMetrics = (responseBody, platform) => {
 export const runInsightSync = async () => {
   const isConnected = getDBStatus();
   if (!isConnected) {
-    console.log('⚠️ [Insight Sync] Skipping — database not connected.');
     return;
   }
 
-  console.log('📊 [Insight Sync] Starting daily per-post insight sync...');
   const startTime = Date.now();
   const todayStr = new Date().toISOString().split('T')[0];
 
@@ -74,11 +72,9 @@ export const runInsightSync = async () => {
     }).populate('accountId');
 
     if (posts.length === 0) {
-      console.log('📊 [Insight Sync] No published posts found in the last 30 days.');
       return;
     }
 
-    console.log(`📊 [Insight Sync] Found ${posts.length} posts to sync across accounts.`);
 
     // Group posts by account for token-scoped batch requests
     const accountPostsMap = new Map();
@@ -176,7 +172,6 @@ export const runInsightSync = async () => {
     }
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`✅ [Insight Sync] Complete in ${elapsed}s — ${totalInsightsUpserted} insights upserted, ${totalErrors} errors.`);
   } catch (error) {
     console.error('❌ [Insight Sync] Critical error:', error.message);
   }

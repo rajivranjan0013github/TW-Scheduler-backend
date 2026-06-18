@@ -62,6 +62,15 @@ app.post('/api/scheduler/publish-now/:id', protect, async (req, res) => {
   }
 });
 
+// Serve frontend static assets from ../TW-Scheduler/dist
+const frontendBuildPath = path.join(__dirname, '../TW-Scheduler/dist');
+app.use(express.static(frontendBuildPath));
+
+// All other GET requests not handled by API routes should serve index.html
+app.get('*', (req, res) => {
+  res.sendFile(path.join(frontendBuildPath, 'index.html'));
+});
+
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
@@ -85,7 +94,6 @@ const startServer = async () => {
 
   // 4. Listen on PORT
   app.listen(PORT, () => {
-    console.log(`🚀 TW Creator Suite Backend running on http://localhost:${PORT}`);
   });
 };
 

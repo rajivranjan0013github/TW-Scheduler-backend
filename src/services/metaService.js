@@ -14,16 +14,7 @@ const getMetaErrorMessage = (stage, response, data) => {
 };
 
 const logInstagramRequest = (stage, context) => {
-  console.log(`🤖 [Instagram Publish:${stage}]`, {
-    graphHost: context.graphHost,
-    accountId: context.accountId,
-    authProvider: context.authProvider,
-    mediaType: context.mediaType,
-    mediaUrl: context.mediaUrl,
-    captionLength: context.captionLength,
-    tokenPrefix: context.accessToken ? `${context.accessToken.slice(0, 12)}...` : null,
-    tokenLength: context.accessToken?.length || 0,
-  });
+
 };
 
 /**
@@ -42,7 +33,6 @@ export const publishToInstagram = async (accessToken, instagramBusinessAccountId
   const graphHost = authProvider === 'instagram' ? 'graph.instagram.com' : 'graph.facebook.com';
   const baseUrl = `https://${graphHost}/${apiVersion}`;
 
-  console.log(`🤖 [Meta Service] Initializing Instagram upload to account: ${instagramBusinessAccountId}`);
   logInstagramRequest('container-create', {
     graphHost,
     accountId: instagramBusinessAccountId,
@@ -91,7 +81,6 @@ export const publishToInstagram = async (accessToken, instagramBusinessAccountId
   }
 
   const containerId = containerData.id;
-  console.log(`📦 Instagram Media Container created successfully. ID: ${containerId}. Starting status polling...`);
 
   // Step 2: Poll status of the container (required for video/reels, good practice for images)
   const pollFields = authProvider === 'instagram' ? 'status_code' : 'status_code,error_info';
@@ -102,7 +91,6 @@ export const publishToInstagram = async (accessToken, instagramBusinessAccountId
 
   while (attempt < maxAttempts && !finished) {
     attempt++;
-    console.log(`⏳ [Attempt ${attempt}/${maxAttempts}] Checking Instagram container status...`);
     
     // Wait 5 seconds
     await new Promise(resolve => setTimeout(resolve, 5000));
@@ -121,7 +109,6 @@ export const publishToInstagram = async (accessToken, instagramBusinessAccountId
     }
 
     const statusCode = pollData.status_code;
-    console.log(`📡 Container status code: ${statusCode}`);
 
     if (statusCode === 'FINISHED') {
       finished = true;
@@ -135,7 +122,6 @@ export const publishToInstagram = async (accessToken, instagramBusinessAccountId
     throw new Error('Timeout waiting for Instagram media container to finish processing');
   }
 
-  console.log(`✨ Instagram Container ready. Publishing container: ${containerId}...`);
   logInstagramRequest('media-publish', {
     graphHost,
     accountId: instagramBusinessAccountId,
@@ -174,7 +160,6 @@ export const publishToInstagram = async (accessToken, instagramBusinessAccountId
     throw new Error(message);
   }
 
-  console.log(`🎉 Instagram Post published successfully! ID: ${publishData.id}`);
   return publishData.id;
 };
 
@@ -191,7 +176,6 @@ export const publishToFacebook = async (accessToken, pageId, mediaUrl, mediaType
   const apiVersion = 'v20.0';
   const baseUrl = `https://graph.facebook.com/${apiVersion}`;
 
-  console.log(`🤖 [Meta Service] Initializing Facebook Page upload to Page ID: ${pageId}`);
 
   let publishUrl = `${baseUrl}/${pageId}/feed`;
   let params = {
@@ -233,6 +217,5 @@ export const publishToFacebook = async (accessToken, pageId, mediaUrl, mediaType
   }
 
   const publishedId = data.post_id || data.id;
-  console.log(`🎉 Facebook Post published successfully! ID: ${publishedId}`);
   return publishedId;
 };

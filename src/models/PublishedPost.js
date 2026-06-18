@@ -17,7 +17,7 @@ const PublishedPostSchema = new mongoose.Schema({
   },
   platform: {
     type: String,
-    enum: ['instagram', 'facebook'],
+    enum: ['instagram', 'facebook', 'youtube'],
     required: true,
   },
   content: {
