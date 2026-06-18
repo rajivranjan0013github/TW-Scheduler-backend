@@ -2,6 +2,9 @@ import express from 'express';
 import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import SocialAccount from '../models/SocialAccount.js';
+import Insight from '../models/Insight.js';
+import PublishedPost from '../models/PublishedPost.js';
+import PostInsight from '../models/PostInsight.js';
 import { protect, authorize } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -41,38 +44,57 @@ router.get('/insights', protect, async (req, res) => {
       return res.status(200).json([]);
     }
 
-    // Days map for sorting and naming
-    const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-    
-    // Initialize a daily aggregation map for the last 7 days
-    const chartMap = {};
+    const period = req.query.period || '7d';
+    const forceRefresh = req.query.refresh === 'true';
     const today = new Date();
-    for (let i = 6; i >= 0; i--) {
+    const todayStr = today.toISOString().split('T')[0];
+    let daysCount = 7;
+    let sinceDate = new Date();
+
+    if (period === '30d') {
+      daysCount = 30;
+      sinceDate.setDate(today.getDate() - 30);
+    } else if (period === 'this_month') {
+      daysCount = today.getDate();
+      sinceDate = new Date(today.getFullYear(), today.getMonth(), 1);
+    } else {
+      daysCount = 7;
+      sinceDate.setDate(today.getDate() - 7);
+    }
+
+    // List of date strings in the timeframe range
+    const dateStrings = [];
+    const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const chartMap = {};
+
+    for (let i = daysCount - 1; i >= 0; i--) {
       const d = new Date();
       d.setDate(today.getDate() - i);
       const dateStr = d.toISOString().split('T')[0];
-      const dayName = dayNames[d.getDay()];
+      dateStrings.push(dateStr);
+
+      let dayNameLabel = '';
+      if (period === 'this_month' || period === '30d') {
+        dayNameLabel = d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+      } else {
+        dayNameLabel = dayNames[d.getDay()];
+      }
+
       chartMap[dateStr] = {
-        name: dayName,
+        name: dayNameLabel,
         Instagram: 0,
         Facebook: 0
       };
     }
 
-    // Compute since and until timestamps for Meta API (last 7 days)
-    const sinceDate = new Date();
-    sinceDate.setDate(today.getDate() - 7);
-    const since = Math.floor(sinceDate.getTime() / 1000);
-    const until = Math.floor(Date.now() / 1000);
-
-    const fetchDailyInsightValues = async (account, metricCandidates) => {
+    const fetchDailyInsightValues = async (account, metricCandidates, sinceTime, untilTime) => {
       const invalidMetrics = [];
       const graphHost = account.authProvider === 'instagram'
         ? 'graph.instagram.com'
         : 'graph.facebook.com';
 
       for (const metric of metricCandidates) {
-        const url = `https://${graphHost}/v20.0/${account.accountId}/insights?metric=${metric}&period=day&since=${since}&until=${until}&access_token=${account.accessToken}`;
+        const url = `https://${graphHost}/v20.0/${account.accountId}/insights?metric=${metric}&period=day&since=${sinceTime}&until=${untilTime}&access_token=${account.accessToken}`;
         const apiRes = await fetch(url);
         const apiData = await apiRes.json();
 
@@ -93,43 +115,111 @@ router.get('/insights', protect, async (req, res) => {
       throw new Error(`No supported Meta insights metric was available for this channel. Tried: ${invalidMetrics.join(', ')}`);
     };
 
-    // Loop through each account and fetch actual daily views/reach
+    // Loop through each account and fetch/caching details
     for (const account of accounts) {
       const isMock = account.accessToken?.startsWith('mock-');
       const skipUntil = insightSkipCache.get(account._id.toString());
       if (skipUntil && skipUntil > Date.now()) {
         continue;
       }
-      
-      let insightsData = [];
 
-      if (!isMock) {
+      // Check DB Cache for dates in timeframe range (including today)
+      let cachedInsights = [];
+      
+      if (!forceRefresh) {
         try {
-          if (account.platform === 'facebook') {
-            insightsData = await fetchDailyInsightValues(account, ['page_post_engagements']);
-          } else if (account.platform === 'instagram') {
-            // Instagram impressions is deprecated for newer API behavior; reach is still accepted for account insights.
-            insightsData = await fetchDailyInsightValues(account, ['reach']);
-          }
+          cachedInsights = await Insight.find({ accountId: account._id, dateStr: { $in: dateStrings } });
         } catch (err) {
-          insightSkipCache.set(account._id.toString(), Date.now() + INSIGHT_SKIP_MS);
-          console.warn(`Skipping insights for ${account.name} for 15 minutes: ${err.message}`);
-          continue;
+          console.error('Failed to query Insight cache:', err.message);
         }
       }
 
-      // If we got real insights, add them to the daily chart data
-      if (insightsData.length > 0) {
-        for (const item of insightsData) {
-          // Meta end_time format is e.g. "2026-06-15T07:00:00+0000"
-          const dateStr = item.end_time.split('T')[0];
-          if (chartMap[dateStr]) {
-            if (account.platform === 'instagram') {
-              chartMap[dateStr].Instagram += item.value;
-            } else {
-              chartMap[dateStr].Facebook += item.value;
+      const cachedDatesMap = {};
+      for (const item of cachedInsights) {
+        cachedDatesMap[item.dateStr] = item.value;
+      }
+
+      // Identify missing dates to query from Meta/Mock
+      // If forceRefresh is active, query all dates live. Otherwise, query only missing dates.
+      const missingDates = forceRefresh ? dateStrings : dateStrings.filter(d => cachedDatesMap[d] === undefined);
+
+      const fetchAndCacheRange = async (targetDates) => {
+        if (targetDates.length === 0) return {};
+        
+        const results = {};
+        
+        if (isMock) {
+          // Mock curve seed logic based on date value
+          let seed = account.platform === 'instagram' ? 3200 : 2100;
+          targetDates.forEach(dateStr => {
+            const timeVal = new Date(dateStr).getTime() / (1000 * 60 * 60 * 24);
+            const randomVal = Math.floor(seed + Math.sin(timeVal * 0.8) * 1100 + (timeVal % 7) * 100);
+            results[dateStr] = randomVal;
+          });
+        } else {
+          // Real Meta API query range
+          const datesSorted = [...targetDates].sort();
+          const targetSinceDate = new Date(datesSorted[0]);
+          const targetUntilDate = new Date(datesSorted[datesSorted.length - 1]);
+          targetUntilDate.setDate(targetUntilDate.getDate() + 1);
+
+          const targetSince = Math.floor(targetSinceDate.getTime() / 1000);
+          const targetUntil = Math.floor(targetUntilDate.getTime() / 1000);
+
+          try {
+            const metric = account.platform === 'facebook' ? 'page_post_engagements' : 'reach';
+            const apiValues = await fetchDailyInsightValues(account, [metric], targetSince, targetUntil);
+            
+            for (const item of apiValues) {
+              const dateStr = item.end_time.split('T')[0];
+              if (targetDates.includes(dateStr)) {
+                results[dateStr] = item.value;
+              }
             }
+          } catch (apiErr) {
+            console.error(`Meta fetch failed for ${account.name}:`, apiErr.message);
           }
+        }
+
+        // Cache retrieved dates in MongoDB (including today's current count)
+        const insertDocs = Object.keys(results).map(dateStr => ({
+          accountId: account._id,
+          dateStr,
+          platform: account.platform,
+          value: results[dateStr]
+        }));
+
+        for (const doc of insertDocs) {
+          try {
+            await Insight.findOneAndUpdate(
+              { accountId: doc.accountId, dateStr: doc.dateStr },
+              doc,
+              { upsert: true, new: true }
+            );
+          } catch (dbErr) {
+            console.error('Failed to cache insight in database:', dbErr.message);
+          }
+        }
+
+        return results;
+      };
+
+      // Query Meta/Mock for missing dates
+      let newCachedData = {};
+      if (missingDates.length > 0) {
+        newCachedData = await fetchAndCacheRange(missingDates);
+      }
+
+      // Populate chartMap
+      for (const dateStr of dateStrings) {
+        const val = cachedDatesMap[dateStr] !== undefined 
+          ? cachedDatesMap[dateStr] 
+          : (newCachedData[dateStr] || 0);
+
+        if (account.platform === 'instagram') {
+          chartMap[dateStr].Instagram += val;
+        } else {
+          chartMap[dateStr].Facebook += val;
         }
       }
     }
@@ -499,16 +589,17 @@ router.post('/instagram-callback', protect, authorize('owner', 'admin'), async (
   }
 });
 
-// @desc    Get published posts for a specific account
+// @desc    Get published posts for a specific account (cached-first, 2h staleness)
 // @route   GET /api/accounts/:id/posts
 // @access  Private
 router.get('/:id/posts', protect, async (req, res) => {
   const { id } = req.params;
+  const forceRefresh = req.query.refresh === 'true';
 
   try {
     const isConnected = getDBStatus();
     if (!isConnected) {
-      return res.status(503).json({ message: 'Database disconnected. Sandbox feed is disabled.' });
+      return res.status(503).json({ message: 'Database disconnected. Feed is disabled.' });
     }
 
     const account = await SocialAccount.findOne({ _id: id, userId: req.user._id });
@@ -521,6 +612,40 @@ router.get('/:id/posts', protect, async (req, res) => {
       return res.status(400).json({ message: 'Mock account feed access is disabled.' });
     }
 
+    // Check for cached posts and their freshness (2 hour threshold)
+    const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+    let cachedPosts = [];
+
+    if (!forceRefresh) {
+      cachedPosts = await PublishedPost.find({ accountId: account._id })
+        .sort({ publishedAt: -1 })
+        .limit(25);
+
+      if (cachedPosts.length > 0) {
+        const mostRecentSync = cachedPosts[0].lastSyncedAt;
+        const isFresh = mostRecentSync && (Date.now() - new Date(mostRecentSync).getTime()) < TWO_HOURS_MS;
+
+        if (isFresh) {
+          // Return cached data directly
+          const result = cachedPosts.map(post => ({
+            id: post.metaPostId,
+            content: post.content,
+            createdAt: post.publishedAt,
+            permalink: post.permalink,
+            mediaUrl: post.mediaUrl,
+            videoUrl: post.videoUrl,
+            mediaType: post.mediaType,
+            views: post.latestViews || 0,
+            likes: post.latestLikes || 0,
+            comments: post.latestComments || 0,
+            lastSyncedAt: post.lastSyncedAt,
+          }));
+          return res.status(200).json(result);
+        }
+      }
+    }
+
+    // Cache is stale or empty or force refresh — fetch from Meta
     const getInsightValue = async (postId, metric) => {
       try {
         const graphHost = account.platform === 'instagram' && account.authProvider === 'instagram'
@@ -613,7 +738,122 @@ router.get('/:id/posts', protect, async (req, res) => {
       }
     }
 
-    res.status(200).json(posts);
+    // Upsert fetched posts into PublishedPost cache
+    for (const post of posts) {
+      try {
+        await PublishedPost.findOneAndUpdate(
+          { userId: req.user._id, metaPostId: post.id },
+          {
+            userId: req.user._id,
+            accountId: account._id,
+            metaPostId: post.id,
+            platform: account.platform,
+            content: post.content,
+            mediaUrl: post.mediaUrl,
+            videoUrl: post.videoUrl || '',
+            mediaType: post.mediaType || '',
+            permalink: post.permalink,
+            publishedAt: new Date(post.createdAt),
+            lastSyncedAt: new Date(),
+            latestViews: post.views,
+            latestLikes: post.likes,
+            latestComments: post.comments,
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+      } catch (upsertErr) {
+        if (upsertErr.code !== 11000) {
+          console.error(`Failed to cache post ${post.id}:`, upsertErr.message);
+        }
+      }
+    }
+
+    // Add lastSyncedAt to each post in the response
+    const result = posts.map(post => ({
+      ...post,
+      lastSyncedAt: new Date(),
+    }));
+
+    res.status(200).json(result);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Get daily insight trend for a specific post
+// @route   GET /api/accounts/:id/posts/:metaPostId/insights
+// @access  Private
+router.get('/:id/posts/:metaPostId/insights', protect, async (req, res) => {
+  const { id, metaPostId } = req.params;
+
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      return res.status(503).json({ message: 'Database disconnected.' });
+    }
+
+    // Verify account belongs to user
+    const account = await SocialAccount.findOne({ _id: id, userId: req.user._id });
+    if (!account) {
+      return res.status(404).json({ message: 'Account not found' });
+    }
+
+    // Find the cached published post
+    const post = await PublishedPost.findOne({ accountId: account._id, metaPostId });
+    if (!post) {
+      return res.status(404).json({ message: 'Post not found in cache. Wait for the next feed sync or refresh the feed.' });
+    }
+
+    // Fetch all daily insight snapshots for this post
+    const insights = await PostInsight.find({ postId: post._id })
+      .sort({ dateStr: 1 });
+
+    if (insights.length === 0) {
+      return res.status(200).json({
+        post: {
+          metaPostId: post.metaPostId,
+          content: post.content,
+          permalink: post.permalink,
+          publishedAt: post.publishedAt,
+          latestViews: post.latestViews,
+          latestLikes: post.latestLikes,
+          latestComments: post.latestComments,
+          mediaUrl: post.mediaUrl,
+          videoUrl: post.videoUrl,
+          mediaType: post.mediaType,
+        },
+        dailyInsights: [],
+        message: 'No daily insight snapshots yet. Data will appear after the next daily insight sync.',
+      });
+    }
+
+    // Calculate daily deltas from cumulative snapshots
+    const dailyInsights = insights.map((item, i) => ({
+      date: item.dateStr,
+      views: i === 0 ? item.views : Math.max(0, item.views - insights[i - 1].views),
+      likes: i === 0 ? item.likes : Math.max(0, item.likes - insights[i - 1].likes),
+      comments: i === 0 ? item.comments : Math.max(0, item.comments - insights[i - 1].comments),
+      // Also include cumulative for reference
+      cumulativeViews: item.views,
+      cumulativeLikes: item.likes,
+      cumulativeComments: item.comments,
+    }));
+
+    res.status(200).json({
+      post: {
+        metaPostId: post.metaPostId,
+        content: post.content,
+        permalink: post.permalink,
+        publishedAt: post.publishedAt,
+        latestViews: post.latestViews,
+        latestLikes: post.latestLikes,
+        latestComments: post.latestComments,
+        mediaUrl: post.mediaUrl,
+        videoUrl: post.videoUrl,
+        mediaType: post.mediaType,
+      },
+      dailyInsights,
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
