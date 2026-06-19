@@ -24,6 +24,11 @@ const UserSchema = new mongoose.Schema({
     unique: true,
     sparse: true,
   },
+  facebookId: {
+    type: String,
+    unique: true,
+    sparse: true,
+  },
 }, { timestamps: true });
 
 export default mongoose.models.User || mongoose.model('User', UserSchema);

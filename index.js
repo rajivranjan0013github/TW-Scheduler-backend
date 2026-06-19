@@ -28,6 +28,11 @@ const PORT = process.env.PORT || 5001;
 
 // Middleware
 app.use(cors());
+app.use((req, res, next) => {
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  next();
+});
 app.use(express.json());
 
 // Serve uploads statically for local file uploads fallback

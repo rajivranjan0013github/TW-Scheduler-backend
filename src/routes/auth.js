@@ -97,6 +97,95 @@ router.post('/login', async (req, res) => {
   }
 });
 
+// @desc    Auth user / Facebook Login
+// @route   POST /api/auth/facebook-login
+// @access  Public
+router.post('/facebook-login', async (req, res) => {
+  const { code, redirectUri } = req.body;
+
+  if (!code || !redirectUri) {
+    return res.status(400).json({ message: 'Missing Facebook login code or redirect URI' });
+  }
+
+  try {
+    const appId = process.env.META_APP_ID;
+    const appSecret = process.env.META_APP_SECRET;
+
+    if (!appId || !appSecret) {
+      return res.status(500).json({ message: 'Facebook login is not configured on the server.' });
+    }
+
+    const tokenParams = new URLSearchParams({
+      client_id: appId,
+      client_secret: appSecret,
+      redirect_uri: redirectUri,
+      code,
+    });
+
+    const tokenResponse = await fetch(`https://graph.facebook.com/v20.0/oauth/access_token?${tokenParams.toString()}`);
+    const tokenData = await tokenResponse.json();
+
+    if (!tokenResponse.ok || !tokenData.access_token) {
+      return res.status(401).json({
+        message: tokenData.error?.message || 'Invalid Facebook login code',
+      });
+    }
+
+    const profileParams = new URLSearchParams({
+      fields: 'id,name,picture.type(large)',
+      access_token: tokenData.access_token,
+    });
+    const profileResponse = await fetch(`https://graph.facebook.com/v20.0/me?${profileParams.toString()}`);
+    const profile = await profileResponse.json();
+
+    if (!profileResponse.ok || !profile.id) {
+      return res.status(401).json({
+        message: profile.error?.message || 'Failed to read Facebook profile',
+      });
+    }
+
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      return res.status(503).json({ message: 'Database disconnected. Sandbox login is disabled.' });
+    }
+
+    const fallbackEmail = `facebook_${profile.id}@facebook.local`;
+    const email = profile.email || fallbackEmail;
+
+    let user = await User.findOne({
+      $or: [
+        { facebookId: profile.id },
+        { email },
+      ],
+    });
+
+    if (!user) {
+      const userCount = await User.countDocuments();
+      user = await User.create({
+        email,
+        name: profile.name || email,
+        avatar: profile.picture?.data?.url,
+        role: userCount === 0 ? 'owner' : 'editor',
+        facebookId: profile.id,
+      });
+    } else {
+      user.facebookId = user.facebookId || profile.id;
+      user.name = user.name || profile.name || email;
+      user.avatar = user.avatar || profile.picture?.data?.url;
+      await user.save();
+    }
+
+    const token = generateToken(user._id);
+
+    res.status(200).json({
+      user,
+      token,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // @desc    Get current logged in user
 // @route   GET /api/auth/me
 // @access  Private
