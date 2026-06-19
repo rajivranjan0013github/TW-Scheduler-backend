@@ -6,6 +6,14 @@ import { protect, authorize } from '../middleware/auth.js';
 import { addPostToQueue, removePostFromQueue } from '../queues/publisherQueue.js';
 
 const router = express.Router();
+const ADMIN_ROLES = ['owner', 'admin'];
+
+const getScopedUserId = (req) => {
+  if (ADMIN_ROLES.includes(req.user?.role) && req.query.userId) {
+    return req.query.userId;
+  }
+  return req.user._id;
+};
 
 // @desc    Get all scheduled and published posts
 // @route   GET /api/scheduler
@@ -19,7 +27,7 @@ router.get('/', protect, async (req, res) => {
       return res.status(200).json(sorted);
     }
 
-    const posts = await ScheduledPost.find({ userId: req.user._id })
+    const posts = await ScheduledPost.find({ userId: getScopedUserId(req) })
       .populate('socialAccountIds')
       .populate('mediaIds')
       .sort({ scheduledAt: 1 });

@@ -11,6 +11,21 @@ import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount, fetchYoutubeVideos } 
 const router = express.Router();
 const insightSkipCache = new Map();
 const INSIGHT_SKIP_MS = 15 * 60 * 1000;
+const ADMIN_ROLES = ['owner', 'admin'];
+
+const getAccountAccessFilter = (req, id) => {
+  if (ADMIN_ROLES.includes(req.user?.role)) {
+    return { _id: id };
+  }
+  return { _id: id, userId: req.user._id };
+};
+
+const getScopedUserId = (req) => {
+  if (ADMIN_ROLES.includes(req.user?.role) && req.query.userId) {
+    return req.query.userId;
+  }
+  return req.user._id;
+};
 
 // @desc    Get all connected accounts
 // @route   GET /api/accounts
@@ -22,7 +37,7 @@ router.get('/', protect, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected.' });
     }
 
-    const accounts = await SocialAccount.find({ userId: req.user._id });
+    const accounts = await SocialAccount.find({ userId: getScopedUserId(req) });
     res.status(200).json(accounts);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -40,7 +55,7 @@ router.get('/insights', protect, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected. Insights service is unavailable.' });
     }
 
-    const accounts = await SocialAccount.find({ userId: req.user._id, isConnected: true });
+    const accounts = await SocialAccount.find({ userId: getScopedUserId(req), isConnected: true });
     if (accounts.length === 0) {
       return res.status(200).json([]);
     }
@@ -332,7 +347,7 @@ router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => 
       return res.status(503).json({ message: 'Database disconnected.' });
     }
 
-    const account = await SocialAccount.findOne({ _id: id, userId: req.user._id });
+    const account = await SocialAccount.findOne(getAccountAccessFilter(req, id));
     if (!account) {
       return res.status(404).json({ message: 'Account not found' });
     }
@@ -636,7 +651,7 @@ router.get('/posts/recent', protect, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected.' });
     }
 
-    const posts = await PublishedPost.find({ userId: req.user._id })
+    const posts = await PublishedPost.find({ userId: getScopedUserId(req) })
       .sort({ publishedAt: -1 })
       .limit(25);
 
@@ -674,7 +689,7 @@ router.get('/:id/posts', protect, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected. Feed is disabled.' });
     }
 
-    const account = await SocialAccount.findOne({ _id: id, userId: req.user._id });
+    const account = await SocialAccount.findOne(getAccountAccessFilter(req, id));
     if (!account) {
       return res.status(404).json({ message: 'Account not found' });
     }
@@ -816,9 +831,9 @@ router.get('/:id/posts', protect, async (req, res) => {
     for (const post of posts) {
       try {
         await PublishedPost.findOneAndUpdate(
-          { userId: req.user._id, metaPostId: post.id },
+          { userId: account.userId, metaPostId: post.id },
           {
-            userId: req.user._id,
+            userId: account.userId,
             accountId: account._id,
             metaPostId: post.id,
             platform: account.platform,
@@ -867,7 +882,7 @@ router.get('/:id/posts/:metaPostId/insights', protect, async (req, res) => {
     }
 
     // Verify account belongs to user
-    const account = await SocialAccount.findOne({ _id: id, userId: req.user._id });
+    const account = await SocialAccount.findOne(getAccountAccessFilter(req, id));
     if (!account) {
       return res.status(404).json({ message: 'Account not found' });
     }

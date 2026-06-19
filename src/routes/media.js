@@ -8,6 +8,14 @@ import { uploadFile, deleteFile } from '../services/r2Service.js';
 import { protect, authorize } from '../middleware/auth.js';
 
 const router = express.Router();
+const ADMIN_ROLES = ['owner', 'admin'];
+
+const getScopedUserId = (req) => {
+  if (ADMIN_ROLES.includes(req.user?.role) && req.query.userId) {
+    return req.query.userId;
+  }
+  return req.user._id;
+};
 
 // Multer in-memory storage configuration
 const storage = multer.memoryStorage();
@@ -121,7 +129,7 @@ router.get('/', protect, async (req, res) => {
       filtered.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
       return res.status(200).json(filtered);
     }
-    const query = { userId: req.user._id };
+    const query = { userId: getScopedUserId(req) };
     if (folderId) {
       query.folderId = folderId === 'root' ? null : folderId;
     }
