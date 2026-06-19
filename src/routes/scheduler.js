@@ -2,6 +2,8 @@ import express from 'express';
 import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import ScheduledPost from '../models/ScheduledPost.js';
+import Media from '../models/Media.js';
+import SocialAccount from '../models/SocialAccount.js';
 import { protect, authorize } from '../middleware/auth.js';
 import { addPostToQueue, removePostFromQueue } from '../queues/publisherQueue.js';
 
@@ -13,6 +15,59 @@ const getScopedUserId = (req) => {
     return req.query.userId;
   }
   return req.user._id;
+};
+
+const idsToStrings = (items = []) => items.map((item) => String(item?._id || item));
+
+const withPostCaption = (platformSpecifics, postCaption, type) => {
+  const nextSpecifics = platformSpecifics
+    ? { ...platformSpecifics }
+    : { type: type || 'reels' };
+
+  if (nextSpecifics.youtube) {
+    nextSpecifics.youtube = {
+      ...nextSpecifics.youtube,
+      description: postCaption,
+    };
+  }
+
+  return nextSpecifics;
+};
+
+const validateSchedulingAccess = async ({ userId, socialAccountIds, mediaIds, requireEveryAccount = true }) => {
+  const accountIds = idsToStrings(socialAccountIds);
+  const mediaIdList = idsToStrings(mediaIds);
+
+  if (accountIds.length === 0 || mediaIdList.length === 0) {
+    return { ok: false, message: 'Must select social accounts and at least one media file' };
+  }
+
+  const [accounts, mediaItems] = await Promise.all([
+    SocialAccount.find({ _id: { $in: accountIds }, userId, isConnected: true }).select('_id'),
+    Media.find({ _id: { $in: mediaIdList }, userId }).select('_id socialAccountIds'),
+  ]);
+
+  if (accounts.length !== accountIds.length) {
+    return { ok: false, message: 'One or more selected social accounts are not connected.' };
+  }
+  if (mediaItems.length !== mediaIdList.length) {
+    return { ok: false, message: 'One or more selected media assets were not found.' };
+  }
+
+  const accountSet = new Set(accountIds);
+  const unavailableMedia = mediaItems.find((mediaItem) => {
+    const availableAccountIds = idsToStrings(mediaItem.socialAccountIds);
+    if (requireEveryAccount) {
+      return accountIds.some((accountId) => !availableAccountIds.includes(accountId));
+    }
+    return !availableAccountIds.some((accountId) => accountSet.has(accountId));
+  });
+
+  if (unavailableMedia) {
+    return { ok: false, message: 'Selected media is not available for one or more selected social accounts.' };
+  }
+
+  return { ok: true };
 };
 
 // @desc    Get all scheduled and published posts
@@ -47,16 +102,21 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
   try {
     const isConnected = getDBStatus();
     const scheduledDate = new Date(scheduledAt);
+    let postCaption = caption || '';
 
     if (!isConnected) {
+      if (!postCaption && mediaIds?.[0]) {
+        const mediaItem = mockStore.media.find(m => String(m._id) === String(mediaIds[0]));
+        postCaption = mediaItem?.caption || '';
+      }
       const newPost = {
         _id: `sp_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
         socialAccountIds,
         mediaIds,
-        caption: caption || '',
+        caption: postCaption,
         scheduledAt: scheduledDate,
         status: 'scheduled',
-        platformSpecifics: platformSpecifics || { type: 'reels' },
+        platformSpecifics: withPostCaption(platformSpecifics, postCaption, platformSpecifics?.type || 'reels'),
         createdAt: new Date(),
         updatedAt: new Date(),
       };
@@ -64,13 +124,28 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
       return res.status(201).json(newPost);
     }
 
+    const access = await validateSchedulingAccess({
+      userId: req.user._id,
+      socialAccountIds,
+      mediaIds,
+      requireEveryAccount: true,
+    });
+    if (!access.ok) {
+      return res.status(400).json({ message: access.message });
+    }
+
+    if (!postCaption && mediaIds?.[0]) {
+      const mediaItem = await Media.findOne({ _id: mediaIds[0], userId: req.user._id }).select('caption');
+      postCaption = mediaItem?.caption || '';
+    }
+
     const post = await ScheduledPost.create({
       userId: req.user._id,
       socialAccountIds,
       mediaIds,
-      caption,
+      caption: postCaption,
       scheduledAt: scheduledDate,
-      platformSpecifics: platformSpecifics || { type: 'reels' },
+      platformSpecifics: withPostCaption(platformSpecifics, postCaption, platformSpecifics?.type || 'reels'),
     });
     await addPostToQueue(post);
 
@@ -95,6 +170,32 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
     const baseDate = new Date(startDate || Date.now());
     const intervalMs = (parseFloat(intervalHours) || 2) * 60 * 60 * 1000;
     const createdPosts = [];
+    const mediaCaptionMap = new Map();
+
+    if (isConnected) {
+      const access = await validateSchedulingAccess({
+        userId: req.user._id,
+        socialAccountIds,
+        mediaIds,
+        requireEveryAccount: true,
+      });
+      if (!access.ok) {
+        return res.status(400).json({ message: access.message });
+      }
+
+      const mediaItems = await Media.find({
+        _id: { $in: idsToStrings(mediaIds) },
+        userId: req.user._id,
+      }).select('_id caption');
+
+      mediaItems.forEach((mediaItem) => {
+        mediaCaptionMap.set(String(mediaItem._id), mediaItem.caption || '');
+      });
+    } else {
+      mockStore.media.forEach((mediaItem) => {
+        mediaCaptionMap.set(String(mediaItem._id), mediaItem.caption || '');
+      });
+    }
 
     // For bulk scheduling: we loop through the social accounts, and for each account
     // we sequence the media files with the specified hour gap.
@@ -105,16 +206,19 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
       
       for (const mediaId of mediaIds) {
         const scheduledTime = new Date(currentScheduleTime.getTime());
+        const mediaCaption = mediaCaptionMap.get(String(mediaId)) || '';
+        const postCaption = mediaCaption || caption || '';
+        const postPlatformSpecifics = withPostCaption(platformSpecifics, postCaption, type);
         
         if (!isConnected) {
           const newPost = {
             _id: `sp_bulk_${Date.now()}_${index++}`,
             socialAccountIds: [accountId],
             mediaIds: [mediaId],
-            caption: caption || '',
+            caption: postCaption,
             scheduledAt: scheduledTime,
             status: 'scheduled',
-            platformSpecifics: platformSpecifics || { type: type || 'reels' },
+            platformSpecifics: postPlatformSpecifics,
             createdAt: new Date(),
             updatedAt: new Date(),
           };
@@ -125,9 +229,9 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
             userId: req.user._id,
             socialAccountIds: [accountId],
             mediaIds: [mediaId],
-            caption: caption || '',
+            caption: postCaption,
             scheduledAt: scheduledTime,
-            platformSpecifics: platformSpecifics || { type: type || 'reels' },
+            platformSpecifics: postPlatformSpecifics,
           });
           await addPostToQueue(post);
           createdPosts.push(post);
@@ -178,6 +282,18 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
     const post = await ScheduledPost.findOne({ _id: id, userId: req.user._id });
     if (!post) {
       return res.status(404).json({ message: 'Post not found' });
+    }
+
+    if (mediaIds || socialAccountIds) {
+      const access = await validateSchedulingAccess({
+        userId: req.user._id,
+        socialAccountIds: socialAccountIds || post.socialAccountIds,
+        mediaIds: mediaIds || post.mediaIds,
+        requireEveryAccount: true,
+      });
+      if (!access.ok) {
+        return res.status(400).json({ message: access.message });
+      }
     }
 
     if (scheduledAt) post.scheduledAt = new Date(scheduledAt);

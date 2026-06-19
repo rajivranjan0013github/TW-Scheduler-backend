@@ -4,6 +4,7 @@ import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import Folder from '../models/Folder.js';
 import Media from '../models/Media.js';
+import SocialAccount from '../models/SocialAccount.js';
 import { uploadFile, deleteFile } from '../services/r2Service.js';
 import { protect, authorize } from '../middleware/auth.js';
 
@@ -15,6 +16,28 @@ const getScopedUserId = (req) => {
     return req.query.userId;
   }
   return req.user._id;
+};
+
+const parseIdList = (value) => {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.filter(Boolean);
+  return String(value)
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+};
+
+const getValidSocialAccountIds = async (accountIds, userId) => {
+  const uniqueIds = [...new Set(accountIds)];
+  if (uniqueIds.length === 0) return [];
+
+  const accounts = await SocialAccount.find({
+    _id: { $in: uniqueIds },
+    userId,
+    isConnected: true,
+  }).select('_id');
+
+  return accounts.map((account) => account._id);
 };
 
 // Multer in-memory storage configuration
@@ -111,7 +134,7 @@ router.delete('/folders/:id', protect, authorize('owner', 'admin'), async (req, 
 // @route   GET /api/media
 // @access  Private
 router.get('/', protect, async (req, res) => {
-  const { folderId, tag } = req.query;
+  const { folderId, tag, accountId } = req.query;
 
   try {
     const isConnected = getDBStatus();
@@ -123,6 +146,9 @@ router.get('/', protect, async (req, res) => {
       }
       if (tag) {
         filtered = filtered.filter(m => m.tags.includes(tag.toLowerCase()));
+      }
+      if (accountId) {
+        filtered = filtered.filter(m => (m.socialAccountIds || []).includes(accountId));
       }
       
       // Sort newest first
@@ -136,8 +162,13 @@ router.get('/', protect, async (req, res) => {
     if (tag) {
       query.tags = tag.toLowerCase();
     }
+    if (accountId) {
+      query.socialAccountIds = accountId;
+    }
 
-    const media = await Media.find(query).sort({ createdAt: -1 });
+    const media = await Media.find(query)
+      .populate('socialAccountIds', 'name username platform avatarUrl isConnected')
+      .sort({ createdAt: -1 });
     res.status(200).json(media);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -152,7 +183,8 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
     return res.status(400).json({ message: 'No file uploaded' });
   }
 
-  const { folderId, tags } = req.body;
+  const { folderId, tags, caption } = req.body;
+  const requestedAccountIds = parseIdList(req.body.socialAccountIds);
   const mimeType = req.file.mimetype;
   let mediaType = 'image';
 
@@ -163,10 +195,19 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
   }
 
   try {
-    const { url, storageKey } = await uploadFile(req.file);
     const tagList = tags ? tags.split(',').map(t => t.trim().toLowerCase()) : [];
-
     const isConnected = getDBStatus();
+    let socialAccountIds = requestedAccountIds;
+
+    if (isConnected) {
+      socialAccountIds = await getValidSocialAccountIds(requestedAccountIds, req.user._id);
+      if (requestedAccountIds.length === 0 || socialAccountIds.length !== requestedAccountIds.length) {
+        return res.status(400).json({ message: 'Select at least one connected social account for this media asset.' });
+      }
+    }
+
+    const { url, storageKey } = await uploadFile(req.file);
+
     if (!isConnected) {
       const newMedia = {
         _id: `m_${Date.now()}`,
@@ -175,6 +216,8 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
         type: mediaType,
         url,
         storageKey,
+        caption: caption || '',
+        socialAccountIds,
         tags: tagList,
         size: req.file.size,
         createdAt: new Date(),
@@ -186,17 +229,71 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
     const media = await Media.create({
       userId: req.user._id,
       folderId: folderId && folderId !== 'null' ? folderId : null,
+      socialAccountIds,
       name: req.file.originalname,
       type: mediaType,
       url,
       storageKey,
+      caption: caption || '',
       tags: tagList,
       size: req.file.size,
     });
 
-    res.status(201).json(media);
+    const populated = await Media.findById(media._id)
+      .populate('socialAccountIds', 'name username platform avatarUrl isConnected');
+
+    res.status(201).json(populated);
   } catch (error) {
     console.error('Upload error in route:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Update media metadata
+// @route   PUT /api/media/:id
+// @access  Private (Owner, Admin, Editor)
+router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
+  const { id } = req.params;
+  const { caption, tags } = req.body;
+
+  try {
+    const isConnected = getDBStatus();
+
+    if (!isConnected) {
+      const mediaItem = mockStore.media.find(m => m._id === id);
+      if (!mediaItem) {
+        return res.status(404).json({ message: 'Media not found' });
+      }
+      if (caption !== undefined) mediaItem.caption = caption;
+      if (tags !== undefined) {
+        mediaItem.tags = Array.isArray(tags)
+          ? tags.map(tag => String(tag).trim().toLowerCase()).filter(Boolean)
+          : String(tags).split(',').map(tag => tag.trim().toLowerCase()).filter(Boolean);
+      }
+      mediaItem.updatedAt = new Date();
+      return res.status(200).json(mediaItem);
+    }
+
+    const updates = {};
+    if (caption !== undefined) updates.caption = caption;
+    if (tags !== undefined) {
+      updates.tags = Array.isArray(tags)
+        ? tags.map(tag => String(tag).trim().toLowerCase()).filter(Boolean)
+        : String(tags).split(',').map(tag => tag.trim().toLowerCase()).filter(Boolean);
+    }
+
+    const media = await Media.findOneAndUpdate(
+      { _id: id, userId: req.user._id },
+      updates,
+      { new: true }
+    ).populate('socialAccountIds', 'name username platform avatarUrl isConnected');
+
+    if (!media) {
+      return res.status(404).json({ message: 'Media not found' });
+    }
+
+    res.status(200).json(media);
+  } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });

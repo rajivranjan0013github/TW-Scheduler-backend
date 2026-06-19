@@ -12,6 +12,11 @@ const MediaSchema = new mongoose.Schema({
     ref: 'Folder',
     default: null,
   },
+  socialAccountIds: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'SocialAccount',
+    index: true,
+  }],
   name: {
     type: String,
     required: true,
@@ -28,6 +33,10 @@ const MediaSchema = new mongoose.Schema({
   storageKey: {
     type: String,
     required: true,
+  },
+  caption: {
+    type: String,
+    default: '',
   },
   tags: [String],
   size: {
