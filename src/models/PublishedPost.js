@@ -61,6 +61,23 @@ const PublishedPostSchema = new mongoose.Schema({
     type: Number,
     default: 0,
   },
+  commentsPreview: [{
+    id: {
+      type: String,
+      default: '',
+    },
+    username: {
+      type: String,
+      default: '',
+    },
+    text: {
+      type: String,
+      default: '',
+    },
+    timestamp: {
+      type: Date,
+    },
+  }],
 }, { timestamps: true });
 
 // Prevent duplicate posts per user

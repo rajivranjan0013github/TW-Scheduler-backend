@@ -10,6 +10,15 @@ import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount, fetchYoutubeVideos } 
 
 const router = express.Router();
 const insightSkipCache = new Map();
+
+const serializeCommentsPreview = (comments = []) => (
+  comments.map((comment) => ({
+    id: comment.id || '',
+    username: comment.username || comment.from?.name || '',
+    text: comment.text || comment.message || '',
+    timestamp: comment.timestamp || comment.created_time || null,
+  })).filter(comment => comment.text).slice(0, 3)
+);
 const INSIGHT_SKIP_MS = 15 * 60 * 1000;
 const ADMIN_ROLES = ['owner', 'admin'];
 
@@ -667,6 +676,7 @@ router.get('/posts/recent', protect, async (req, res) => {
       views: post.latestViews || 0,
       likes: post.latestLikes || 0,
       comments: post.latestComments || 0,
+      commentsPreview: serializeCommentsPreview(post.commentsPreview || []),
       lastSyncedAt: post.lastSyncedAt,
     }));
 
@@ -725,6 +735,7 @@ router.get('/:id/posts', protect, async (req, res) => {
             views: post.latestViews || 0,
             likes: post.latestLikes || 0,
             comments: post.latestComments || 0,
+            commentsPreview: serializeCommentsPreview(post.commentsPreview || []),
             lastSyncedAt: post.lastSyncedAt,
           }));
           return res.status(200).json(result);
@@ -754,6 +765,30 @@ router.get('/:id/posts', protect, async (req, res) => {
       }
     };
 
+    const getCommentsPreview = async (postId) => {
+      try {
+        const graphHost = account.platform === 'instagram' && account.authProvider === 'instagram'
+          ? 'graph.instagram.com'
+          : 'graph.facebook.com';
+        const fields = account.platform === 'facebook'
+          ? 'id,from,message,created_time'
+          : 'id,username,text,timestamp';
+        const url = `https://${graphHost}/v20.0/${postId}/comments?fields=${fields}&limit=3&access_token=${account.accessToken}`;
+        const commentsRes = await fetch(url);
+        const commentsData = await commentsRes.json();
+
+        if (!commentsRes.ok) {
+          console.warn(`Comments preview failed for post ${postId}:`, commentsData.error?.message || 'Unknown error');
+          return [];
+        }
+
+        return serializeCommentsPreview(commentsData.data || []);
+      } catch (error) {
+        console.warn(`Comments preview failed for post ${postId}:`, error.message);
+        return [];
+      }
+    };
+
     // Call actual Meta APIs
     let posts = [];
     if (account.platform === 'facebook') {
@@ -763,10 +798,11 @@ router.get('/:id/posts', protect, async (req, res) => {
       
       if (apiRes.ok) {
         posts = await Promise.all((apiData.data || []).map(async (post) => {
-          const [views, likes, activityByType] = await Promise.all([
+          const [views, likes, activityByType, commentsPreview] = await Promise.all([
             getInsightValue(post.id, 'post_impressions_unique'),
             getInsightValue(post.id, 'post_reactions_like_total'),
             getInsightValue(post.id, 'post_activity_by_action_type'),
+            getCommentsPreview(post.id),
           ]);
 
           return {
@@ -777,7 +813,8 @@ router.get('/:id/posts', protect, async (req, res) => {
             mediaUrl: post.full_picture || '',
             views: Number(views) || 0,
             likes: Number(likes) || 0,
-            comments: Number(activityByType?.comment) || 0
+            comments: Number(activityByType?.comment) || 0,
+            commentsPreview,
           };
         }));
       } else {
@@ -798,10 +835,11 @@ router.get('/:id/posts', protect, async (req, res) => {
 
       if (apiRes.ok) {
         posts = await Promise.all((apiData.data || []).map(async (post) => {
-          const [views, insightLikes, insightComments] = await Promise.all([
+          const [views, insightLikes, insightComments, commentsPreview] = await Promise.all([
             getInsightValue(post.id, 'views'),
             getInsightValue(post.id, 'likes'),
             getInsightValue(post.id, 'comments'),
+            getCommentsPreview(post.id),
           ]);
 
           return {
@@ -814,7 +852,8 @@ router.get('/:id/posts', protect, async (req, res) => {
             mediaType: post.media_type,
             views: Number(views) || 0,
             likes: Number(insightLikes || post.like_count) || 0,
-            comments: Number(insightComments || post.comments_count) || 0
+            comments: Number(insightComments || post.comments_count) || 0,
+            commentsPreview,
           };
         }));
       } else {
@@ -847,6 +886,7 @@ router.get('/:id/posts', protect, async (req, res) => {
             latestViews: post.views,
             latestLikes: post.likes,
             latestComments: post.comments,
+            commentsPreview: post.commentsPreview || [],
           },
           { upsert: true, new: true, setDefaultsOnInsert: true }
         );
@@ -861,6 +901,7 @@ router.get('/:id/posts', protect, async (req, res) => {
     const result = posts.map(post => ({
       ...post,
       lastSyncedAt: new Date(),
+      commentsPreview: serializeCommentsPreview(post.commentsPreview || []),
     }));
 
     res.status(200).json(result);
