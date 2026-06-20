@@ -609,6 +609,78 @@ router.delete('/users/:id', protect, authorize('owner'), async (req, res) => {
   }
 });
 
+// @desc    List all folders for all users
+// @route   GET /api/admin/folders
+// @access  Private (Owner, Admin)
+router.get('/folders', protect, authorize('owner', 'admin'), async (req, res) => {
+  try {
+    if (!getDBStatus()) {
+      return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
+    }
+
+    const folders = await Folder.find()
+      .populate('userId', 'name email')
+      .sort({ name: 1 })
+      .lean();
+
+    res.status(200).json(folders);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Get folder details and its media contents
+// @route   GET /api/admin/folders/:id
+// @access  Private (Owner, Admin)
+router.get('/folders/:id', protect, authorize('owner', 'admin'), async (req, res) => {
+  try {
+    if (!getDBStatus()) {
+      return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
+    }
+
+    const folder = await Folder.findById(req.params.id)
+      .populate('userId', 'name email')
+      .lean();
+
+    if (!folder) {
+      return res.status(404).json({ message: 'Folder not found.' });
+    }
+
+    const media = await Media.find({ folderId: folder._id })
+      .populate('socialAccountIds', 'name username platform avatarUrl isConnected')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    res.status(200).json({ folder, media });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Delete any folder
+// @route   DELETE /api/admin/folders/:id
+// @access  Private (Owner, Admin)
+router.delete('/folders/:id', protect, authorize('owner', 'admin'), async (req, res) => {
+  try {
+    if (!getDBStatus()) {
+      return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
+    }
+
+    const folder = await Folder.findById(req.params.id);
+    if (!folder) {
+      return res.status(404).json({ message: 'Folder not found.' });
+    }
+
+    await Folder.deleteOne({ _id: req.params.id });
+    // Update all media referencing this folder to null
+    await Media.updateMany({ folderId: req.params.id }, { folderId: null });
+
+    res.status(200).json({ message: 'Folder deleted successfully.' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // @desc    List social accounts for campaign assignment
 // @route   GET /api/admin/social-accounts
 // @access  Private (Owner, Admin)

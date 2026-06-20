@@ -67,7 +67,7 @@ router.post('/login', async (req, res) => {
     }
 
     const isConnected = getDBStatus();
-    
+
     if (!isConnected) {
       return res.status(503).json({ message: 'Database disconnected. Sandbox login is disabled.' });
     }

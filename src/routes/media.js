@@ -49,6 +49,67 @@ const upload = multer({
   }
 });
 
+// @desc    Proxy media files from R2 to add CORS and CORP headers
+// @route   GET /api/media/proxy
+// @access  Public
+router.get('/proxy', async (req, res) => {
+  const { url } = req.query;
+  if (!url) {
+    return res.status(400).json({ message: 'URL parameter is required' });
+  }
+
+  try {
+    // Only allow proxying from trusted domains like R2
+    if (!url.startsWith('https://pub-') && !url.includes('r2.cloudflarestorage.com')) {
+      return res.status(403).json({ message: 'Access denied: untrusted media origin' });
+    }
+
+    const headers = {};
+    if (req.headers.range) {
+      headers.range = req.headers.range;
+    }
+
+    const response = await fetch(url, { headers });
+    
+    // Set headers
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    
+    const contentType = response.headers.get('content-type');
+    if (contentType) res.setHeader('Content-Type', contentType);
+
+    const acceptRanges = response.headers.get('accept-ranges');
+    if (acceptRanges) res.setHeader('Accept-Ranges', acceptRanges);
+
+    const contentRange = response.headers.get('content-range');
+    if (contentRange) res.setHeader('Content-Range', contentRange);
+
+    const contentLength = response.headers.get('content-length');
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+
+    if (response.status === 206) {
+      res.status(206);
+    } else if (!response.ok) {
+      return res.status(response.status).json({ message: 'Failed to fetch remote media' });
+    }
+
+    const reader = response.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      res.write(Buffer.from(value));
+    }
+    res.end();
+  } catch (error) {
+    console.error('Proxy error:', error.message);
+    if (!res.headersSent) {
+      res.status(500).json({ message: error.message });
+    }
+  }
+});
+
 // ================= Folder Routes =================
 
 // @desc    Get all folders
@@ -192,6 +253,8 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
     mediaType = 'video';
   } else if (mimeType.startsWith('image/')) {
     mediaType = 'image';
+  } else if (mimeType.startsWith('audio/') || mimeType === 'audio/mpeg' || mimeType === 'audio/mp3') {
+    mediaType = 'audio';
   }
 
   try {
