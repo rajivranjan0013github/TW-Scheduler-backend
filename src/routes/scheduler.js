@@ -39,7 +39,7 @@ const validateSchedulingAccess = async ({ userId, socialAccountIds, mediaIds, re
   const mediaIdList = idsToStrings(mediaIds);
 
   if (accountIds.length === 0 || mediaIdList.length === 0) {
-    return { ok: false, message: 'Must select social accounts and at least one media file' };
+    return { ok: false, message: 'Must select publishing channels and at least one media file' };
   }
 
   const [accounts, mediaItems] = await Promise.all([
@@ -48,7 +48,7 @@ const validateSchedulingAccess = async ({ userId, socialAccountIds, mediaIds, re
   ]);
 
   if (accounts.length !== accountIds.length) {
-    return { ok: false, message: 'One or more selected social accounts are not connected.' };
+    return { ok: false, message: 'One or more selected publishing channels are not connected.' };
   }
   if (mediaItems.length !== mediaIdList.length) {
     return { ok: false, message: 'One or more selected media assets were not found.' };
@@ -57,6 +57,9 @@ const validateSchedulingAccess = async ({ userId, socialAccountIds, mediaIds, re
   const accountSet = new Set(accountIds);
   const unavailableMedia = mediaItems.find((mediaItem) => {
     const availableAccountIds = idsToStrings(mediaItem.socialAccountIds);
+    if (availableAccountIds.length === 0) {
+      return false;
+    }
     if (requireEveryAccount) {
       return accountIds.some((accountId) => !availableAccountIds.includes(accountId));
     }
@@ -64,7 +67,7 @@ const validateSchedulingAccess = async ({ userId, socialAccountIds, mediaIds, re
   });
 
   if (unavailableMedia) {
-    return { ok: false, message: 'Selected media is not available for one or more selected social accounts.' };
+    return { ok: false, message: 'Selected media is restricted away from one or more selected publishing channels.' };
   }
 
   return { ok: true };
@@ -162,7 +165,7 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
   const { socialAccountIds, mediaIds, caption, startDate, intervalHours, type, platformSpecifics } = req.body;
 
   if (!socialAccountIds || !mediaIds || mediaIds.length === 0) {
-    return res.status(400).json({ message: 'Must select social accounts and at least one media file' });
+    return res.status(400).json({ message: 'Must select publishing channels and at least one media file' });
   }
 
   try {
@@ -197,7 +200,7 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
       });
     }
 
-    // For bulk scheduling: we loop through the social accounts, and for each account
+    // For bulk scheduling: we loop through the publishing channels, and for each channel
     // we sequence the media files with the specified hour gap.
     // e.g. 5 accounts, 50 reels = 250 scheduled posts
     let index = 0;

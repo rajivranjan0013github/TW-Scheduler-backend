@@ -6,7 +6,9 @@ import Folder from '../models/Folder.js';
 import Media from '../models/Media.js';
 import SocialAccount from '../models/SocialAccount.js';
 import { uploadFile, deleteFile } from '../services/r2Service.js';
+import { createAndUploadThumbnail, fetchMediaBuffer } from '../services/thumbnailService.js';
 import { protect, authorize } from '../middleware/auth.js';
+import { getOriginalStorageKey, getThumbnailStorageKey } from '../utils/storageKeys.js';
 
 const router = express.Router();
 const ADMIN_ROLES = ['owner', 'admin'];
@@ -38,6 +40,36 @@ const getValidSocialAccountIds = async (accountIds, userId) => {
   }).select('_id');
 
   return accounts.map((account) => account._id);
+};
+
+const thumbnailEligibleTypes = ['image', 'video'];
+
+const buildThumbnailFromUpload = async ({ file, mediaType, storageKey, thumbnailStorageKey }) => {
+  if (!thumbnailEligibleTypes.includes(mediaType)) return {};
+  const thumbnail = await createAndUploadThumbnail({
+    buffer: file.buffer,
+    mediaType,
+    originalName: file.originalname,
+    baseStorageKey: storageKey,
+    thumbnailStorageKey,
+  });
+  return thumbnail || {};
+};
+
+const buildThumbnailFromMedia = async (mediaItem) => {
+  if (!mediaItem?.url || !thumbnailEligibleTypes.includes(mediaItem.type)) return null;
+  const buffer = await fetchMediaBuffer(mediaItem.url);
+  return createAndUploadThumbnail({
+    buffer,
+    mediaType: mediaItem.type,
+    originalName: mediaItem.name,
+    baseStorageKey: mediaItem.storageKey || mediaItem._id,
+    thumbnailStorageKey: getThumbnailStorageKey({
+      userId: mediaItem.userId,
+      folderId: mediaItem.folderId,
+      mediaId: mediaItem._id,
+    }),
+  });
 };
 
 // Multer in-memory storage configuration
@@ -209,7 +241,10 @@ router.get('/', protect, async (req, res) => {
         filtered = filtered.filter(m => m.tags.includes(tag.toLowerCase()));
       }
       if (accountId) {
-        filtered = filtered.filter(m => (m.socialAccountIds || []).includes(accountId));
+        filtered = filtered.filter((m) => {
+          const mediaAccountIds = m.socialAccountIds || [];
+          return mediaAccountIds.length === 0 || mediaAccountIds.includes(accountId);
+        });
       }
       
       // Sort newest first
@@ -224,7 +259,10 @@ router.get('/', protect, async (req, res) => {
       query.tags = tag.toLowerCase();
     }
     if (accountId) {
-      query.socialAccountIds = accountId;
+      query.$or = [
+        { socialAccountIds: accountId },
+        { socialAccountIds: { $size: 0 } },
+      ];
     }
 
     const media = await Media.find(query)
@@ -264,21 +302,39 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
 
     if (isConnected) {
       socialAccountIds = await getValidSocialAccountIds(requestedAccountIds, req.user._id);
-      if (requestedAccountIds.length === 0 || socialAccountIds.length !== requestedAccountIds.length) {
-        return res.status(400).json({ message: 'Select at least one connected social account for this media asset.' });
+      if (requestedAccountIds.length > 0 && socialAccountIds.length !== requestedAccountIds.length) {
+        return res.status(400).json({ message: 'One or more selected publishing channels are not connected.' });
       }
     }
 
-    const { url, storageKey } = await uploadFile(req.file);
-
     if (!isConnected) {
+      const mediaId = `m_${Date.now()}`;
+      const resolvedFolderId = folderId && folderId !== 'null' ? folderId : null;
+      const storageKey = getOriginalStorageKey({
+        userId: req.user?._id || 'mock-user',
+        folderId: resolvedFolderId,
+        mediaId,
+        originalName: req.file.originalname,
+      });
+      const { url } = await uploadFile({ ...req.file, storageKey });
+      const thumbnailFields = await buildThumbnailFromUpload({
+        file: req.file,
+        mediaType,
+        storageKey,
+        thumbnailStorageKey: getThumbnailStorageKey({
+          userId: req.user?._id || 'mock-user',
+          folderId: resolvedFolderId,
+          mediaId,
+        }),
+      });
       const newMedia = {
-        _id: `m_${Date.now()}`,
-        folderId: folderId && folderId !== 'null' ? folderId : null,
+        _id: mediaId,
+        folderId: resolvedFolderId,
         name: req.file.originalname,
         type: mediaType,
         url,
         storageKey,
+        ...thumbnailFields,
         caption: caption || '',
         socialAccountIds,
         tags: tagList,
@@ -289,14 +345,36 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
       return res.status(201).json(newMedia);
     }
 
-    const media = await Media.create({
+    const mediaId = new Media()._id;
+    const resolvedFolderId = folderId && folderId !== 'null' ? folderId : null;
+    const storageKey = getOriginalStorageKey({
       userId: req.user._id,
-      folderId: folderId && folderId !== 'null' ? folderId : null,
+      folderId: resolvedFolderId,
+      mediaId,
+      originalName: req.file.originalname,
+    });
+    const { url } = await uploadFile({ ...req.file, storageKey });
+    const thumbnailFields = await buildThumbnailFromUpload({
+      file: req.file,
+      mediaType,
+      storageKey,
+      thumbnailStorageKey: getThumbnailStorageKey({
+        userId: req.user._id,
+        folderId: resolvedFolderId,
+        mediaId,
+      }),
+    });
+
+    const media = await Media.create({
+      _id: mediaId,
+      userId: req.user._id,
+      folderId: resolvedFolderId,
       socialAccountIds,
       name: req.file.originalname,
       type: mediaType,
       url,
       storageKey,
+      ...thumbnailFields,
       caption: caption || '',
       tags: tagList,
       size: req.file.size,
@@ -377,6 +455,9 @@ router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => 
 
       const mediaItem = mockStore.media[index];
       await deleteFile(mediaItem.storageKey);
+      if (mediaItem.thumbnailStorageKey) {
+        await deleteFile(mediaItem.thumbnailStorageKey);
+      }
       mockStore.media.splice(index, 1);
       return res.status(200).json({ message: 'Media asset deleted successfully' });
     }
@@ -387,8 +468,103 @@ router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => 
     }
 
     await deleteFile(media.storageKey);
+    if (media.thumbnailStorageKey) {
+      await deleteFile(media.thumbnailStorageKey);
+    }
     await Media.deleteOne({ _id: id, userId: req.user._id });
     res.status(200).json({ message: 'Media asset deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Generate missing low-quality thumbnails for existing media
+// @route   POST /api/media/thumbnails/backfill
+// @access  Private (Owner, Admin, Editor)
+router.post('/thumbnails/backfill', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
+  const { folderId, overwrite = false } = req.body;
+
+  try {
+    const isConnected = getDBStatus();
+    const query = {
+      userId: getScopedUserId(req),
+      type: { $in: thumbnailEligibleTypes },
+    };
+
+    if (folderId) {
+      query.folderId = folderId === 'root' ? null : folderId;
+    }
+
+    if (!overwrite) {
+      query.$or = [
+        { thumbnailUrl: { $exists: false } },
+        { thumbnailUrl: '' },
+        { thumbnailUrl: null },
+      ];
+    }
+
+    if (!isConnected) {
+      const candidates = mockStore.media.filter((item) => {
+        if (!thumbnailEligibleTypes.includes(item.type)) return false;
+        if (!overwrite && item.thumbnailUrl) return false;
+        if (!folderId) return true;
+        if (folderId === 'root') return !item.folderId;
+        return item.folderId === folderId;
+      });
+
+      const results = [];
+      for (const item of candidates) {
+        try {
+          const thumbnail = await buildThumbnailFromMedia(item);
+          if (thumbnail) {
+            Object.assign(item, thumbnail);
+            results.push({ id: item._id, status: 'generated' });
+          } else {
+            results.push({ id: item._id, status: 'skipped' });
+          }
+        } catch (error) {
+          results.push({ id: item._id, status: 'failed', message: error.message });
+        }
+      }
+
+      return res.status(200).json({
+        matched: candidates.length,
+        generated: results.filter(item => item.status === 'generated').length,
+        failed: results.filter(item => item.status === 'failed').length,
+        results,
+      });
+    }
+
+    const mediaItems = await Media.find(query);
+    const results = [];
+
+    for (const item of mediaItems) {
+      try {
+        if (overwrite && item.thumbnailStorageKey) {
+          await deleteFile(item.thumbnailStorageKey);
+        }
+
+        const thumbnail = await buildThumbnailFromMedia(item);
+        if (thumbnail) {
+          item.thumbnailUrl = thumbnail.thumbnailUrl;
+          item.thumbnailStorageKey = thumbnail.thumbnailStorageKey;
+          item.thumbnailGeneratedAt = thumbnail.thumbnailGeneratedAt;
+          await item.save();
+          results.push({ id: item._id, status: 'generated' });
+        } else {
+          results.push({ id: item._id, status: 'skipped' });
+        }
+      } catch (error) {
+        results.push({ id: item._id, status: 'failed', message: error.message });
+      }
+    }
+
+    res.status(200).json({
+      matched: mediaItems.length,
+      generated: results.filter(item => item.status === 'generated').length,
+      failed: results.filter(item => item.status === 'failed').length,
+      results,
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

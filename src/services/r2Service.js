@@ -1,4 +1,4 @@
-import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, DeleteObjectCommand, CopyObjectCommand } from '@aws-sdk/client-s3';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -12,6 +12,7 @@ const accessKeyId = process.env.R2_ACCESS_KEY_ID?.trim();
 const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY?.trim();
 
 const useR2 = accessKeyId && secretAccessKey && accountId;
+const bucketName = (process.env.R2_BUCKET_NAME || 'tw-creator-suite').trim();
 
 if (useR2) {
   try {
@@ -36,10 +37,9 @@ if (useR2) {
  */
 export const uploadFile = async (fileInfo) => {
   const fileExtension = path.extname(fileInfo.originalname);
-  const fileKey = `${Date.now()}-${Math.random().toString(36).substring(2, 15)}${fileExtension}`;
+  const fileKey = fileInfo.storageKey || `${Date.now()}-${Math.random().toString(36).substring(2, 15)}${fileExtension}`;
 
   if (useR2 && r2Client) {
-    const bucketName = (process.env.R2_BUCKET_NAME || 'tw-creator-suite').trim();
     try {
       const command = new PutObjectCommand({
         Bucket: bucketName,
@@ -69,6 +69,7 @@ export const uploadFile = async (fileInfo) => {
     }
 
     const localFilePath = path.join(uploadDir, fileKey);
+    fs.mkdirSync(path.dirname(localFilePath), { recursive: true });
     fs.writeFileSync(localFilePath, fileInfo.buffer);
 
     const port = process.env.PORT || 5001;
@@ -88,7 +89,6 @@ export const uploadFile = async (fileInfo) => {
  */
 export const deleteFile = async (storageKey) => {
   if (useR2 && r2Client) {
-    const bucketName = (process.env.R2_BUCKET_NAME || 'tw-creator-suite').trim();
     try {
       const command = new DeleteObjectCommand({
         Bucket: bucketName,
@@ -106,4 +106,50 @@ export const deleteFile = async (storageKey) => {
       fs.unlinkSync(localFilePath);
     }
   }
+};
+
+export const copyFile = async ({ fromKey, toKey, contentType }) => {
+  if (!fromKey || !toKey || fromKey === toKey) return null;
+
+  if (useR2 && r2Client) {
+    const command = new CopyObjectCommand({
+      Bucket: bucketName,
+      CopySource: `${bucketName}/${encodeURIComponent(fromKey).replace(/%2F/g, '/')}`,
+      Key: toKey,
+      ...(contentType ? { ContentType: contentType, MetadataDirective: 'REPLACE' } : {}),
+    });
+
+    await r2Client.send(command);
+
+    const publicBaseUrl = (process.env.R2_PUBLIC_URL || `https://${bucketName}.r2.cloudflarestorage.com`).trim();
+    return {
+      url: `${publicBaseUrl.replace(/\/$/, '')}/${toKey}`,
+      storageKey: toKey,
+    };
+  }
+
+  const uploadDir = path.join(__dirname, '../../public/uploads');
+  const sourcePath = path.join(uploadDir, fromKey);
+  const targetPath = path.join(uploadDir, toKey);
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  fs.copyFileSync(sourcePath, targetPath);
+
+  const port = process.env.PORT || 5001;
+  const backendUrl = process.env.BACKEND_URL || `http://localhost:${port}`;
+  return {
+    url: `${backendUrl}/uploads/${toKey}`,
+    storageKey: toKey,
+  };
+};
+
+export const getStorageUrl = (storageKey) => {
+  if (!storageKey) return '';
+  if (useR2 && r2Client) {
+    const publicBaseUrl = (process.env.R2_PUBLIC_URL || `https://${bucketName}.r2.cloudflarestorage.com`).trim();
+    return `${publicBaseUrl.replace(/\/$/, '')}/${storageKey}`;
+  }
+
+  const port = process.env.PORT || 5001;
+  const backendUrl = process.env.BACKEND_URL || `http://localhost:${port}`;
+  return `${backendUrl}/uploads/${storageKey}`;
 };

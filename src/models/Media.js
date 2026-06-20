@@ -34,6 +34,17 @@ const MediaSchema = new mongoose.Schema({
     type: String,
     required: true,
   },
+  thumbnailUrl: {
+    type: String,
+    default: '',
+  },
+  thumbnailStorageKey: {
+    type: String,
+    default: '',
+  },
+  thumbnailGeneratedAt: {
+    type: Date,
+  },
   caption: {
     type: String,
     default: '',
