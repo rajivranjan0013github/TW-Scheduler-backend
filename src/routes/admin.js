@@ -58,8 +58,12 @@ const getLast7DayActivity = (now = new Date()) => {
 };
 
 const getCampaignMetrics = async (campaign) => {
-  const accountIds = (campaign.accountIds || []).map((account) => account._id || account);
-  const accountDetails = (campaign.accountIds || []).map((account) => {
+  const scopedAccounts = await SocialAccount.find({ campaignId: campaign._id })
+    .populate('userId', 'name email')
+    .sort({ name: 1 })
+    .lean();
+  const accountIds = scopedAccounts.map((account) => account._id);
+  const accountDetails = scopedAccounts.map((account) => {
     const plain = account.toObject ? account.toObject() : account;
     return {
       _id: plain._id,
@@ -618,8 +622,10 @@ router.get('/folders', protect, authorize('owner', 'admin'), async (req, res) =>
       return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
     }
 
-    const folders = await Folder.find()
+    const query = req.query.campaignId ? { campaignId: req.query.campaignId } : {};
+    const folders = await Folder.find(query)
       .populate('userId', 'name email')
+      .populate('campaignId', 'name mainEmail')
       .sort({ name: 1 })
       .lean();
 
@@ -638,15 +644,22 @@ router.get('/folders/:id', protect, authorize('owner', 'admin'), async (req, res
       return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
     }
 
-    const folder = await Folder.findById(req.params.id)
+    const folderQuery = { _id: req.params.id };
+    if (req.query.campaignId) folderQuery.campaignId = req.query.campaignId;
+
+    const folder = await Folder.findOne(folderQuery)
       .populate('userId', 'name email')
+      .populate('campaignId', 'name mainEmail')
       .lean();
 
     if (!folder) {
       return res.status(404).json({ message: 'Folder not found.' });
     }
 
-    const media = await Media.find({ folderId: folder._id })
+    const mediaQuery = { folderId: folder._id };
+    if (req.query.campaignId) mediaQuery.campaignId = req.query.campaignId;
+
+    const media = await Media.find(mediaQuery)
       .populate('socialAccountIds', 'name username platform avatarUrl isConnected')
       .sort({ createdAt: -1 })
       .lean();
@@ -666,14 +679,19 @@ router.delete('/folders/:id', protect, authorize('owner', 'admin'), async (req, 
       return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
     }
 
-    const folder = await Folder.findById(req.params.id);
+    const folderQuery = { _id: req.params.id };
+    if (req.query.campaignId) folderQuery.campaignId = req.query.campaignId;
+
+    const folder = await Folder.findOne(folderQuery);
     if (!folder) {
       return res.status(404).json({ message: 'Folder not found.' });
     }
 
-    await Folder.deleteOne({ _id: req.params.id });
+    await Folder.deleteOne(folderQuery);
     // Update all media referencing this folder to null
-    await Media.updateMany({ folderId: req.params.id }, { folderId: null });
+    const mediaQuery = { folderId: req.params.id };
+    if (req.query.campaignId) mediaQuery.campaignId = req.query.campaignId;
+    await Media.updateMany(mediaQuery, { folderId: null });
 
     res.status(200).json({ message: 'Folder deleted successfully.' });
   } catch (error) {
@@ -735,7 +753,7 @@ router.post('/campaigns', protect, authorize('owner', 'admin'), async (req, res)
       return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
     }
 
-    const { name, description = '', status = 'active', accountIds = [] } = req.body;
+    const { name, description = '', mainEmail = req.user.email || '', status = 'active', accountIds = [] } = req.body;
     if (!name?.trim()) {
       return res.status(400).json({ message: 'Campaign name is required.' });
     }
@@ -745,6 +763,7 @@ router.post('/campaigns', protect, authorize('owner', 'admin'), async (req, res)
     const campaign = await Campaign.create({
       name: name.trim(),
       description,
+      mainEmail: mainEmail.trim().toLowerCase(),
       status,
       accountIds: validAccounts.map((account) => account._id),
       createdBy: req.user._id,
@@ -778,7 +797,7 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
       return res.status(404).json({ message: 'Campaign not found.' });
     }
 
-    const { name, description, status, accountIds } = req.body;
+    const { name, description, mainEmail, status, accountIds } = req.body;
 
     if (name !== undefined) {
       if (!name.trim()) {
@@ -788,6 +807,7 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
     }
 
     if (description !== undefined) campaign.description = description;
+    if (mainEmail !== undefined) campaign.mainEmail = mainEmail.trim().toLowerCase();
     if (status !== undefined) campaign.status = status;
 
     if (Array.isArray(accountIds)) {

@@ -7,6 +7,11 @@ const SocialAccountSchema = new mongoose.Schema({
     required: true,
     index: true,
   },
+  campaignId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Campaign',
+    index: true,
+  },
   platform: {
     type: String,
     enum: ['instagram', 'facebook', 'youtube'],

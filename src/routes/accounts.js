@@ -2,6 +2,7 @@ import express from 'express';
 import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import SocialAccount from '../models/SocialAccount.js';
+import Campaign from '../models/Campaign.js';
 import Insight from '../models/Insight.js';
 import PublishedPost from '../models/PublishedPost.js';
 import PostInsight from '../models/PostInsight.js';
@@ -36,6 +37,42 @@ const getScopedUserId = (req) => {
   return req.user._id;
 };
 
+const getActiveCampaignId = (req) => req.query.campaignId || req.body?.campaignId || null;
+
+const canAccessCampaign = async (req, campaignId) => {
+  if (!campaignId) return false;
+  if (ADMIN_ROLES.includes(req.user?.role)) return true;
+
+  const userEmail = (req.user.email || '').trim().toLowerCase();
+  const campaign = await Campaign.findOne({
+    _id: campaignId,
+    status: { $ne: 'archived' },
+    $or: [
+      { mainEmail: userEmail },
+      { mainEmail: { $in: ['', null] }, createdBy: req.user._id },
+      { createdBy: req.user._id },
+    ],
+  }).select('_id').lean();
+
+  return Boolean(campaign);
+};
+
+const getScopedAccountQuery = async (req, extra = {}) => {
+  const campaignId = getActiveCampaignId(req);
+  if (campaignId) {
+    const allowed = await canAccessCampaign(req, campaignId);
+    if (!allowed) {
+      const error = new Error('Campaign access denied.');
+      error.statusCode = 403;
+      throw error;
+    }
+
+    return { campaignId, ...extra };
+  }
+
+  return { userId: getScopedUserId(req), ...extra };
+};
+
 // @desc    Get all connected accounts
 // @route   GET /api/accounts
 // @access  Private
@@ -46,8 +83,36 @@ router.get('/', protect, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected.' });
     }
 
-    const accounts = await SocialAccount.find({ userId: getScopedUserId(req) });
+    const accounts = await SocialAccount.find(await getScopedAccountQuery(req));
     res.status(200).json(accounts);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message });
+  }
+});
+
+// @desc    Get campaign workspaces visible to the signed-in user's email
+// @route   GET /api/accounts/campaigns
+// @access  Private
+router.get('/campaigns', protect, async (req, res) => {
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      return res.status(503).json({ message: 'Database disconnected.' });
+    }
+
+    const userEmail = (req.user.email || '').trim().toLowerCase();
+    const campaigns = await Campaign.find({
+      status: { $ne: 'archived' },
+      $or: [
+        { mainEmail: userEmail },
+        { mainEmail: { $in: ['', null] }, createdBy: req.user._id },
+      ],
+    })
+      .populate('createdBy', 'name email')
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    res.status(200).json(campaigns);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -64,7 +129,7 @@ router.get('/insights', protect, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected. Insights service is unavailable.' });
     }
 
-    const accounts = await SocialAccount.find({ userId: getScopedUserId(req), isConnected: true });
+    const accounts = await SocialAccount.find(await getScopedAccountQuery(req, { isConnected: true }));
     if (accounts.length === 0) {
       return res.status(200).json([]);
     }
@@ -208,6 +273,7 @@ router.get('/insights', protect, async (req, res) => {
 
         // Cache retrieved dates in MongoDB (including today's current count)
         const insertDocs = Object.keys(results).map(dateStr => ({
+          campaignId: account.campaignId,
           accountId: account._id,
           dateStr,
           platform: account.platform,
@@ -264,7 +330,7 @@ router.get('/insights', protect, async (req, res) => {
 // @route   POST /api/accounts/connect
 // @access  Private (Owner, Admin)
 router.post('/connect', protect, authorize('owner', 'admin'), async (req, res) => {
-  const { platform, accountId, name, username, accessToken, avatarUrl } = req.body;
+  const { platform, accountId, name, username, accessToken, avatarUrl, campaignId } = req.body;
 
   try {
     const isConnected = getDBStatus();
@@ -276,10 +342,12 @@ router.post('/connect', protect, authorize('owner', 'admin'), async (req, res) =
     if (account) {
       account.isConnected = true;
       account.accessToken = accessToken || 'mock-access-token';
+      account.campaignId = campaignId || undefined;
       await account.save();
     } else {
       account = await SocialAccount.create({
         userId: req.user._id,
+        campaignId: campaignId || undefined,
         platform,
         accountId,
         name,
@@ -312,7 +380,7 @@ router.get('/youtube/auth-url', protect, authorize('owner', 'admin'), async (req
 // @route   POST /api/accounts/youtube-callback
 // @access  Private (Owner, Admin)
 router.post('/youtube-callback', protect, authorize('owner', 'admin'), async (req, res) => {
-  const { code } = req.body;
+  const { code, campaignId } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
   }
@@ -330,7 +398,10 @@ router.post('/youtube-callback', protect, authorize('owner', 'admin'), async (re
         platform: 'youtube',
         accountId: accountPayload.accountId,
       },
-      accountPayload,
+      {
+        ...accountPayload,
+        campaignId: campaignId || undefined,
+      },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
@@ -372,7 +443,7 @@ router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => 
 // @route   POST /api/accounts/facebook-callback
 // @access  Private (Owner, Admin)
 router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (req, res) => {
-  const { code } = req.body;
+  const { code, campaignId } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
   }
@@ -494,6 +565,7 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
         { userId: req.user._id, accountId: pageId },
         {
           userId: req.user._id,
+          campaignId: campaignId || undefined,
           platform: 'facebook',
           name: pageName,
           username: pageUsername,
@@ -528,6 +600,7 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
           { userId: req.user._id, accountId: igAccountId },
           {
             userId: req.user._id,
+            campaignId: campaignId || undefined,
             platform: 'instagram',
             name: igName,
             username: igUsername,
@@ -556,7 +629,7 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
 // @route   POST /api/accounts/instagram-callback
 // @access  Private (Owner, Admin)
 router.post('/instagram-callback', protect, authorize('owner', 'admin'), async (req, res) => {
-  const { code, redirectUri: requestRedirectUri } = req.body;
+  const { code, redirectUri: requestRedirectUri, campaignId } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
   }
@@ -627,6 +700,7 @@ router.post('/instagram-callback', protect, authorize('owner', 'admin'), async (
       { userId: req.user._id, platform: 'instagram', accountId: instagramAccountId },
       {
         userId: req.user._id,
+        campaignId: campaignId || undefined,
         platform: 'instagram',
         accountId: instagramAccountId,
         name,
@@ -660,7 +734,16 @@ router.get('/posts/recent', protect, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected.' });
     }
 
-    const posts = await PublishedPost.find({ userId: getScopedUserId(req) })
+    const postQuery = {};
+    const campaignId = getActiveCampaignId(req);
+    if (campaignId) {
+      const accounts = await SocialAccount.find(await getScopedAccountQuery(req)).select('_id').lean();
+      postQuery.accountId = { $in: accounts.map((account) => account._id) };
+    } else {
+      postQuery.userId = getScopedUserId(req);
+    }
+
+    const posts = await PublishedPost.find(postQuery)
       .sort({ publishedAt: -1 })
       .limit(25);
 
@@ -873,6 +956,7 @@ router.get('/:id/posts', protect, async (req, res) => {
           { userId: account.userId, metaPostId: post.id },
           {
             userId: account.userId,
+            campaignId: account.campaignId,
             accountId: account._id,
             metaPostId: post.id,
             platform: account.platform,

@@ -6,6 +6,11 @@ const PublishedPostSchema = new mongoose.Schema({
     ref: 'User',
     required: true,
   },
+  campaignId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Campaign',
+    index: true,
+  },
   accountId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'SocialAccount',

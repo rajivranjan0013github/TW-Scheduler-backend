@@ -136,6 +136,7 @@ export const runInsightSync = async () => {
             await PostInsight.findOneAndUpdate(
               { postId: post._id, dateStr: todayStr },
               {
+                campaignId: account.campaignId,
                 postId: post._id,
                 accountId: account._id,
                 dateStr: todayStr,

@@ -7,6 +7,11 @@ const MediaSchema = new mongoose.Schema({
     required: true,
     index: true,
   },
+  campaignId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Campaign',
+    index: true,
+  },
   folderId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Folder',

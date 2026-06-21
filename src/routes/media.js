@@ -20,6 +20,26 @@ const getScopedUserId = (req) => {
   return req.user._id;
 };
 
+const getActiveCampaignId = (req) => req.query.campaignId || req.body?.campaignId || null;
+
+const requireCampaignId = (req, res) => {
+  const campaignId = getActiveCampaignId(req);
+  if (!campaignId) {
+    res.status(400).json({ message: 'Campaign is required.' });
+    return null;
+  }
+  return campaignId;
+};
+
+const getCampaignQuery = (req, extra = {}) => {
+  const campaignId = getActiveCampaignId(req);
+  if (campaignId) {
+    return { campaignId, ...extra };
+  }
+
+  return { userId: getScopedUserId(req), ...extra };
+};
+
 const parseIdList = (value) => {
   if (!value) return [];
   if (Array.isArray(value)) return value.filter(Boolean);
@@ -29,13 +49,13 @@ const parseIdList = (value) => {
     .filter(Boolean);
 };
 
-const getValidSocialAccountIds = async (accountIds, userId) => {
+const getValidSocialAccountIds = async (accountIds, campaignId) => {
   const uniqueIds = [...new Set(accountIds)];
   if (uniqueIds.length === 0) return [];
 
   const accounts = await SocialAccount.find({
     _id: { $in: uniqueIds },
-    userId,
+    campaignId,
     isConnected: true,
   }).select('_id');
 
@@ -153,7 +173,9 @@ router.get('/folders', protect, async (req, res) => {
     if (!isConnected) {
       return res.status(200).json(mockStore.folders);
     }
-    const folders = await Folder.find({ userId: req.user._id });
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+    const folders = await Folder.find(getCampaignQuery(req));
     res.status(200).json(folders);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -179,7 +201,9 @@ router.post('/folders', protect, authorize('owner', 'admin', 'editor'), async (r
       return res.status(201).json(newFolder);
     }
 
-    const folder = await Folder.create({ userId: req.user._id, name, parentFolderId: parentFolderId || null });
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+    const folder = await Folder.create({ userId: req.user._id, campaignId, name, parentFolderId: parentFolderId || null });
     res.status(201).json(folder);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -207,14 +231,16 @@ router.delete('/folders/:id', protect, authorize('owner', 'admin'), async (req, 
       return res.status(200).json({ message: 'Folder deleted successfully' });
     }
 
-    const folder = await Folder.findOne({ _id: id, userId: req.user._id });
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+    const folder = await Folder.findOne({ _id: id, campaignId });
     if (!folder) {
       return res.status(404).json({ message: 'Folder not found' });
     }
 
-    await Folder.deleteOne({ _id: id, userId: req.user._id });
+    await Folder.deleteOne({ _id: id, campaignId });
     // Update media referencing this folder to null
-    await Media.updateMany({ userId: req.user._id, folderId: id }, { folderId: null });
+    await Media.updateMany({ campaignId, folderId: id }, { folderId: null });
     res.status(200).json({ message: 'Folder deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -251,7 +277,9 @@ router.get('/', protect, async (req, res) => {
       filtered.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
       return res.status(200).json(filtered);
     }
-    const query = { userId: getScopedUserId(req) };
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+    const query = getCampaignQuery(req);
     if (folderId) {
       query.folderId = folderId === 'root' ? null : folderId;
     }
@@ -283,6 +311,8 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
   }
 
   const { folderId, tags, caption } = req.body;
+  const campaignId = requireCampaignId(req, res);
+  if (!campaignId) return;
   const requestedAccountIds = parseIdList(req.body.socialAccountIds);
   const mimeType = req.file.mimetype;
   let mediaType = 'image';
@@ -301,7 +331,7 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
     let socialAccountIds = requestedAccountIds;
 
     if (isConnected) {
-      socialAccountIds = await getValidSocialAccountIds(requestedAccountIds, req.user._id);
+      socialAccountIds = await getValidSocialAccountIds(requestedAccountIds, campaignId);
       if (requestedAccountIds.length > 0 && socialAccountIds.length !== requestedAccountIds.length) {
         return res.status(400).json({ message: 'One or more selected publishing channels are not connected.' });
       }
@@ -312,6 +342,7 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
       const resolvedFolderId = folderId && folderId !== 'null' ? folderId : null;
       const storageKey = getOriginalStorageKey({
         userId: req.user?._id || 'mock-user',
+        campaignId,
         folderId: resolvedFolderId,
         mediaId,
         originalName: req.file.originalname,
@@ -349,6 +380,7 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
     const resolvedFolderId = folderId && folderId !== 'null' ? folderId : null;
     const storageKey = getOriginalStorageKey({
       userId: req.user._id,
+      campaignId,
       folderId: resolvedFolderId,
       mediaId,
       originalName: req.file.originalname,
@@ -368,6 +400,7 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
     const media = await Media.create({
       _id: mediaId,
       userId: req.user._id,
+      campaignId,
       folderId: resolvedFolderId,
       socialAccountIds,
       name: req.file.originalname,
@@ -423,8 +456,10 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
         : String(tags).split(',').map(tag => tag.trim().toLowerCase()).filter(Boolean);
     }
 
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
     const media = await Media.findOneAndUpdate(
-      { _id: id, userId: req.user._id },
+      { _id: id, campaignId },
       updates,
       { new: true }
     ).populate('socialAccountIds', 'name username platform avatarUrl isConnected');
@@ -462,7 +497,9 @@ router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => 
       return res.status(200).json({ message: 'Media asset deleted successfully' });
     }
 
-    const media = await Media.findOne({ _id: id, userId: req.user._id });
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+    const media = await Media.findOne({ _id: id, campaignId });
     if (!media) {
       return res.status(404).json({ message: 'Media not found' });
     }
@@ -471,7 +508,7 @@ router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => 
     if (media.thumbnailStorageKey) {
       await deleteFile(media.thumbnailStorageKey);
     }
-    await Media.deleteOne({ _id: id, userId: req.user._id });
+    await Media.deleteOne({ _id: id, campaignId });
     res.status(200).json({ message: 'Media asset deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -486,8 +523,10 @@ router.post('/thumbnails/backfill', protect, authorize('owner', 'admin', 'editor
 
   try {
     const isConnected = getDBStatus();
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
     const query = {
-      userId: getScopedUserId(req),
+      campaignId,
       type: { $in: thumbnailEligibleTypes },
     };
 

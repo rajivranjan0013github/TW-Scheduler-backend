@@ -1,6 +1,11 @@
 import mongoose from 'mongoose';
 
 const PostInsightSchema = new mongoose.Schema({
+  campaignId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Campaign',
+    index: true,
+  },
   postId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'PublishedPost',

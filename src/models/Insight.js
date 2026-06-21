@@ -1,6 +1,11 @@
 import mongoose from 'mongoose';
 
 const InsightSchema = new mongoose.Schema({
+  campaignId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Campaign',
+    index: true,
+  },
   accountId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'SocialAccount',

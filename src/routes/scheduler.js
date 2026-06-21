@@ -17,6 +17,17 @@ const getScopedUserId = (req) => {
   return req.user._id;
 };
 
+const getActiveCampaignId = (req) => req.query.campaignId || req.body?.campaignId || null;
+
+const requireCampaignId = (req, res) => {
+  const campaignId = getActiveCampaignId(req);
+  if (!campaignId) {
+    res.status(400).json({ message: 'Campaign is required.' });
+    return null;
+  }
+  return campaignId;
+};
+
 const idsToStrings = (items = []) => items.map((item) => String(item?._id || item));
 
 const withPostCaption = (platformSpecifics, postCaption, type) => {
@@ -34,7 +45,7 @@ const withPostCaption = (platformSpecifics, postCaption, type) => {
   return nextSpecifics;
 };
 
-const validateSchedulingAccess = async ({ userId, socialAccountIds, mediaIds, requireEveryAccount = true }) => {
+const validateSchedulingAccess = async ({ campaignId, socialAccountIds, mediaIds, requireEveryAccount = true }) => {
   const accountIds = idsToStrings(socialAccountIds);
   const mediaIdList = idsToStrings(mediaIds);
 
@@ -43,8 +54,8 @@ const validateSchedulingAccess = async ({ userId, socialAccountIds, mediaIds, re
   }
 
   const [accounts, mediaItems] = await Promise.all([
-    SocialAccount.find({ _id: { $in: accountIds }, userId, isConnected: true }).select('_id'),
-    Media.find({ _id: { $in: mediaIdList }, userId }).select('_id socialAccountIds'),
+    SocialAccount.find({ _id: { $in: accountIds }, campaignId, isConnected: true }).select('_id'),
+    Media.find({ _id: { $in: mediaIdList }, campaignId }).select('_id socialAccountIds'),
   ]);
 
   if (accounts.length !== accountIds.length) {
@@ -52,22 +63,6 @@ const validateSchedulingAccess = async ({ userId, socialAccountIds, mediaIds, re
   }
   if (mediaItems.length !== mediaIdList.length) {
     return { ok: false, message: 'One or more selected media assets were not found.' };
-  }
-
-  const accountSet = new Set(accountIds);
-  const unavailableMedia = mediaItems.find((mediaItem) => {
-    const availableAccountIds = idsToStrings(mediaItem.socialAccountIds);
-    if (availableAccountIds.length === 0) {
-      return false;
-    }
-    if (requireEveryAccount) {
-      return accountIds.some((accountId) => !availableAccountIds.includes(accountId));
-    }
-    return !availableAccountIds.some((accountId) => accountSet.has(accountId));
-  });
-
-  if (unavailableMedia) {
-    return { ok: false, message: 'Selected media is restricted away from one or more selected publishing channels.' };
   }
 
   return { ok: true };
@@ -85,7 +80,9 @@ router.get('/', protect, async (req, res) => {
       return res.status(200).json(sorted);
     }
 
-    const posts = await ScheduledPost.find({ userId: getScopedUserId(req) })
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+    const posts = await ScheduledPost.find({ campaignId })
       .populate('socialAccountIds')
       .populate('mediaIds')
       .sort({ scheduledAt: 1 });
@@ -104,6 +101,8 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
 
   try {
     const isConnected = getDBStatus();
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
     const scheduledDate = new Date(scheduledAt);
     let postCaption = caption || '';
 
@@ -128,7 +127,7 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
     }
 
     const access = await validateSchedulingAccess({
-      userId: req.user._id,
+      campaignId,
       socialAccountIds,
       mediaIds,
       requireEveryAccount: true,
@@ -138,12 +137,13 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
     }
 
     if (!postCaption && mediaIds?.[0]) {
-      const mediaItem = await Media.findOne({ _id: mediaIds[0], userId: req.user._id }).select('caption');
+      const mediaItem = await Media.findOne({ _id: mediaIds[0], campaignId }).select('caption');
       postCaption = mediaItem?.caption || '';
     }
 
     const post = await ScheduledPost.create({
       userId: req.user._id,
+      campaignId,
       socialAccountIds,
       mediaIds,
       caption: postCaption,
@@ -170,6 +170,8 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
 
   try {
     const isConnected = getDBStatus();
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
     const baseDate = new Date(startDate || Date.now());
     const intervalMs = (parseFloat(intervalHours) || 2) * 60 * 60 * 1000;
     const createdPosts = [];
@@ -177,7 +179,7 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
 
     if (isConnected) {
       const access = await validateSchedulingAccess({
-        userId: req.user._id,
+        campaignId,
         socialAccountIds,
         mediaIds,
         requireEveryAccount: true,
@@ -188,7 +190,7 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
 
       const mediaItems = await Media.find({
         _id: { $in: idsToStrings(mediaIds) },
-        userId: req.user._id,
+        campaignId,
       }).select('_id caption');
 
       mediaItems.forEach((mediaItem) => {
@@ -230,6 +232,7 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
         } else {
           const post = await ScheduledPost.create({
             userId: req.user._id,
+            campaignId,
             socialAccountIds: [accountId],
             mediaIds: [mediaId],
             caption: postCaption,
@@ -264,6 +267,8 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
 
   try {
     const isConnected = getDBStatus();
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
 
     if (!isConnected) {
       const post = mockStore.scheduledPosts.find(p => p._id === id);
@@ -282,14 +287,14 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
       return res.status(200).json(post);
     }
 
-    const post = await ScheduledPost.findOne({ _id: id, userId: req.user._id });
+    const post = await ScheduledPost.findOne({ _id: id, campaignId });
     if (!post) {
       return res.status(404).json({ message: 'Post not found' });
     }
 
     if (mediaIds || socialAccountIds) {
       const access = await validateSchedulingAccess({
-        userId: req.user._id,
+        campaignId,
         socialAccountIds: socialAccountIds || post.socialAccountIds,
         mediaIds: mediaIds || post.mediaIds,
         requireEveryAccount: true,
@@ -313,7 +318,7 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
       await addPostToQueue(post);
     }
     
-    const populated = await ScheduledPost.findOne({ _id: id, userId: req.user._id })
+    const populated = await ScheduledPost.findOne({ _id: id, campaignId })
       .populate('socialAccountIds')
       .populate('mediaIds');
       
@@ -331,6 +336,8 @@ router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req
 
   try {
     const isConnected = getDBStatus();
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
 
     if (!isConnected) {
       const index = mockStore.scheduledPosts.findIndex(p => p._id === id);
@@ -341,13 +348,13 @@ router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req
       return res.status(200).json({ message: 'Scheduled post removed successfully' });
     }
 
-    const post = await ScheduledPost.findOne({ _id: id, userId: req.user._id });
+    const post = await ScheduledPost.findOne({ _id: id, campaignId });
     if (!post) {
       return res.status(404).json({ message: 'Post not found' });
     }
 
     await removePostFromQueue(post._id);
-    await ScheduledPost.deleteOne({ _id: id, userId: req.user._id });
+    await ScheduledPost.deleteOne({ _id: id, campaignId });
     res.status(200).json({ message: 'Scheduled post removed successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });

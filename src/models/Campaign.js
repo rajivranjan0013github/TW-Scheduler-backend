@@ -11,6 +11,13 @@ const CampaignSchema = new mongoose.Schema({
     default: '',
     trim: true,
   },
+  mainEmail: {
+    type: String,
+    default: '',
+    trim: true,
+    lowercase: true,
+    index: true,
+  },
   status: {
     type: String,
     enum: ['active', 'paused', 'archived'],

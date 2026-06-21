@@ -110,6 +110,7 @@ export const runFeedSync = async () => {
               { userId: account.userId, metaPostId: postData.metaPostId },
               {
                 userId: account.userId,
+                campaignId: account.campaignId,
                 accountId: account._id,
                 ...postData,
                 lastSyncedAt: new Date(),
