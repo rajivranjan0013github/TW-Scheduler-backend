@@ -1,0 +1,49 @@
+0 verbose cli /Users/rajivranjan/.nvm/versions/node/v20.19.4/bin/node /Users/rajivranjan/.nvm/versions/node/v20.19.4/bin/npm
+1 info using npm@10.8.2
+2 info using node@v20.19.4
+3 silly config load:file:/Users/rajivranjan/.nvm/versions/node/v20.19.4/lib/node_modules/npm/npmrc
+4 silly config load:file:/Volumes/SSD500/Rajiv/Project/TW-Scheduler/tw-backend/.npmrc
+5 silly config load:file:/Users/rajivranjan/.npmrc
+6 silly config load:file:/Users/rajivranjan/.nvm/versions/node/v20.19.4/etc/npmrc
+7 verbose title npm install @google/generative-ai
+8 verbose argv "install" "--cache" "./.npm_cache" "@google/generative-ai"
+9 verbose logfile logs-max:10 dir:/Volumes/SSD500/Rajiv/Project/TW-Scheduler/tw-backend/.npm_cache/_logs/2026-06-20T22_27_51_885Z-
+10 verbose logfile /Volumes/SSD500/Rajiv/Project/TW-Scheduler/tw-backend/.npm_cache/_logs/2026-06-20T22_27_51_885Z-debug-0.log
+11 silly packumentCache heap:4345298944 maxSize:1086324736 maxEntrySize:543162368
+12 silly logfile done cleaning log files
+13 http fetch GET https://registry.npmjs.org/npm attempt 1 failed with ENOTFOUND
+14 silly idealTree buildDeps
+15 silly fetch manifest @google/generative-ai@*
+16 silly packumentCache full:https://registry.npmjs.org/@google%2fgenerative-ai cache-miss
+17 http fetch GET https://registry.npmjs.org/@google%2fgenerative-ai attempt 1 failed with ENOTFOUND
+18 http fetch GET https://registry.npmjs.org/npm attempt 2 failed with ENOTFOUND
+19 http fetch GET https://registry.npmjs.org/@google%2fgenerative-ai attempt 2 failed with ENOTFOUND
+20 http fetch GET https://registry.npmjs.org/npm attempt 3 failed with ENOTFOUND
+21 http fetch GET https://registry.npmjs.org/@google%2fgenerative-ai attempt 3 failed with ENOTFOUND
+22 silly placeDep ROOT @google/generative-ai@ OK for: tw-backend@1.0.0 want: *
+23 verbose type system
+24 verbose stack FetchError: request to https://registry.npmjs.org/@google%2fgenerative-ai failed, reason: getaddrinfo ENOTFOUND registry.npmjs.org
+24 verbose stack     at ClientRequest.<anonymous> (/Users/rajivranjan/.nvm/versions/node/v20.19.4/lib/node_modules/npm/node_modules/minipass-fetch/lib/index.js:130:14)
+24 verbose stack     at ClientRequest.emit (node:events:524:28)
+24 verbose stack     at emitErrorEvent (node:_http_client:101:11)
+24 verbose stack     at _destroy (node:_http_client:884:9)
+24 verbose stack     at onSocketNT (node:_http_client:904:5)
+24 verbose stack     at process.processTicksAndRejections (node:internal/process/task_queues:83:21)
+25 error code ENOTFOUND
+26 error syscall getaddrinfo
+27 error errno ENOTFOUND
+28 error network request to https://registry.npmjs.org/@google%2fgenerative-ai failed, reason: getaddrinfo ENOTFOUND registry.npmjs.org
+29 error network This is a problem related to network connectivity.
+29 error network In most cases you are behind a proxy or have bad network settings.
+29 error network
+29 error network If you are behind a proxy, please make sure that the
+29 error network 'proxy' config is set properly.  See: 'npm help config'
+30 silly unfinished npm timer reify 1781994472044
+31 silly unfinished npm timer reify:loadTrees 1781994472064
+32 verbose cwd /Volumes/SSD500/Rajiv/Project/TW-Scheduler/tw-backend
+33 verbose os Darwin 24.6.0
+34 verbose node v20.19.4
+35 verbose npm  v10.8.2
+36 verbose exit 1
+37 verbose code 1
+38 error A complete log of this run can be found in: /Volumes/SSD500/Rajiv/Project/TW-Scheduler/tw-backend/.npm_cache/_logs/2026-06-20T22_27_51_885Z-debug-0.log

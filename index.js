@@ -16,6 +16,7 @@ import accountRoutes from './src/routes/accounts.js';
 import mediaRoutes from './src/routes/media.js';
 import schedulerRoutes from './src/routes/scheduler.js';
 import adminRoutes from './src/routes/admin.js';
+import aiRoutes from './src/routes/ai.js';
 import { protect } from './src/middleware/auth.js';
 import ScheduledPost from './src/models/ScheduledPost.js';
 
@@ -49,6 +50,7 @@ app.use('/api/accounts', accountRoutes);
 app.use('/api/media', mediaRoutes);
 app.use('/api/scheduler', schedulerRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/ai', aiRoutes);
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {

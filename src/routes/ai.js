@@ -1,0 +1,118 @@
+import express from 'express';
+import { protect } from '../middleware/auth.js';
+
+const router = express.Router();
+
+// @desc    Generate overlay text options using Gemini API via native fetch
+// @route   POST /api/ai/generate-text
+// @access  Private
+router.post('/generate-text', protect, async (req, res) => {
+  const { vibe } = req.body;
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    return res.status(500).json({ message: 'GEMINI_API_KEY is not configured on the server.' });
+  }
+
+  try {
+    const modelsToTry = ['gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-1.5-flash'];
+    let errorMsg = '';
+    let responseText = '';
+
+    const prompt = `You are a mobile app marketing copywriter.
+
+App Name: Penguin
+
+Penguin is a couples app where partners can answer 3000+ questions, play games, complete rituals, update moods, send doodles, see relationship countdowns, track distance, and use lock screen/home screen widgets.
+
+Generate 20 short overlay texts for the first 3–4 seconds of a TikTok/Reels ad.
+${vibe ? `Tailor the suggestions to the specific topic/vibe: "${vibe}".` : ''}
+
+Requirements:
+- Output must be valid JSON only
+- No markdown
+- No explanation
+- Each overlay text must be maximum 8 words
+- Emotional, relatable, curiosity-driven
+- Natural Gen Z couple tone
+- Avoid sounding like an ad
+- Model the copywriting style, formatting, and tone EXACTLY like these examples:
+  * "POV: You finally found an app made for couples."
+  * "Date nights were getting boring... until this."
+  * "We downloaded this app 'for fun'... and got addicted."
+  * "This is what healthy couples do differently."
+  * "Every couple should try this at least once."
+
+JSON format:
+{
+  "overlay_texts": [
+    {
+      "id": 1,
+      "text": "POV: You finally found an app made for couples.",
+      "category": "relatable"
+    }
+  ]
+}`;
+
+    for (const modelName of modelsToTry) {
+      try {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                parts: [
+                  {
+                    text: prompt,
+                  }
+                ]
+              }
+            ],
+            generationConfig: {
+              responseMimeType: "application/json",
+            }
+          })
+        });
+
+        if (!response.ok) {
+          const errData = await response.json();
+          throw new Error(errData.error?.message || `HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        responseText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (responseText) {
+          break; // successfully generated content, break loop
+        }
+      } catch (err) {
+        console.error(`Gemini REST API failed for model ${modelName}:`, err);
+        errorMsg = err.message || 'Generation failed';
+      }
+    }
+
+    if (!responseText) {
+      throw new Error(`All model attempts failed. Last error: ${errorMsg}`);
+    }
+
+    // Parse output JSON to ensure valid list of items
+    const parsed = JSON.parse(responseText.trim());
+    let suggestions = [];
+    if (parsed && Array.isArray(parsed.overlay_texts)) {
+      suggestions = parsed.overlay_texts.map(item => item.text || item);
+    } else if (Array.isArray(parsed)) {
+      suggestions = parsed.map(item => typeof item === 'object' ? item.text || item : item);
+    } else {
+      throw new Error('Response is not in the expected JSON format.');
+    }
+
+    return res.status(200).json({ suggestions });
+  } catch (error) {
+    console.error('Error in /api/ai/generate-text:', error);
+    res.status(500).json({ message: `Failed to generate overlay text: ${error.message}` });
+  }
+});
+
+export default router;
