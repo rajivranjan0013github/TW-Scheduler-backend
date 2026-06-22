@@ -753,7 +753,17 @@ router.post('/campaigns', protect, authorize('owner', 'admin'), async (req, res)
       return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
     }
 
-    const { name, description = '', mainEmail = req.user.email || '', status = 'active', accountIds = [] } = req.body;
+    const {
+      name,
+      description = '',
+      productName = '',
+      productWebsite = '',
+      targetAudience = '',
+      primaryGoal = '',
+      mainEmail = req.user.email || '',
+      status = 'active',
+      accountIds = [],
+    } = req.body;
     if (!name?.trim()) {
       return res.status(400).json({ message: 'Campaign name is required.' });
     }
@@ -763,6 +773,10 @@ router.post('/campaigns', protect, authorize('owner', 'admin'), async (req, res)
     const campaign = await Campaign.create({
       name: name.trim(),
       description,
+      productName,
+      productWebsite,
+      targetAudience,
+      primaryGoal,
       mainEmail: mainEmail.trim().toLowerCase(),
       status,
       accountIds: validAccounts.map((account) => account._id),
@@ -797,7 +811,7 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
       return res.status(404).json({ message: 'Campaign not found.' });
     }
 
-    const { name, description, mainEmail, status, accountIds } = req.body;
+    const { name, description, productName, productWebsite, targetAudience, primaryGoal, mainEmail, status, accountIds } = req.body;
 
     if (name !== undefined) {
       if (!name.trim()) {
@@ -807,6 +821,10 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
     }
 
     if (description !== undefined) campaign.description = description;
+    if (productName !== undefined) campaign.productName = productName;
+    if (productWebsite !== undefined) campaign.productWebsite = productWebsite;
+    if (targetAudience !== undefined) campaign.targetAudience = targetAudience;
+    if (primaryGoal !== undefined) campaign.primaryGoal = primaryGoal;
     if (mainEmail !== undefined) campaign.mainEmail = mainEmail.trim().toLowerCase();
     if (status !== undefined) campaign.status = status;
 

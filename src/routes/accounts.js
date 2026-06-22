@@ -118,6 +118,52 @@ router.get('/campaigns', protect, async (req, res) => {
   }
 });
 
+// @desc    Create a campaign workspace for the signed-in user
+// @route   POST /api/accounts/campaigns
+// @access  Private
+router.post('/campaigns', protect, async (req, res) => {
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      return res.status(503).json({ message: 'Database disconnected.' });
+    }
+
+    const {
+      name,
+      description = '',
+      productName = '',
+      productWebsite = '',
+      targetAudience = '',
+      primaryGoal = '',
+    } = req.body;
+
+    if (!name?.trim()) {
+      return res.status(400).json({ message: 'Campaign name is required.' });
+    }
+
+    const campaign = await Campaign.create({
+      name: name.trim(),
+      description,
+      productName,
+      productWebsite,
+      targetAudience,
+      primaryGoal,
+      mainEmail: (req.user.email || '').trim().toLowerCase(),
+      status: 'active',
+      accountIds: [],
+      createdBy: req.user._id,
+    });
+
+    const populated = await Campaign.findById(campaign._id)
+      .populate('createdBy', 'name email')
+      .lean();
+
+    res.status(201).json(populated);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // @desc    Get aggregated insights for all connected channels
 // @route   GET /api/accounts/insights
 // @access  Private

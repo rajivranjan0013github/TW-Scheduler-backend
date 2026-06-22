@@ -11,6 +11,26 @@ const CampaignSchema = new mongoose.Schema({
     default: '',
     trim: true,
   },
+  productName: {
+    type: String,
+    default: '',
+    trim: true,
+  },
+  productWebsite: {
+    type: String,
+    default: '',
+    trim: true,
+  },
+  targetAudience: {
+    type: String,
+    default: '',
+    trim: true,
+  },
+  primaryGoal: {
+    type: String,
+    default: '',
+    trim: true,
+  },
   mainEmail: {
     type: String,
     default: '',
