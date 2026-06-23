@@ -210,6 +210,47 @@ router.post('/folders', protect, authorize('owner', 'admin', 'editor'), async (r
   }
 });
 
+// @desc    Rename folder
+// @route   PUT /api/media/folders/:id
+// @access  Private (Owner, Admin, Editor)
+router.put('/folders/:id', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
+  const { id } = req.params;
+  const nextName = String(req.body?.name || '').trim();
+
+  if (!nextName) {
+    return res.status(400).json({ message: 'Folder name is required.' });
+  }
+
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      const folder = mockStore.folders.find(f => f._id === id);
+      if (!folder) {
+        return res.status(404).json({ message: 'Folder not found' });
+      }
+      folder.name = nextName;
+      folder.updatedAt = new Date();
+      return res.status(200).json(folder);
+    }
+
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+    const folder = await Folder.findOneAndUpdate(
+      { _id: id, campaignId },
+      { name: nextName },
+      { new: true }
+    );
+
+    if (!folder) {
+      return res.status(404).json({ message: 'Folder not found' });
+    }
+
+    res.status(200).json(folder);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // @desc    Delete folder
 // @route   DELETE /api/media/folders/:id
 // @access  Private (Owner, Admin)

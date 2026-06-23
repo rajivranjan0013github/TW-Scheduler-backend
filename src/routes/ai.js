@@ -1,5 +1,6 @@
 import express from 'express';
 import { protect } from '../middleware/auth.js';
+import SavedCaption from '../models/SavedCaption.js';
 
 const router = express.Router();
 
@@ -7,7 +8,7 @@ const router = express.Router();
 // @route   POST /api/ai/generate-text
 // @access  Private
 router.post('/generate-text', protect, async (req, res) => {
-  const { vibe } = req.body;
+  const { vibe, exclude } = req.body;
   const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
@@ -27,6 +28,7 @@ Penguin is a couples app where partners can answer 3000+ questions, play games, 
 
 Generate 20 short overlay texts for the first 3–4 seconds of a TikTok/Reels ad.
 ${vibe ? `Tailor the suggestions to the specific topic/vibe: "${vibe}".` : ''}
+${Array.isArray(exclude) && exclude.length > 0 ? `Avoid generating duplicate or highly similar phrases to these existing captions: ${JSON.stringify(exclude)}.` : ''}
 
 Requirements:
 - Output must be valid JSON only
@@ -112,6 +114,62 @@ JSON format:
   } catch (error) {
     console.error('Error in /api/ai/generate-text:', error);
     res.status(500).json({ message: `Failed to generate overlay text: ${error.message}` });
+  }
+});
+
+// @desc    Get all saved captions for the logged-in user
+// @route   GET /api/ai/saved-captions
+// @access  Private
+router.get('/saved-captions', protect, async (req, res) => {
+  try {
+    const saved = await SavedCaption.find({ userId: req.user._id }).sort({ createdAt: -1 });
+    res.status(200).json(saved);
+  } catch (error) {
+    console.error('Error fetching saved captions:', error);
+    res.status(500).json({ message: 'Failed to fetch saved captions.' });
+  }
+});
+
+// @desc    Save a caption (bookmark it)
+// @route   POST /api/ai/saved-captions
+// @access  Private
+router.post('/saved-captions', protect, async (req, res) => {
+  const { text } = req.body;
+  if (!text || !text.trim()) {
+    return res.status(400).json({ message: 'Caption text is required.' });
+  }
+
+  try {
+    // Prevent duplicate entries of the same text for this user
+    let existing = await SavedCaption.findOne({ userId: req.user._id, text: text.trim() });
+    if (existing) {
+      return res.status(200).json(existing);
+    }
+
+    const saved = await SavedCaption.create({
+      userId: req.user._id,
+      text: text.trim(),
+    });
+    res.status(201).json(saved);
+  } catch (error) {
+    console.error('Error saving caption:', error);
+    res.status(500).json({ message: 'Failed to save caption.' });
+  }
+});
+
+// @desc    Delete a saved caption by ID
+// @route   DELETE /api/ai/saved-captions/:id
+// @access  Private
+router.delete('/saved-captions/:id', protect, async (req, res) => {
+  try {
+    const deleted = await SavedCaption.findOneAndDelete({ _id: req.params.id, userId: req.user._id });
+    if (!deleted) {
+      return res.status(404).json({ message: 'Saved caption not found.' });
+    }
+    res.status(200).json({ message: 'Saved caption deleted successfully.', id: req.params.id });
+  } catch (error) {
+    console.error('Error deleting saved caption:', error);
+    res.status(500).json({ message: 'Failed to delete saved caption.' });
   }
 });
 
