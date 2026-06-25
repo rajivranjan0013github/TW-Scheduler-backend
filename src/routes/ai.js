@@ -117,6 +117,98 @@ JSON format:
   }
 });
 
+// @desc    Generate campaign media caption using Gemini API
+// @route   POST /api/ai/generate-caption
+// @access  Private
+router.post('/generate-caption', protect, async (req, res) => {
+  const { videoName } = req.body;
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    return res.status(500).json({ message: 'GEMINI_API_KEY is not configured on the server.' });
+  }
+
+  try {
+    const modelsToTry = ['gemini-2.5-flash', 'gemini-1.5-flash'];
+    let errorMsg = '';
+    let responseText = '';
+
+    const prompt = `You are a mobile app marketing copywriter. We need a short, relatable, Gen Z couple/relationship caption for a video representing our couples app: "Penguin".
+
+App Name: Penguin
+Penguin is a couples app where partners can answer 3000+ questions, play games, complete rituals, update moods, send doodles, see relationship countdowns, track distance, and use lock screen/home screen widgets.
+
+Video File Name/Context: "${videoName || 'couple video'}"
+
+Generate a short, viral, Gen Z couple caption.
+Requirements:
+1. One short relatable line (e.g. "she always be clutching me out tbh", "i'm actually addicted to this", "my bf downloads the weirdest apps").
+2. Followed by exactly five dots (each dot on a new line).
+3. Followed by exactly 10 relevant hashtags starting with relationship/couple topics like #couple #ldr #relationship #longdistance #bfgf #longdistancerelationships #game #widget #relationshipadvice and 1 related to the video context.
+
+Formatting style example:
+she always be clutching me out tbh
+.
+.
+.
+.
+.
+#couple #ldr #relationship #longdistance #bfgf #longdistancerelationships #game #widget #relationshipadvice #clutch
+
+Output ONLY the final caption text. Do not include markdown codeblocks or explanations. Just output the raw caption.`;
+
+    for (const modelName of modelsToTry) {
+      try {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                parts: [
+                  {
+                    text: prompt,
+                  }
+                ]
+              }
+            ],
+          })
+        });
+
+        if (!response.ok) {
+          const errData = await response.json();
+          throw new Error(errData.error?.message || `HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        responseText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (responseText) {
+          break;
+        }
+      } catch (err) {
+        console.error(`Gemini failed for model ${modelName}:`, err);
+        errorMsg = err.message || 'Generation failed';
+      }
+    }
+
+    if (!responseText) {
+      throw new Error(`All model attempts failed. Last error: ${errorMsg}`);
+    }
+
+    let captionText = responseText.trim();
+    if (captionText.startsWith('```')) {
+      captionText = captionText.replace(/^```[a-zA-Z]*\n/, '').replace(/\n```$/, '');
+    }
+
+    return res.status(200).json({ caption: captionText.trim() });
+  } catch (error) {
+    console.error('Error in /api/ai/generate-caption:', error);
+    res.status(500).json({ message: `Failed to generate caption: ${error.message}` });
+  }
+});
+
 // @desc    Get all saved captions for the logged-in user
 // @route   GET /api/ai/saved-captions
 // @access  Private

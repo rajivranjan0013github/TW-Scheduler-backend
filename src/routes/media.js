@@ -295,10 +295,18 @@ router.delete('/folders/:id', protect, authorize('owner', 'admin'), async (req, 
 // @route   GET /api/media
 // @access  Private
 router.get('/', protect, async (req, res) => {
-  const { folderId, tag, accountId } = req.query;
+  const { folderId, tag, accountId, page, limit } = req.query;
 
   try {
     const isConnected = getDBStatus();
+    
+    let queryLimit = undefined;
+    let querySkip = undefined;
+    if (page && limit) {
+      queryLimit = parseInt(limit, 10);
+      querySkip = (parseInt(page, 10) - 1) * queryLimit;
+    }
+
     if (!isConnected) {
       let filtered = [...mockStore.media];
       
@@ -317,6 +325,11 @@ router.get('/', protect, async (req, res) => {
       
       // Sort newest first
       filtered.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      
+      if (querySkip !== undefined && queryLimit !== undefined) {
+        filtered = filtered.slice(querySkip, querySkip + queryLimit);
+      }
+      
       return res.status(200).json(filtered);
     }
     const campaignId = requireCampaignId(req, res);
@@ -335,9 +348,15 @@ router.get('/', protect, async (req, res) => {
       ];
     }
 
-    const media = await Media.find(query)
+    let dbQuery = Media.find(query)
       .populate('socialAccountIds', 'name username platform avatarUrl isConnected')
       .sort({ createdAt: -1 });
+
+    if (querySkip !== undefined && queryLimit !== undefined) {
+      dbQuery = dbQuery.skip(querySkip).limit(queryLimit);
+    }
+
+    const media = await dbQuery;
     res.status(200).json(media);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -508,7 +527,7 @@ router.get('/:id/download', protect, async (req, res) => {
 // @access  Private (Owner, Admin, Editor)
 router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
   const { id } = req.params;
-  const { caption, tags } = req.body;
+  const { caption, tags, name } = req.body;
 
   try {
     const isConnected = getDBStatus();
@@ -519,6 +538,13 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
         return res.status(404).json({ message: 'Media not found' });
       }
       if (caption !== undefined) mediaItem.caption = caption;
+      if (name !== undefined) {
+        const trimmedName = String(name).trim();
+        if (!trimmedName) {
+          return res.status(400).json({ message: 'File name cannot be empty.' });
+        }
+        mediaItem.name = trimmedName;
+      }
       if (tags !== undefined) {
         mediaItem.tags = Array.isArray(tags)
           ? tags.map(tag => String(tag).trim().toLowerCase()).filter(Boolean)
@@ -530,6 +556,13 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
 
     const updates = {};
     if (caption !== undefined) updates.caption = caption;
+    if (name !== undefined) {
+      const trimmedName = String(name).trim();
+      if (!trimmedName) {
+        return res.status(400).json({ message: 'File name cannot be empty.' });
+      }
+      updates.name = trimmedName;
+    }
     if (tags !== undefined) {
       updates.tags = Array.isArray(tags)
         ? tags.map(tag => String(tag).trim().toLowerCase()).filter(Boolean)
