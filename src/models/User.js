@@ -19,6 +19,10 @@ const UserSchema = new mongoose.Schema({
     enum: ['owner', 'admin', 'editor', 'viewer'],
     default: 'editor',
   },
+  userType: {
+    type: String,
+    enum: ['campaign_maker', 'account_handler'],
+  },
   googleId: {
     type: String,
     unique: true,

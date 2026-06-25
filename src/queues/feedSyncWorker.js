@@ -11,6 +11,7 @@ import SocialAccount from '../models/SocialAccount.js';
 import PublishedPost from '../models/PublishedPost.js';
 import { getDBStatus } from '../config/db.js';
 import { fetchYoutubeVideos } from '../services/youtubeService.js';
+import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
 
 /**
  * Fetches the latest published posts from a Facebook Page via Meta Graph API.
@@ -94,31 +95,32 @@ export const runFeedSync = async () => {
 
       try {
         let posts = [];
+        const freshAccount = await ensureFreshAccountToken(account);
 
-        if (account.platform === 'facebook') {
-          posts = await fetchFacebookPosts(account);
-        } else if (account.platform === 'instagram') {
-          posts = await fetchInstagramPosts(account);
-        } else if (account.platform === 'youtube') {
-          posts = await fetchYoutubeVideos(account);
+        if (freshAccount.platform === 'facebook') {
+          posts = await fetchFacebookPosts(freshAccount);
+        } else if (freshAccount.platform === 'instagram') {
+          posts = await fetchInstagramPosts(freshAccount);
+        } else if (freshAccount.platform === 'youtube') {
+          posts = await fetchYoutubeVideos(freshAccount);
         }
 
         // Upsert each post into PublishedPost
         for (const postData of posts) {
           try {
             const result = await PublishedPost.findOneAndUpdate(
-              { userId: account.userId, metaPostId: postData.metaPostId },
+              { userId: freshAccount.userId, metaPostId: postData.metaPostId },
               {
-                userId: account.userId,
-                campaignId: account.campaignId,
-                accountId: account._id,
+                userId: freshAccount.userId,
+                campaignId: freshAccount.campaignId,
+                accountId: freshAccount._id,
                 ...postData,
                 lastSyncedAt: new Date(),
                 // Only update latestLikes/Comments if values are available from Instagram media endpoint
                 ...(postData.latestLikes !== undefined && { latestLikes: postData.latestLikes }),
                 ...(postData.latestComments !== undefined && { latestComments: postData.latestComments }),
               },
-              { upsert: true, new: true, setDefaultsOnInsert: true }
+              { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
             );
 
             if (result.createdAt && result.updatedAt && result.createdAt.getTime() === result.updatedAt.getTime()) {
@@ -137,6 +139,7 @@ export const runFeedSync = async () => {
         accountsProcessed++;
       } catch (accountErr) {
         accountsFailed++;
+        await handleProviderAuthFailure(account, accountErr, accountErr.message);
         console.error(`❌ [Feed Sync] Failed to sync account "${account.name}" (${account._id}):`, accountErr.message);
       }
     }

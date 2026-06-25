@@ -4,6 +4,7 @@ import { mockStore } from '../models/mockStore.js';
 import ScheduledPost from '../models/ScheduledPost.js';
 import Media from '../models/Media.js';
 import SocialAccount from '../models/SocialAccount.js';
+import CampaignChannel from '../models/CampaignChannel.js';
 import { protect, authorize } from '../middleware/auth.js';
 import { addPostToQueue, removePostFromQueue } from '../queues/publisherQueue.js';
 
@@ -29,6 +30,36 @@ const requireCampaignId = (req, res) => {
 };
 
 const idsToStrings = (items = []) => items.map((item) => String(item?._id || item));
+const validScheduleModes = new Set(['auto', 'manual', 'hybrid']);
+const terminalManualStatuses = new Set(['posted_manual', 'published', 'published_auto', 'cancelled']);
+
+const normalizeScheduleMode = (mode) => (
+  validScheduleModes.has(mode) ? mode : 'auto'
+);
+
+const getInitialStatusForMode = (mode) => (
+  mode === 'manual' ? 'manual_ready' : 'scheduled'
+);
+
+const shouldQueuePost = (post) => (
+  ['auto', 'hybrid'].includes(post.scheduleMode || 'auto') && post.status === 'scheduled'
+);
+
+const canAccessManualPost = async (post, user) => {
+  if (!post || !user) return false;
+  if (ADMIN_ROLES.includes(user.role)) return true;
+  if (String(post.userId) === String(user._id)) return true;
+
+  const postAccountIds = idsToStrings(post.socialAccountIds);
+  if (postAccountIds.length === 0) return false;
+
+  const ownedAccount = await SocialAccount.exists({
+    _id: { $in: postAccountIds },
+    userId: user._id,
+  });
+
+  return Boolean(ownedAccount);
+};
 
 const withPostCaption = (platformSpecifics, postCaption, type) => {
   const nextSpecifics = platformSpecifics
@@ -54,11 +85,16 @@ const validateSchedulingAccess = async ({ campaignId, socialAccountIds, mediaIds
   }
 
   const [accounts, mediaItems] = await Promise.all([
-    SocialAccount.find({ _id: { $in: accountIds }, campaignId, isConnected: true }).select('_id'),
+    CampaignChannel.find({
+      campaignId,
+      status: 'verified',
+      socialAccountId: { $in: accountIds },
+    }).select('socialAccountId'),
     Media.find({ _id: { $in: mediaIdList }, campaignId }).select('_id socialAccountIds'),
   ]);
+  const verifiedAccountIds = new Set(accounts.map((channel) => String(channel.socialAccountId)));
 
-  if (accounts.length !== accountIds.length) {
+  if (!accountIds.every((accountId) => verifiedAccountIds.has(String(accountId)))) {
     return { ok: false, message: 'One or more selected publishing channels are not connected.' };
   }
   if (mediaItems.length !== mediaIdList.length) {
@@ -98,6 +134,7 @@ router.get('/', protect, async (req, res) => {
 // @access  Private (Owner, Admin, Editor)
 router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
   const { socialAccountIds, mediaIds, caption, scheduledAt, platformSpecifics } = req.body;
+  const scheduleMode = normalizeScheduleMode(req.body.scheduleMode);
 
   try {
     const isConnected = getDBStatus();
@@ -117,7 +154,8 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
         mediaIds,
         caption: postCaption,
         scheduledAt: scheduledDate,
-        status: 'scheduled',
+        scheduleMode,
+        status: getInitialStatusForMode(scheduleMode),
         platformSpecifics: withPostCaption(platformSpecifics, postCaption, platformSpecifics?.type || 'reels'),
         createdAt: new Date(),
         updatedAt: new Date(),
@@ -148,9 +186,13 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
       mediaIds,
       caption: postCaption,
       scheduledAt: scheduledDate,
+      scheduleMode,
+      status: getInitialStatusForMode(scheduleMode),
       platformSpecifics: withPostCaption(platformSpecifics, postCaption, platformSpecifics?.type || 'reels'),
     });
-    await addPostToQueue(post);
+    if (shouldQueuePost(post)) {
+      await addPostToQueue(post);
+    }
 
     res.status(201).json(post);
   } catch (error) {
@@ -163,6 +205,7 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
 // @access  Private (Owner, Admin, Editor)
 router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
   const { socialAccountIds, mediaIds, caption, startDate, intervalHours, type, platformSpecifics } = req.body;
+  const scheduleMode = normalizeScheduleMode(req.body.scheduleMode);
 
   if (!socialAccountIds || !mediaIds || mediaIds.length === 0) {
     return res.status(400).json({ message: 'Must select publishing channels and at least one media file' });
@@ -222,7 +265,8 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
             mediaIds: [mediaId],
             caption: postCaption,
             scheduledAt: scheduledTime,
-            status: 'scheduled',
+            scheduleMode,
+            status: getInitialStatusForMode(scheduleMode),
             platformSpecifics: postPlatformSpecifics,
             createdAt: new Date(),
             updatedAt: new Date(),
@@ -237,9 +281,13 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
             mediaIds: [mediaId],
             caption: postCaption,
             scheduledAt: scheduledTime,
+            scheduleMode,
+            status: getInitialStatusForMode(scheduleMode),
             platformSpecifics: postPlatformSpecifics,
           });
-          await addPostToQueue(post);
+          if (shouldQueuePost(post)) {
+            await addPostToQueue(post);
+          }
           createdPosts.push(post);
         }
 
@@ -258,12 +306,150 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
   }
 });
 
+// @desc    Mark creator access/download on a manual or hybrid post
+// @route   POST /api/scheduler/:id/downloaded
+// @access  Private
+router.post('/:id/downloaded', protect, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      const post = mockStore.scheduledPosts.find(p => p._id === id);
+      if (!post) return res.status(404).json({ message: 'Post not found' });
+      post.manualDownloadedAt = new Date();
+      if (post.status === 'manual_ready') post.status = 'downloaded';
+      post.updatedAt = new Date();
+      return res.status(200).json(post);
+    }
+
+    const post = await ScheduledPost.findById(id)
+      .populate('socialAccountIds')
+      .populate('mediaIds');
+    if (!post) return res.status(404).json({ message: 'Post not found' });
+    if (!['manual', 'hybrid'].includes(post.scheduleMode || 'auto')) {
+      return res.status(400).json({ message: 'Only manual or hybrid posts can be downloaded by creators.' });
+    }
+    if (!(await canAccessManualPost(post, req.user))) {
+      return res.status(403).json({ message: 'Access denied for this scheduled post.' });
+    }
+    if (terminalManualStatuses.has(post.status)) {
+      return res.status(400).json({ message: 'This post is already complete or cancelled.' });
+    }
+
+    post.manualDownloadedAt = new Date();
+    if (post.status === 'manual_ready') post.status = 'downloaded';
+    await post.save();
+
+    res.status(200).json(post);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Mark a manual/hybrid post as posted by the creator
+// @route   POST /api/scheduler/:id/manual-posted
+// @access  Private
+router.post('/:id/manual-posted', protect, async (req, res) => {
+  const { id } = req.params;
+  const { manualPostUrl = '' } = req.body || {};
+
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      const post = mockStore.scheduledPosts.find(p => p._id === id);
+      if (!post) return res.status(404).json({ message: 'Post not found' });
+      post.status = 'posted_manual';
+      post.publishSource = 'creator';
+      post.manualPostedAt = new Date();
+      post.manualPostUrl = manualPostUrl;
+      post.postedByUserId = req.user._id;
+      post.updatedAt = new Date();
+      return res.status(200).json(post);
+    }
+
+    const post = await ScheduledPost.findById(id)
+      .populate('socialAccountIds')
+      .populate('mediaIds');
+    if (!post) return res.status(404).json({ message: 'Post not found' });
+    if (!['manual', 'hybrid'].includes(post.scheduleMode || 'auto')) {
+      return res.status(400).json({ message: 'Only manual or hybrid posts can be marked as manually posted.' });
+    }
+    if (!(await canAccessManualPost(post, req.user))) {
+      return res.status(403).json({ message: 'Access denied for this scheduled post.' });
+    }
+    if (terminalManualStatuses.has(post.status)) {
+      return res.status(400).json({ message: 'This post is already complete or cancelled.' });
+    }
+
+    await removePostFromQueue(post._id);
+    post.status = 'posted_manual';
+    post.publishSource = 'creator';
+    post.manualPostedAt = new Date();
+    post.manualPostUrl = manualPostUrl;
+    post.postedByUserId = req.user._id;
+    await post.save();
+
+    res.status(200).json(post);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Return a hybrid post back to automatic publishing
+// @route   POST /api/scheduler/:id/return-to-auto
+// @access  Private (Owner, Admin, Editor)
+router.post('/:id/return-to-auto', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      const post = mockStore.scheduledPosts.find(p => p._id === id);
+      if (!post) return res.status(404).json({ message: 'Post not found' });
+      post.scheduleMode = 'hybrid';
+      post.status = 'scheduled';
+      post.publishSource = null;
+      post.manualPostedAt = null;
+      post.manualPostUrl = '';
+      post.postedByUserId = null;
+      post.updatedAt = new Date();
+      return res.status(200).json(post);
+    }
+
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+    const post = await ScheduledPost.findOne({ _id: id, campaignId });
+    if (!post) return res.status(404).json({ message: 'Post not found' });
+    if (post.scheduleMode !== 'hybrid') {
+      return res.status(400).json({ message: 'Only hybrid posts can be returned to automatic publishing.' });
+    }
+
+    post.status = 'scheduled';
+    post.publishSource = null;
+    post.manualPostedAt = null;
+    post.manualPostUrl = '';
+    post.postedByUserId = null;
+    await post.save();
+    await removePostFromQueue(post._id);
+    await addPostToQueue(post);
+
+    const populated = await ScheduledPost.findOne({ _id: id, campaignId })
+      .populate('socialAccountIds')
+      .populate('mediaIds');
+    res.status(200).json(populated);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // @desc    Update/Reschedule a post (supports Drag & Drop)
 // @route   PUT /api/scheduler/:id
 // @access  Private (Owner, Admin, Editor)
 router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
   const { id } = req.params;
   const { scheduledAt, caption, mediaIds, socialAccountIds, platformSpecifics, status } = req.body;
+  const nextScheduleMode = req.body.scheduleMode === undefined ? null : normalizeScheduleMode(req.body.scheduleMode);
 
   try {
     const isConnected = getDBStatus();
@@ -281,7 +467,9 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
       if (mediaIds) post.mediaIds = mediaIds;
       if (socialAccountIds) post.socialAccountIds = socialAccountIds;
       if (platformSpecifics) post.platformSpecifics = platformSpecifics;
+      if (nextScheduleMode) post.scheduleMode = nextScheduleMode;
       if (status) post.status = status;
+      if (nextScheduleMode && !status) post.status = getInitialStatusForMode(nextScheduleMode);
       post.updatedAt = new Date();
 
       return res.status(200).json(post);
@@ -309,12 +497,14 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
     if (mediaIds) post.mediaIds = mediaIds;
     if (socialAccountIds) post.socialAccountIds = socialAccountIds;
     if (platformSpecifics) post.platformSpecifics = platformSpecifics;
+    if (nextScheduleMode) post.scheduleMode = nextScheduleMode;
     if (status) post.status = status;
+    if (nextScheduleMode && !status) post.status = getInitialStatusForMode(nextScheduleMode);
     
     await post.save();
 
     await removePostFromQueue(post._id);
-    if (post.status === 'scheduled') {
+    if (shouldQueuePost(post)) {
       await addPostToQueue(post);
     }
     
@@ -356,6 +546,37 @@ router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req
     await removePostFromQueue(post._id);
     await ScheduledPost.deleteOne({ _id: id, campaignId });
     res.status(200).json({ message: 'Scheduled post removed successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Get all scheduled posts assigned to this creator's accounts
+router.get('/creator/posts', protect, async (req, res) => {
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      return res.status(200).json([]);
+    }
+
+    // 1. Find creator accounts
+    const creatorAccounts = await SocialAccount.find({ userId: req.user._id }).select('_id').lean();
+    const creatorAccountIds = creatorAccounts.map(acc => acc._id);
+
+    if (creatorAccountIds.length === 0) {
+      return res.status(200).json([]);
+    }
+
+    // 2. Find scheduled posts containing these accounts
+    const posts = await ScheduledPost.find({
+      socialAccountIds: { $in: creatorAccountIds }
+    })
+      .populate('socialAccountIds')
+      .populate('mediaIds')
+      .sort({ scheduledAt: 1 })
+      .lean();
+
+    res.status(200).json(posts);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

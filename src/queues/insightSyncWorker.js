@@ -11,6 +11,7 @@ import PublishedPost from '../models/PublishedPost.js';
 import PostInsight from '../models/PostInsight.js';
 import { sendBatchRequests } from '../services/metaBatchService.js';
 import { getDBStatus } from '../config/db.js';
+import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
 
 /**
  * Extracts metric values from a Meta insights API response body.
@@ -83,6 +84,9 @@ export const runInsightSync = async () => {
       if (!account || !account.accessToken || account.accessToken.startsWith('mock-')) {
         continue;
       }
+      if (!['instagram', 'facebook'].includes(account.platform)) {
+        continue;
+      }
 
       const accountKey = account._id.toString();
       if (!accountPostsMap.has(accountKey)) {
@@ -96,10 +100,11 @@ export const runInsightSync = async () => {
 
     for (const [accountKey, { account, posts: accountPosts }] of accountPostsMap) {
       try {
+        const freshAccount = await ensureFreshAccountToken(account);
         // Build batch request items for this account's posts
         const batchRequests = accountPosts.map(post => {
           let metricParam;
-          if (account.platform === 'instagram') {
+          if (freshAccount.platform === 'instagram') {
             metricParam = 'views,likes,comments';
           } else {
             metricParam = 'post_impressions_unique,post_reactions_like_total';
@@ -112,12 +117,12 @@ export const runInsightSync = async () => {
         });
 
         // Determine graph host based on auth provider
-        const graphHost = (account.platform === 'instagram' && account.authProvider === 'instagram')
+        const graphHost = (freshAccount.platform === 'instagram' && freshAccount.authProvider === 'instagram')
           ? 'graph.instagram.com'
           : 'graph.facebook.com';
 
         // Send batch requests
-        const batchResults = await sendBatchRequests(account.accessToken, batchRequests, graphHost);
+        const batchResults = await sendBatchRequests(freshAccount.accessToken, batchRequests, graphHost);
 
         // Process results and upsert insights
         for (const post of accountPosts) {
@@ -129,22 +134,22 @@ export const runInsightSync = async () => {
             continue;
           }
 
-          const metrics = extractMetrics(responseBody, account.platform);
+          const metrics = extractMetrics(responseBody, freshAccount.platform);
 
           try {
             // Upsert daily snapshot
             await PostInsight.findOneAndUpdate(
               { postId: post._id, dateStr: todayStr },
               {
-                campaignId: account.campaignId,
+                campaignId: freshAccount.campaignId,
                 postId: post._id,
-                accountId: account._id,
+                accountId: freshAccount._id,
                 dateStr: todayStr,
                 views: metrics.views,
                 likes: metrics.likes,
                 comments: metrics.comments,
               },
-              { upsert: true, new: true }
+              { upsert: true, returnDocument: 'after' }
             );
 
             // Update latest metrics on the PublishedPost document
@@ -168,6 +173,7 @@ export const runInsightSync = async () => {
         }
       } catch (accountErr) {
         totalErrors++;
+        await handleProviderAuthFailure(account, accountErr, accountErr.message);
         console.error(`❌ [Insight Sync] Failed to sync insights for account "${account.name}":`, accountErr.message);
       }
     }

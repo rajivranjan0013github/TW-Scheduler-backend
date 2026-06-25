@@ -48,6 +48,32 @@ const CampaignSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'SocialAccount',
   }],
+  channels: [{
+    platform: {
+      type: String,
+      enum: ['instagram', 'facebook', 'youtube'],
+      required: true,
+    },
+    handle: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    displayName: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    socialAccountId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'SocialAccount',
+      default: null,
+    },
+    addedAt: {
+      type: Date,
+      default: Date.now,
+    },
+  }],
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',

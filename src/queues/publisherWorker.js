@@ -9,11 +9,13 @@ import { publishToInstagram, publishToFacebook } from '../services/metaService.j
 import { runFeedSync } from './feedSyncWorker.js';
 import { runInsightSync } from './insightSyncWorker.js';
 import { publishToYoutube } from '../services/youtubeService.js';
+import { ensureFreshAccountToken, handleProviderAuthFailure, runTokenHealthCheck } from '../services/tokenHealthService.js';
 
 // Setup BullMQ workers if Redis is connected
 let worker = null;
 let feedSyncWorker = null;
 let insightSyncWorker = null;
+let tokenHealthWorker = null;
 
 export const initWorker = () => {
   const connection = getRedisConnection();
@@ -54,6 +56,14 @@ export const initWorker = () => {
     insightSyncWorker.on('failed', (job, err) => {
       console.error(`❌ Insight sync job ${job.id} failed: ${err.message}`);
     });
+
+    tokenHealthWorker = new Worker('token-health-queue', async () => {
+      await runTokenHealthCheck();
+    }, { connection });
+
+    tokenHealthWorker.on('failed', (job, err) => {
+      console.error(`❌ Token health job ${job.id} failed: ${err.message}`);
+    });
   }
 };
 
@@ -76,6 +86,20 @@ export const publishPostJob = async (postId) => {
 
     if (!post) {
       throw new Error(`Scheduled post not found: ${postId}`);
+    }
+
+    const mode = post.scheduleMode || 'auto';
+    if (!['auto', 'hybrid'].includes(mode) || !['scheduled', 'publishing'].includes(post.status)) {
+      return;
+    }
+
+    if (post.status === 'scheduled') {
+      post.status = 'publishing';
+      if (isConnected) {
+        await post.save();
+      } else {
+        post.updatedAt = new Date();
+      }
     }
 
     const format = (post.platformSpecifics?.type || 'reels').toLowerCase();
@@ -102,53 +126,61 @@ export const publishPostJob = async (postId) => {
     if (!isConnected) {
       // In sandbox/dev mode, we simulate network request latency.
       await new Promise(resolve => setTimeout(resolve, 3000));
-      post.status = 'published';
+      post.status = 'published_auto';
+      post.publishSource = 'software';
       post.updatedAt = new Date();
     } else {
       // Call actual Meta API for each connected account
       for (const account of accounts) {
         let publishedId = null;
         const mainMedia = mediaFiles[0]; // Grab first attached media file if any
+        const freshAccount = await ensureFreshAccountToken(account);
 
-        if (account.platform === 'instagram') {
-          if (!mainMedia) {
-            throw new Error('Instagram requires an attached image or video file to publish.');
+        try {
+          if (freshAccount.platform === 'instagram') {
+            if (!mainMedia) {
+              throw new Error('Instagram requires an attached image or video file to publish.');
+            }
+            publishedId = await publishToInstagram(
+              freshAccount.accessToken,
+              freshAccount.accountId,
+              mainMedia.url,
+              mainMedia.type,
+              post.caption,
+              freshAccount.authProvider
+            );
+          } else if (freshAccount.platform === 'facebook') {
+            publishedId = await publishToFacebook(
+              freshAccount.accessToken,
+              freshAccount.accountId,
+              mainMedia?.url,
+              mainMedia?.type,
+              post.caption
+            );
+          } else if (freshAccount.platform === 'youtube') {
+            publishedId = await publishToYoutube({
+              account: freshAccount,
+              media: mainMedia,
+              caption: post.caption,
+              specifics: post.platformSpecifics,
+            });
+          } else {
+            throw new Error(`Unsupported social platform: ${freshAccount.platform}`);
           }
-          publishedId = await publishToInstagram(
-            account.accessToken,
-            account.accountId,
-            mainMedia.url,
-            mainMedia.type,
-            post.caption,
-            account.authProvider
-          );
-        } else if (account.platform === 'facebook') {
-          publishedId = await publishToFacebook(
-            account.accessToken,
-            account.accountId,
-            mainMedia?.url,
-            mainMedia?.type,
-            post.caption
-          );
-        } else if (account.platform === 'youtube') {
-          publishedId = await publishToYoutube({
-            account,
-            media: mainMedia,
-            caption: post.caption,
-            specifics: post.platformSpecifics,
-          });
-        } else {
-          throw new Error(`Unsupported social platform: ${account.platform}`);
+        } catch (providerError) {
+          await handleProviderAuthFailure(freshAccount, providerError, providerError.message);
+          throw providerError;
         }
 
         publishResponses.push({
-          accountId: account._id,
-          platform: account.platform,
+          accountId: freshAccount._id,
+          platform: freshAccount.platform,
           publishId: publishedId,
         });
       }
 
-      post.status = 'published';
+      post.status = 'published_auto';
+      post.publishSource = 'software';
       post.publishResponseId = JSON.stringify(publishResponses);
       await post.save();
     }

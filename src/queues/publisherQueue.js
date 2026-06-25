@@ -6,13 +6,16 @@ import ScheduledPost from '../models/ScheduledPost.js';
 import { publishPostJob } from './publisherWorker.js';
 import { runFeedSync } from './feedSyncWorker.js';
 import { runInsightSync } from './insightSyncWorker.js';
+import { runTokenHealthCheck } from '../services/tokenHealthService.js';
 
 let publishQueue = null;
 let feedSyncQueue = null;
 let insightSyncQueue = null;
+let tokenHealthQueue = null;
 let intervalFallbackId = null;
 let feedSyncIntervalId = null;
 let insightSyncIntervalId = null;
+let tokenHealthIntervalId = null;
 
 export const initQueue = async () => {
   const connection = getRedisConnection();
@@ -44,6 +47,15 @@ export const initQueue = async () => {
     await insightSyncQueue.add('insight-sync', {}, {
       repeat: { pattern: '30 20 * * *' }, // 20:30 UTC = 2:00 AM IST
       jobId: 'insight-sync-repeatable',
+    });
+
+    tokenHealthQueue = new Queue('token-health-queue', {
+      connection,
+      defaultJobOptions: { removeOnComplete: true, removeOnFail: false },
+    });
+    await tokenHealthQueue.add('token-health', {}, {
+      repeat: { pattern: '0 */12 * * *' }, // Every 12 hours
+      jobId: 'token-health-repeatable',
     });
   } else {
     startIntervalFallback();
@@ -82,7 +94,9 @@ const startIntervalFallback = () => {
     if (!isConnected) {
       // Process mockStore scheduled posts
       const postsToPublish = mockStore.scheduledPosts.filter(
-        p => p.status === 'scheduled' && new Date(p.scheduledAt) <= now
+        p => p.status === 'scheduled'
+          && ['auto', 'hybrid'].includes(p.scheduleMode || 'auto')
+          && new Date(p.scheduledAt) <= now
       );
 
       for (const post of postsToPublish) {
@@ -102,6 +116,10 @@ const startIntervalFallback = () => {
       try {
         const postsToPublish = await ScheduledPost.find({
           status: 'scheduled',
+          $or: [
+            { scheduleMode: { $in: ['auto', 'hybrid'] } },
+            { scheduleMode: { $exists: false } },
+          ],
           scheduledAt: { $lte: now }
         });
 
@@ -148,4 +166,14 @@ const startSyncFallbacks = () => {
       console.error('❌ [Fallback] Insight sync error:', err.message);
     }
   }, 24 * 60 * 60 * 1000); // 24 hours
+
+  // Token health fallback — every 12 hours
+  if (tokenHealthIntervalId) clearInterval(tokenHealthIntervalId);
+  tokenHealthIntervalId = setInterval(async () => {
+    try {
+      await runTokenHealthCheck();
+    } catch (err) {
+      console.error('❌ [Fallback] Token health error:', err.message);
+    }
+  }, 12 * 60 * 60 * 1000); // 12 hours
 };

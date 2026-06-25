@@ -43,6 +43,18 @@ const SocialAccountSchema = new mongoose.Schema({
   tokenExpiresAt: {
     type: Date,
   },
+  tokenStatus: {
+    type: String,
+    enum: ['unknown', 'healthy', 'expiring', 'expired', 'reauth_required'],
+    default: 'unknown',
+  },
+  tokenLastCheckedAt: {
+    type: Date,
+  },
+  tokenRefreshError: {
+    type: String,
+    default: '',
+  },
   scopes: [String],
   avatarUrl: {
     type: String,
