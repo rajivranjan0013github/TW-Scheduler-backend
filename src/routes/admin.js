@@ -15,6 +15,43 @@ const router = express.Router();
 const VALID_ROLES = ['owner', 'admin', 'editor', 'viewer'];
 
 const toKey = (value) => value?.toString();
+const normalizeEmail = (email = '') => email.trim().toLowerCase();
+
+const getCampaignAccessQuery = (req, { forceWorkspaceScope = false } = {}) => {
+  if (req.user?.role === 'owner' && !forceWorkspaceScope) return {};
+
+  const userEmail = normalizeEmail(req.user?.email || '');
+  return {
+    $or: [
+      { mainEmail: userEmail },
+      { createdBy: req.user._id },
+    ],
+  };
+};
+
+const findAccessibleCampaign = (req, campaignId) => {
+  return Campaign.findOne({
+    _id: campaignId,
+    ...getCampaignAccessQuery(req, { forceWorkspaceScope: req.query.scope === 'workspace' }),
+  });
+};
+
+const getAssignableAccountQuery = async (req, accountIds) => {
+  const baseQuery = { _id: { $in: accountIds } };
+  const forceWorkspaceScope = req.query.scope === 'workspace';
+  if (req.user?.role === 'owner' && !forceWorkspaceScope) return baseQuery;
+
+  const visibleCampaignIds = await Campaign.find(getCampaignAccessQuery(req, { forceWorkspaceScope })).distinct('_id');
+  return {
+    ...baseQuery,
+    $or: [
+      { userId: req.user._id },
+      { campaignId: { $in: visibleCampaignIds } },
+      { campaignId: { $exists: false } },
+      { campaignId: null },
+    ],
+  };
+};
 
 const buildCountMap = (rows, valueKey = 'count') => {
   const map = new Map();
@@ -433,6 +470,32 @@ const serializeCampaign = async (campaign) => {
   };
 };
 
+const syncCampaignAccounts = async (req, campaignId, accountIds = []) => {
+  const uniqueAccountIds = [...new Set(accountIds.map(toKey).filter(Boolean))];
+  const validAccounts = await SocialAccount.find(await getAssignableAccountQuery(req, uniqueAccountIds)).select('_id');
+  const validAccountIds = validAccounts.map((account) => account._id);
+
+  await Campaign.updateMany(
+    { _id: { $ne: campaignId }, accountIds: { $in: validAccountIds } },
+    { $pull: { accountIds: { $in: validAccountIds } } }
+  );
+
+  await SocialAccount.updateMany(
+    { campaignId, _id: { $nin: validAccountIds } },
+    { $unset: { campaignId: '' } }
+  );
+
+  if (validAccountIds.length > 0) {
+    await SocialAccount.updateMany(
+      { _id: { $in: validAccountIds } },
+      { $set: { campaignId } }
+    );
+  }
+
+  await Campaign.findByIdAndUpdate(campaignId, { accountIds: validAccountIds });
+  return validAccountIds;
+};
+
 // @desc    List all users with admin metrics
 // @route   GET /api/admin/users
 // @access  Private (Owner, Admin)
@@ -708,8 +771,23 @@ router.get('/social-accounts', protect, authorize('owner', 'admin'), async (req,
       return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
     }
 
-    const accounts = await SocialAccount.find()
+    let accountQuery = {};
+    const forceWorkspaceScope = req.query.scope === 'workspace';
+    if (req.user?.role !== 'owner' || forceWorkspaceScope) {
+      const visibleCampaignIds = await Campaign.find(getCampaignAccessQuery(req, { forceWorkspaceScope })).distinct('_id');
+      accountQuery = {
+        $or: [
+          { userId: req.user._id },
+          { campaignId: { $in: visibleCampaignIds } },
+          { campaignId: { $exists: false } },
+          { campaignId: null },
+        ],
+      };
+    }
+
+    const accounts = await SocialAccount.find(accountQuery)
       .populate('userId', 'name email')
+      .populate('campaignId', 'name status')
       .sort({ platform: 1, name: 1 })
       .lean();
 
@@ -728,7 +806,7 @@ router.get('/campaigns', protect, authorize('owner', 'admin'), async (req, res) 
       return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
     }
 
-    const campaigns = await Campaign.find()
+    const campaigns = await Campaign.find(getCampaignAccessQuery(req, { forceWorkspaceScope: req.query.scope === 'workspace' }))
       .populate({
         path: 'accountIds',
         select: 'name username platform avatarUrl isConnected tokenExpiresAt userId',
@@ -768,8 +846,6 @@ router.post('/campaigns', protect, authorize('owner', 'admin'), async (req, res)
       return res.status(400).json({ message: 'Campaign name is required.' });
     }
 
-    const validAccounts = await SocialAccount.find({ _id: { $in: accountIds } }).select('_id');
-
     const campaign = await Campaign.create({
       name: name.trim(),
       description,
@@ -779,9 +855,11 @@ router.post('/campaigns', protect, authorize('owner', 'admin'), async (req, res)
       primaryGoal,
       mainEmail: mainEmail.trim().toLowerCase(),
       status,
-      accountIds: validAccounts.map((account) => account._id),
+      accountIds: [],
       createdBy: req.user._id,
     });
+
+    await syncCampaignAccounts(req, campaign._id, accountIds);
 
     const populated = await Campaign.findById(campaign._id)
       .populate({
@@ -806,7 +884,7 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
       return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
     }
 
-    const campaign = await Campaign.findById(req.params.id);
+    const campaign = await findAccessibleCampaign(req, req.params.id);
     if (!campaign) {
       return res.status(404).json({ message: 'Campaign not found.' });
     }
@@ -829,8 +907,7 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
     if (status !== undefined) campaign.status = status;
 
     if (Array.isArray(accountIds)) {
-      const validAccounts = await SocialAccount.find({ _id: { $in: accountIds } }).select('_id');
-      campaign.accountIds = validAccounts.map((account) => account._id);
+      campaign.accountIds = await syncCampaignAccounts(req, campaign._id, accountIds);
     }
 
     await campaign.save();
@@ -863,6 +940,7 @@ router.delete('/campaigns/:id', protect, authorize('owner'), async (req, res) =>
       return res.status(404).json({ message: 'Campaign not found.' });
     }
 
+    await SocialAccount.updateMany({ campaignId: campaign._id }, { $unset: { campaignId: '' } });
     await Campaign.deleteOne({ _id: campaign._id });
     res.status(200).json({ message: 'Campaign deleted successfully.' });
   } catch (error) {
