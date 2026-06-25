@@ -331,11 +331,19 @@ router.get('/', protect, async (req, res) => {
       
       return res.status(200).json(filtered);
     }
-    const campaignId = requireCampaignId(req, res);
-    if (!campaignId) return;
-    const query = getCampaignQuery(req);
-    if (folderId) {
-      query.folderId = folderId === 'root' ? null : folderId;
+    const PLATFORM_AUDIO_FOLDER_ID = '6a35f428fa3873d31da585b8';
+    const folderIdStr = folderId ? String(folderId) : '';
+    const query = {};
+
+    if (folderIdStr === PLATFORM_AUDIO_FOLDER_ID) {
+      query.folderId = PLATFORM_AUDIO_FOLDER_ID;
+    } else {
+      const campaignId = requireCampaignId(req, res);
+      if (!campaignId) return;
+      Object.assign(query, getCampaignQuery(req));
+      if (folderId) {
+        query.folderId = folderId === 'root' ? null : folderId;
+      }
     }
     if (tag) {
       query.tags = tag.toLowerCase();
