@@ -41,6 +41,14 @@ const PublishedPostSchema = new mongoose.Schema({
     type: String,
     default: '',
   },
+  facebookVideoId: {
+    type: String,
+    default: '',
+  },
+  viewsSource: {
+    type: String,
+    default: '',
+  },
   permalink: {
     type: String,
     default: '',

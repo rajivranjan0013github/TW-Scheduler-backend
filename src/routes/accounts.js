@@ -10,6 +10,10 @@ import { protect, authorize } from '../middleware/auth.js';
 import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount, fetchYoutubeVideos } from '../services/youtubeService.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
 import {
+  fetchFacebookPostInsightValue,
+  fetchFacebookPostViews,
+} from '../services/facebookMetricsService.js';
+import {
   canAccountVerifyCampaign,
   linkSocialAccountToCampaignChannels,
   normalizeChannelHandle,
@@ -1084,6 +1088,8 @@ router.get('/posts/recent', protect, async (req, res) => {
       mediaUrl: post.mediaUrl,
       videoUrl: post.videoUrl,
       mediaType: post.mediaType,
+      facebookVideoId: post.facebookVideoId || '',
+      viewsSource: post.viewsSource || '',
       views: post.latestViews || 0,
       likes: post.latestLikes || 0,
       comments: post.latestComments || 0,
@@ -1145,6 +1151,8 @@ router.get('/:id/posts', protect, async (req, res) => {
             mediaUrl: post.mediaUrl,
             videoUrl: post.videoUrl,
             mediaType: post.mediaType,
+            facebookVideoId: post.facebookVideoId || '',
+            viewsSource: post.viewsSource || '',
             views: post.latestViews || 0,
             likes: post.latestLikes || 0,
             comments: post.latestComments || 0,
@@ -1218,12 +1226,15 @@ router.get('/:id/posts', protect, async (req, res) => {
       
       if (apiRes.ok) {
         posts = await Promise.all((apiData.data || []).map(async (post) => {
-          const [views, likes, activityByType, commentsPreview] = await Promise.all([
-            getInsightValue(post.id, 'post_impressions_unique'),
-            getInsightValue(post.id, 'post_reactions_like_total'),
-            getInsightValue(post.id, 'post_activity_by_action_type'),
+          const [viewResult, likes, commentsPreview] = await Promise.all([
+            fetchFacebookPostViews(liveAccount.accessToken, post),
+            fetchFacebookPostInsightValue(liveAccount.accessToken, post.id, 'post_reactions_like_total').catch((error) => {
+              console.warn(`Meta insight "post_reactions_like_total" failed for post ${post.id}:`, error.message);
+              return 0;
+            }),
             getCommentsPreview(post.id),
           ]);
+          const facebookVideoId = viewResult.videoId || '';
 
           return {
             id: post.id,
@@ -1231,9 +1242,12 @@ router.get('/:id/posts', protect, async (req, res) => {
             createdAt: post.created_time,
             permalink: post.permalink_url || `https://facebook.com/${post.id}`,
             mediaUrl: post.full_picture || '',
-            views: Number(views) || 0,
+            mediaType: facebookVideoId ? 'VIDEO' : (post.full_picture ? 'IMAGE' : ''),
+            facebookVideoId,
+            viewsSource: viewResult.source,
+            views: Number(viewResult.views) || 0,
             likes: Number(likes) || 0,
-            comments: Number(activityByType?.comment) || 0,
+            comments: 0,
             commentsPreview,
           };
         }));
@@ -1303,6 +1317,8 @@ router.get('/:id/posts', protect, async (req, res) => {
             mediaUrl: post.mediaUrl,
             videoUrl: post.videoUrl || '',
             mediaType: post.mediaType || '',
+            facebookVideoId: post.facebookVideoId || '',
+            viewsSource: post.viewsSource || '',
             permalink: post.permalink,
             publishedAt: new Date(post.createdAt),
             lastSyncedAt: new Date(),

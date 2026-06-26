@@ -26,23 +26,67 @@ const getExpiryStatus = (expiresAt) => {
   return 'healthy';
 };
 
+const readErrorBody = async (response) => {
+  try {
+    return await response.json();
+  } catch {
+    return {};
+  }
+};
+
+const getErrorMessage = (error = {}, fallbackMessage = 'Token refresh failed.') => {
+  return (
+    error.error?.message ||
+    error.response?.data?.error_description ||
+    error.response?.data?.error?.message ||
+    error.response?.data?.error ||
+    error.message ||
+    fallbackMessage
+  );
+};
+
+const throwProviderError = (message, { status, error, data } = {}) => {
+  const providerError = new Error(message);
+  providerError.status = status;
+  providerError.error = error;
+  providerError.providerData = data;
+  throw providerError;
+};
+
 export const isProviderAuthError = (error = {}) => {
-  const code = Number(error.code || error.error?.code || 0);
-  const status = Number(error.status || error.statusCode || 0);
-  const type = String(error.type || error.error?.type || '').toLowerCase();
-  const message = String(error.message || error.error?.message || '').toLowerCase();
+  const responseData = error.response?.data || {};
+  const responseError = responseData.error || {};
+  const code = Number(error.code || error.error?.code || responseError.code || 0);
+  const status = Number(error.status || error.statusCode || error.response?.status || 0);
+  const type = String(error.type || error.error?.type || responseError.type || '').toLowerCase();
+  const providerErrorName = String(
+    typeof responseError === 'string' ? responseError : responseData.error_code || ''
+  ).toLowerCase();
+  const message = String(
+    error.message ||
+    error.error?.message ||
+    responseError.message ||
+    responseData.error_description ||
+    ''
+  ).toLowerCase();
 
   return (
     status === 401 ||
     code === 190 ||
     code === 102 ||
     code === 401 ||
-    type.includes('oauthexception') ||
-    message.includes('access token') ||
-    message.includes('invalid token') ||
-    message.includes('expired token') ||
-    message.includes('refresh token') ||
-    message.includes('token has expired')
+    providerErrorName === 'invalid_grant' ||
+    providerErrorName === 'invalid_token' ||
+    (type.includes('oauthexception') && message.includes('error validating access token')) ||
+    message.includes('invalid oauth access token') ||
+    message.includes('error validating access token') ||
+    message.includes('access token has expired') ||
+    message.includes('token has expired') ||
+    message.includes('session has expired') ||
+    message.includes('refresh token is invalid') ||
+    message.includes('refresh token has expired') ||
+    message.includes('refresh token has been revoked') ||
+    message.includes('invalid_grant')
   );
 };
 
@@ -85,17 +129,39 @@ const markAccountHealthy = async (account, updates = {}) => {
   return SocialAccount.findByIdAndUpdate(account._id, payload, { returnDocument: 'after' });
 };
 
+const markAccountRefreshFailed = async (account, error, status) => {
+  if (!account?._id) return account;
+
+  const payload = {
+    tokenStatus: status,
+    tokenRefreshError: getErrorMessage(error),
+    tokenLastCheckedAt: new Date(),
+  };
+
+  if (typeof account.set === 'function') {
+    account.set(payload);
+    await account.save();
+    return account;
+  }
+
+  return SocialAccount.findByIdAndUpdate(account._id, payload, { returnDocument: 'after' });
+};
+
 const refreshDirectInstagramToken = async (account) => {
   const refreshUrl = `https://graph.instagram.com/refresh_access_token` +
     `?grant_type=ig_refresh_token` +
     `&access_token=${encodeURIComponent(account.accessToken)}`;
 
   const response = await fetch(refreshUrl);
-  const data = await response.json();
+  const data = await readErrorBody(response);
 
   if (!response.ok || !data.access_token) {
     const error = data.error || data;
-    throw new Error(error.message || 'Instagram token refresh failed.');
+    throwProviderError(error.message || 'Instagram token refresh failed.', {
+      status: response.status,
+      error,
+      data,
+    });
   }
 
   const tokenExpiresAt = data.expires_in
@@ -148,23 +214,17 @@ export const ensureFreshAccountToken = async (account, { force = false } = {}) =
 
     return markAccountHealthy(account);
   } catch (error) {
-    const hasExpired = status === 'expired';
-    if (hasExpired || isProviderAuthError(error)) {
-      await markAccountReauthRequired(account, error.message);
-    } else if (typeof account.set === 'function') {
-      account.set({
-        tokenStatus: status,
-        tokenRefreshError: error.message,
-        tokenLastCheckedAt: new Date(),
-      });
-      await account.save();
+    if (isProviderAuthError(error)) {
+      await markAccountReauthRequired(account, getErrorMessage(error));
+    } else {
+      await markAccountRefreshFailed(account, error, status);
     }
     throw error;
   }
 };
 
 export const handleProviderAuthFailure = async (account, errorData, fallbackMessage = 'Provider authorization failed.') => {
-  const message = errorData?.error?.message || errorData?.message || fallbackMessage;
+  const message = getErrorMessage(errorData, fallbackMessage);
   if (isProviderAuthError(errorData)) {
     await markAccountReauthRequired(account, message);
   }

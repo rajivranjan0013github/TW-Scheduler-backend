@@ -12,6 +12,7 @@ import PublishedPost from '../models/PublishedPost.js';
 import { getDBStatus } from '../config/db.js';
 import { fetchYoutubeVideos } from '../services/youtubeService.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
+import { fetchFacebookPostViews } from '../services/facebookMetricsService.js';
 
 /**
  * Fetches the latest published posts from a Facebook Page via Meta Graph API.
@@ -27,15 +28,23 @@ const fetchFacebookPosts = async (account) => {
     throw new Error(data.error?.message || `Facebook feed fetch failed (status ${response.status})`);
   }
 
-  return (data.data || []).map(post => ({
-    metaPostId: post.id,
-    platform: 'facebook',
-    content: post.message || '',
-    mediaUrl: post.full_picture || '',
-    videoUrl: '',
-    mediaType: post.full_picture ? 'IMAGE' : '',
-    permalink: post.permalink_url || `https://facebook.com/${post.id}`,
-    publishedAt: new Date(post.created_time),
+  return Promise.all((data.data || []).map(async (post) => {
+    const viewResult = await fetchFacebookPostViews(account.accessToken, post);
+    const facebookVideoId = viewResult.videoId || '';
+
+    return {
+      metaPostId: post.id,
+      platform: 'facebook',
+      content: post.message || '',
+      mediaUrl: post.full_picture || '',
+      videoUrl: '',
+      mediaType: facebookVideoId ? 'VIDEO' : (post.full_picture ? 'IMAGE' : ''),
+      facebookVideoId,
+      viewsSource: viewResult.source,
+      permalink: post.permalink_url || `https://facebook.com/${post.id}`,
+      publishedAt: new Date(post.created_time),
+      latestViews: viewResult.views,
+    };
   }));
 };
 
@@ -117,6 +126,7 @@ export const runFeedSync = async () => {
                 ...postData,
                 lastSyncedAt: new Date(),
                 // Only update latestLikes/Comments if values are available from Instagram media endpoint
+                ...(postData.latestViews !== undefined && { latestViews: postData.latestViews }),
                 ...(postData.latestLikes !== undefined && { latestLikes: postData.latestLikes }),
                 ...(postData.latestComments !== undefined && { latestComments: postData.latestComments }),
               },
