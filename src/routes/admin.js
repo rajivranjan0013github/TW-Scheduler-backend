@@ -10,6 +10,8 @@ import Folder from '../models/Folder.js';
 import Insight from '../models/Insight.js';
 import PostInsight from '../models/PostInsight.js';
 import Campaign from '../models/Campaign.js';
+import CampaignChannel from '../models/CampaignChannel.js';
+import { resolveCampaignPublishingChannels, syncCampaignChannelList } from '../utils/campaignChannels.js';
 
 const router = express.Router();
 const VALID_ROLES = ['owner', 'admin', 'editor', 'viewer'];
@@ -95,7 +97,29 @@ const getLast7DayActivity = (now = new Date()) => {
 };
 
 const getCampaignMetrics = async (campaign) => {
-  const scopedAccounts = await SocialAccount.find({ campaignId: campaign._id })
+  const channels = campaign.channels || [];
+  const lookups = channels.map((ch) => ({
+    platform: ch.platform,
+    handle: ch.handle?.replace(/^@/, '').toLowerCase(),
+  }));
+
+  const orConditions = lookups.map(({ platform, handle }) => ({
+    platform,
+    $or: [
+      { username: { $regex: new RegExp(`^${handle}$`, 'i') } },
+      { name: { $regex: new RegExp(`^${handle}$`, 'i') } },
+    ],
+  }));
+
+  const accountQuery = {
+    $or: [
+      { campaignId: campaign._id },
+      { _id: { $in: campaign.accountIds || [] } },
+      ...(orConditions.length > 0 ? orConditions : []),
+    ]
+  };
+
+  const scopedAccounts = await SocialAccount.find(accountQuery)
     .populate('userId', 'name email')
     .sort({ name: 1 })
     .lean();
@@ -462,10 +486,55 @@ const getCampaignMetrics = async (campaign) => {
   };
 };
 
+const enrichChannels = async (channels = []) => {
+  if (channels.length === 0) return [];
+
+  const lookups = channels.map((ch) => ({
+    platform: ch.platform,
+    handle: ch.handle?.replace(/^@/, '').toLowerCase(),
+  }));
+
+  const orConditions = lookups.map(({ platform, handle }) => ({
+    platform,
+    $or: [
+      { username: { $regex: new RegExp(`^@?${handle}$`, 'i') } },
+      { name: { $regex: new RegExp(`^@?${handle}$`, 'i') } },
+    ],
+  }));
+
+  const matchedAccounts = orConditions.length > 0
+    ? await SocialAccount.find({ $or: orConditions })
+        .select('_id platform username name isConnected avatarUrl')
+        .lean()
+    : [];
+
+  return channels.map((ch) => {
+    const normalizedHandle = ch.handle?.replace(/^@/, '').toLowerCase();
+    const matched = matchedAccounts.find((acc) =>
+      acc.platform === ch.platform &&
+      (((acc.username || '').replace(/^@/, '').toLowerCase() === normalizedHandle) ||
+       ((acc.name || '').replace(/^@/, '').toLowerCase() === normalizedHandle))
+    );
+
+    return {
+      _id: ch._id,
+      platform: ch.platform,
+      handle: ch.handle,
+      displayName: ch.displayName || '',
+      socialAccountId: matched?._id || ch.socialAccountId || null,
+      isVerified: matched ? matched.isConnected !== false : false,
+      avatarUrl: matched?.avatarUrl || null,
+      addedAt: ch.addedAt,
+    };
+  });
+};
+
 const serializeCampaign = async (campaign) => {
   const campaignObject = campaign.toObject ? campaign.toObject() : campaign;
+  const channels = await resolveCampaignPublishingChannels(campaign, { persist: true });
   return {
     ...campaignObject,
+    channels,
     metrics: await getCampaignMetrics(campaignObject),
   };
 };
@@ -505,6 +574,78 @@ router.get('/users', protect, authorize('owner', 'admin'), async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
     }
 
+    const campaignId = req.query.campaignId;
+    if (!campaignId) {
+      return res.status(400).json({ message: 'Campaign is required to view team access.' });
+    }
+
+    const campaign = await findAccessibleCampaign(req, campaignId);
+    if (!campaign) {
+      return res.status(404).json({ message: 'Campaign not found.' });
+    }
+
+    const campaignObject = campaign.toObject ? campaign.toObject() : campaign;
+    const campaignUserIds = new Set();
+    const campaignOwnerUserIds = new Set();
+    if (campaignObject.createdBy) campaignUserIds.add(toKey(campaignObject.createdBy));
+    if (campaignObject.createdBy) campaignOwnerUserIds.add(toKey(campaignObject.createdBy));
+
+    const campaignMainEmail = normalizeEmail(campaignObject.mainEmail || '');
+    if (campaignMainEmail) {
+      const mainEmailUser = await User.findOne({ email: campaignMainEmail }).select('_id').lean();
+      if (mainEmailUser?._id) campaignUserIds.add(toKey(mainEmailUser._id));
+      if (mainEmailUser?._id) campaignOwnerUserIds.add(toKey(mainEmailUser._id));
+    }
+
+    const channelSocialAccountIds = await CampaignChannel.find({
+      campaignId: campaignObject._id,
+      socialAccountId: { $ne: null },
+    }).distinct('socialAccountId');
+
+    const accountUserIds = await SocialAccount.find({
+      $or: [
+        { campaignId: campaignObject._id },
+        { _id: { $in: campaignObject.accountIds || [] } },
+        { _id: { $in: channelSocialAccountIds } },
+      ],
+    }).distinct('userId');
+
+    const [
+      scheduledUserIds,
+      publishedUserIds,
+      mediaUserIds,
+    ] = await Promise.all([
+      ScheduledPost.find({ campaignId: campaignObject._id }).distinct('userId'),
+      PublishedPost.find({ campaignId: campaignObject._id }).distinct('userId'),
+      Media.find({ campaignId: campaignObject._id }).distinct('userId'),
+    ]);
+
+    [
+      ...accountUserIds,
+      ...scheduledUserIds,
+      ...publishedUserIds,
+      ...mediaUserIds,
+    ].forEach((userId) => {
+      if (userId) campaignUserIds.add(toKey(userId));
+    });
+
+    const scopedUserIds = [...campaignUserIds].filter(Boolean);
+    if (scopedUserIds.length === 0) {
+      return res.status(200).json([]);
+    }
+
+    const userMatch = {
+      _id: { $in: scopedUserIds.map((userId) => userId) },
+    };
+    const campaignMatch = { campaignId: campaignObject._id };
+    const accountMatch = {
+      $or: [
+        { campaignId: campaignObject._id },
+        { _id: { $in: campaignObject.accountIds || [] } },
+        { _id: { $in: channelSocialAccountIds } },
+      ],
+    };
+
     const [
       users,
       accountCounts,
@@ -514,26 +655,37 @@ router.get('/users', protect, authorize('owner', 'admin'), async (req, res) => {
       publishedCounts,
       mediaRows,
     ] = await Promise.all([
-      User.find().sort({ createdAt: -1 }).lean(),
-      SocialAccount.aggregate([{ $group: { _id: '$userId', count: { $sum: 1 } } }]),
+      User.find(userMatch).sort({ createdAt: -1 }).lean(),
       SocialAccount.aggregate([
-        { $match: { isConnected: true } },
+        { $match: accountMatch },
         { $group: { _id: '$userId', count: { $sum: 1 } } },
       ]),
       SocialAccount.aggregate([
+        { $match: { ...accountMatch, isConnected: true } },
+        { $group: { _id: '$userId', count: { $sum: 1 } } },
+      ]),
+      SocialAccount.aggregate([
+        { $match: accountMatch },
         {
           $group: {
             _id: '$userId',
             platforms: { $addToSet: '$platform' },
             tokenExpiresAt: { $min: '$tokenExpiresAt' },
+            tokenStatuses: { $addToSet: '$tokenStatus' },
+            tokenRefreshErrors: { $addToSet: '$tokenRefreshError' },
           },
         },
       ]),
       ScheduledPost.aggregate([
+        { $match: campaignMatch },
         { $group: { _id: { userId: '$userId', status: '$status' }, count: { $sum: 1 } } },
       ]),
-      PublishedPost.aggregate([{ $group: { _id: '$userId', count: { $sum: 1 } } }]),
+      PublishedPost.aggregate([
+        { $match: campaignMatch },
+        { $group: { _id: '$userId', count: { $sum: 1 } } },
+      ]),
       Media.aggregate([
+        { $match: campaignMatch },
         {
           $group: {
             _id: '$userId',
@@ -554,6 +706,8 @@ router.get('/users', protect, authorize('owner', 'admin'), async (req, res) => {
       platformMap.set(toKey(row._id), {
         platforms: row.platforms || [],
         tokenExpiresAt: row.tokenExpiresAt || null,
+        tokenStatuses: row.tokenStatuses || [],
+        tokenRefreshErrors: (row.tokenRefreshErrors || []).filter(Boolean),
       });
     });
 
@@ -569,10 +723,16 @@ router.get('/users', protect, authorize('owner', 'admin'), async (req, res) => {
       const userId = toKey(user._id);
       const scheduled = scheduledStatusMap.get(userId) || {};
       const media = mediaMap.get(userId) || { count: 0, storageBytes: 0 };
-      const accountHealth = platformMap.get(userId) || { platforms: [], tokenExpiresAt: null };
+      const accountHealth = platformMap.get(userId) || {
+        platforms: [],
+        tokenExpiresAt: null,
+        tokenStatuses: [],
+        tokenRefreshErrors: [],
+      };
 
       return {
         ...user,
+        campaignRole: campaignOwnerUserIds.has(userId) ? 'owner' : 'account_handler',
         metrics: {
           accounts: accountCountMap.get(userId) || 0,
           connectedAccounts: connectedAccountCountMap.get(userId) || 0,
@@ -841,10 +1001,19 @@ router.post('/campaigns', protect, authorize('owner', 'admin'), async (req, res)
       mainEmail = req.user.email || '',
       status = 'active',
       accountIds = [],
+      channels = [],
     } = req.body;
     if (!name?.trim()) {
       return res.status(400).json({ message: 'Campaign name is required.' });
     }
+
+    const cleanChannels = channels
+      .filter((ch) => ch.platform && ch.handle?.trim())
+      .map((ch) => ({
+        platform: ch.platform,
+        handle: ch.handle.trim(),
+        displayName: ch.displayName?.trim() || '',
+      }));
 
     const campaign = await Campaign.create({
       name: name.trim(),
@@ -856,10 +1025,12 @@ router.post('/campaigns', protect, authorize('owner', 'admin'), async (req, res)
       mainEmail: mainEmail.trim().toLowerCase(),
       status,
       accountIds: [],
+      channels: [],
       createdBy: req.user._id,
     });
 
     await syncCampaignAccounts(req, campaign._id, accountIds);
+    await syncCampaignChannelList(campaign._id, cleanChannels, { userId: req.user._id });
 
     const populated = await Campaign.findById(campaign._id)
       .populate({
@@ -889,7 +1060,7 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
       return res.status(404).json({ message: 'Campaign not found.' });
     }
 
-    const { name, description, productName, productWebsite, targetAudience, primaryGoal, mainEmail, status, accountIds } = req.body;
+    const { name, description, productName, productWebsite, targetAudience, primaryGoal, mainEmail, status, accountIds, channels } = req.body;
 
     if (name !== undefined) {
       if (!name.trim()) {
@@ -906,11 +1077,15 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
     if (mainEmail !== undefined) campaign.mainEmail = mainEmail.trim().toLowerCase();
     if (status !== undefined) campaign.status = status;
 
+    await campaign.save();
+
     if (Array.isArray(accountIds)) {
-      campaign.accountIds = await syncCampaignAccounts(req, campaign._id, accountIds);
+      await syncCampaignAccounts(req, campaign._id, accountIds);
     }
 
-    await campaign.save();
+    if (Array.isArray(channels)) {
+      await syncCampaignChannelList(campaign._id, channels, { userId: req.user._id });
+    }
 
     const populated = await Campaign.findById(campaign._id)
       .populate({
@@ -942,6 +1117,7 @@ router.delete('/campaigns/:id', protect, authorize('owner'), async (req, res) =>
 
     await SocialAccount.updateMany({ campaignId: campaign._id }, { $unset: { campaignId: '' } });
     await Campaign.deleteOne({ _id: campaign._id });
+    await CampaignChannel.deleteMany({ campaignId: campaign._id });
     res.status(200).json({ message: 'Campaign deleted successfully.' });
   } catch (error) {
     res.status(500).json({ message: error.message });

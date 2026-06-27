@@ -8,6 +8,14 @@ import PublishedPost from '../models/PublishedPost.js';
 import PostInsight from '../models/PostInsight.js';
 import { protect, authorize } from '../middleware/auth.js';
 import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount, fetchYoutubeVideos } from '../services/youtubeService.js';
+import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
+import {
+  canAccountVerifyCampaign,
+  linkSocialAccountToCampaignChannels,
+  normalizeChannelHandle,
+  resolveCampaignPublishingChannels,
+} from '../utils/campaignChannels.js';
+import CampaignChannel from '../models/CampaignChannel.js';
 
 const router = express.Router();
 const insightSkipCache = new Map();
@@ -39,6 +47,15 @@ const getScopedUserId = (req) => {
 
 const getActiveCampaignId = (req) => req.query.campaignId || req.body?.campaignId || null;
 
+const getVerifiedCampaignSocialAccountIds = async (campaignId) => {
+  const channels = await CampaignChannel.find({
+    campaignId,
+    status: 'verified',
+    socialAccountId: { $ne: null },
+  }).select('socialAccountId').lean();
+  return channels.map((channel) => channel.socialAccountId);
+};
+
 const canAccessCampaign = async (req, campaignId) => {
   if (!campaignId) return false;
   if (ADMIN_ROLES.includes(req.user?.role)) return true;
@@ -54,7 +71,24 @@ const canAccessCampaign = async (req, campaignId) => {
     ],
   }).select('_id').lean();
 
-  return Boolean(campaign);
+  if (campaign) return true;
+
+  const userAccounts = await SocialAccount.find({ userId: req.user._id, isConnected: true })
+    .select('platform username name accountId')
+    .lean();
+  if (userAccounts.length === 0) return false;
+
+  const campaignChannels = await CampaignChannel.find({ campaignId }).select('platform normalizedHandle').lean();
+  return campaignChannels.some((channel) => (
+    userAccounts.some((account) => (
+      account.platform === channel.platform &&
+      [
+        normalizeChannelHandle(account.username),
+        normalizeChannelHandle(account.name),
+        normalizeChannelHandle(account.accountId),
+      ].includes(channel.normalizedHandle)
+    ))
+  ));
 };
 
 const getScopedAccountQuery = async (req, extra = {}) => {
@@ -73,6 +107,28 @@ const getScopedAccountQuery = async (req, extra = {}) => {
   return { userId: getScopedUserId(req), ...extra };
 };
 
+const getLinkableCampaignId = async (req, campaignId, accountPayload) => {
+  if (!campaignId) return undefined;
+  if (ADMIN_ROLES.includes(req.user?.role)) return campaignId;
+  return await canAccountVerifyCampaign(campaignId, accountPayload) ? campaignId : undefined;
+};
+
+const linkAccountToCampaign = async (campaignId, socialAccountId, platform, username, name, accountId) => {
+  if (!campaignId || !socialAccountId) return;
+  try {
+    await linkSocialAccountToCampaignChannels(campaignId, {
+      _id: socialAccountId,
+      platform,
+      username,
+      name,
+      accountId,
+      isConnected: true,
+    });
+  } catch (err) {
+    console.error('Failed to link account to campaign:', err.message);
+  }
+};
+
 // @desc    Get all connected accounts
 // @route   GET /api/accounts
 // @access  Private
@@ -83,8 +139,54 @@ router.get('/', protect, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected.' });
     }
 
+    const campaignId = getActiveCampaignId(req);
+    if (campaignId) {
+      const allowed = await canAccessCampaign(req, campaignId);
+      if (!allowed) {
+        return res.status(403).json({ message: 'Campaign access denied.' });
+      }
+
+      const accountIds = await getVerifiedCampaignSocialAccountIds(campaignId);
+      const accounts = accountIds.length > 0
+        ? await SocialAccount.find({ _id: { $in: accountIds }, isConnected: true })
+        : [];
+      return res.status(200).json(accounts);
+    }
+
     const accounts = await SocialAccount.find(await getScopedAccountQuery(req));
     res.status(200).json(accounts);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message });
+  }
+});
+
+// @desc    Get campaign publishing channels, including pending verification rows
+// @route   GET /api/accounts/publishing-channels?campaignId=...
+// @access  Private
+router.get('/publishing-channels', protect, async (req, res) => {
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      return res.status(503).json({ message: 'Database disconnected.' });
+    }
+
+    const campaignId = getActiveCampaignId(req);
+    if (!campaignId) {
+      return res.status(400).json({ message: 'Campaign is required.' });
+    }
+
+    const allowed = await canAccessCampaign(req, campaignId);
+    if (!allowed) {
+      return res.status(403).json({ message: 'Campaign access denied.' });
+    }
+
+    const campaign = await Campaign.findById(campaignId).select('channels status').lean();
+    if (!campaign || campaign.status === 'archived') {
+      return res.status(404).json({ message: 'Campaign not found.' });
+    }
+
+    const channels = await resolveCampaignPublishingChannels(campaign, { persist: true });
+    res.status(200).json(channels);
   } catch (error) {
     res.status(error.statusCode || 500).json({ message: error.message });
   }
@@ -175,7 +277,20 @@ router.get('/insights', protect, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected. Insights service is unavailable.' });
     }
 
-    const accounts = await SocialAccount.find(await getScopedAccountQuery(req, { isConnected: true }));
+    const campaignId = getActiveCampaignId(req);
+    let accounts;
+    if (campaignId) {
+      const allowed = await canAccessCampaign(req, campaignId);
+      if (!allowed) {
+        return res.status(403).json({ message: 'Campaign access denied.' });
+      }
+      const accountIds = await getVerifiedCampaignSocialAccountIds(campaignId);
+      accounts = accountIds.length > 0
+        ? await SocialAccount.find({ _id: { $in: accountIds }, isConnected: true })
+        : [];
+    } else {
+      accounts = await SocialAccount.find(await getScopedAccountQuery(req, { isConnected: true }));
+    }
     if (accounts.length === 0) {
       return res.status(200).json([]);
     }
@@ -253,7 +368,12 @@ router.get('/insights', protect, async (req, res) => {
 
     // Loop through each account and fetch/caching details
     for (const account of accounts) {
+      if (!['instagram', 'facebook'].includes(account.platform)) {
+        continue;
+      }
+
       const isMock = account.accessToken?.startsWith('mock-');
+      let liveAccount = account;
       const skipUntil = insightSkipCache.get(account._id.toString());
       if (skipUntil && skipUntil > Date.now()) {
         continue;
@@ -293,6 +413,13 @@ router.get('/insights', protect, async (req, res) => {
             results[dateStr] = randomVal;
           });
         } else {
+          try {
+            liveAccount = await ensureFreshAccountToken(liveAccount);
+          } catch (authErr) {
+            await handleProviderAuthFailure(liveAccount, authErr, authErr.message);
+            throw authErr;
+          }
+
           // Real Meta API query range
           const datesSorted = [...targetDates].sort();
           const targetSinceDate = new Date(datesSorted[0]);
@@ -303,8 +430,8 @@ router.get('/insights', protect, async (req, res) => {
           const targetUntil = Math.floor(targetUntilDate.getTime() / 1000);
 
           try {
-            const metric = account.platform === 'facebook' ? 'page_post_engagements' : 'reach';
-            const apiValues = await fetchDailyInsightValues(account, [metric], targetSince, targetUntil);
+            const metric = liveAccount.platform === 'facebook' ? 'page_post_engagements' : 'reach';
+            const apiValues = await fetchDailyInsightValues(liveAccount, [metric], targetSince, targetUntil);
             
             for (const item of apiValues) {
               const dateStr = item.end_time.split('T')[0];
@@ -313,16 +440,17 @@ router.get('/insights', protect, async (req, res) => {
               }
             }
           } catch (apiErr) {
-            console.error(`Meta fetch failed for ${account.name}:`, apiErr.message);
+            await handleProviderAuthFailure(liveAccount, apiErr, apiErr.message);
+            console.error(`Meta fetch failed for ${liveAccount.name}:`, apiErr.message);
           }
         }
 
         // Cache retrieved dates in MongoDB (including today's current count)
         const insertDocs = Object.keys(results).map(dateStr => ({
-          campaignId: account.campaignId,
-          accountId: account._id,
+          campaignId: liveAccount.campaignId,
+          accountId: liveAccount._id,
           dateStr,
-          platform: account.platform,
+          platform: liveAccount.platform,
           value: results[dateStr]
         }));
 
@@ -331,7 +459,7 @@ router.get('/insights', protect, async (req, res) => {
             await Insight.findOneAndUpdate(
               { accountId: doc.accountId, dateStr: doc.dateStr },
               doc,
-              { upsert: true, new: true }
+              { upsert: true, returnDocument: 'after' }
             );
           } catch (dbErr) {
             console.error('Failed to cache insight in database:', dbErr.message);
@@ -353,7 +481,7 @@ router.get('/insights', protect, async (req, res) => {
           ? cachedDatesMap[dateStr] 
           : (newCachedData[dateStr] || 0);
 
-        if (account.platform === 'instagram') {
+        if (liveAccount.platform === 'instagram') {
           chartMap[dateStr].Instagram += val;
         } else {
           chartMap[dateStr].Facebook += val;
@@ -375,7 +503,7 @@ router.get('/insights', protect, async (req, res) => {
 // @desc    Connect a new account
 // @route   POST /api/accounts/connect
 // @access  Private (Owner, Admin)
-router.post('/connect', protect, authorize('owner', 'admin'), async (req, res) => {
+router.post('/connect', protect, async (req, res) => {
   const { platform, accountId, name, username, accessToken, avatarUrl, campaignId } = req.body;
 
   try {
@@ -384,25 +512,40 @@ router.post('/connect', protect, authorize('owner', 'admin'), async (req, res) =
       return res.status(503).json({ message: 'Database disconnected.' });
     }
 
+    const linkableCampaignId = await getLinkableCampaignId(req, campaignId, {
+      platform,
+      accountId,
+      name,
+      username,
+    });
+
     let account = await SocialAccount.findOne({ userId: req.user._id, accountId });
     if (account) {
       account.isConnected = true;
       account.accessToken = accessToken || 'mock-access-token';
-      account.campaignId = campaignId || undefined;
+      account.campaignId = linkableCampaignId || undefined;
+      account.tokenStatus = 'healthy';
+      account.tokenRefreshError = '';
+      account.tokenLastCheckedAt = new Date();
       await account.save();
     } else {
       account = await SocialAccount.create({
         userId: req.user._id,
-        campaignId: campaignId || undefined,
+        campaignId: linkableCampaignId || undefined,
         platform,
         accountId,
         name,
         username,
         accessToken: accessToken || 'mock-access-token',
         avatarUrl,
+        tokenStatus: 'healthy',
+        tokenLastCheckedAt: new Date(),
       });
     }
 
+    if (linkableCampaignId) {
+      await linkAccountToCampaign(linkableCampaignId, account._id, platform, username, name, accountId);
+    }
 
     res.status(201).json(account);
   } catch (error) {
@@ -413,7 +556,7 @@ router.post('/connect', protect, authorize('owner', 'admin'), async (req, res) =
 // @desc    Get YouTube OAuth URL
 // @route   GET /api/accounts/youtube/auth-url
 // @access  Private (Owner, Admin)
-router.get('/youtube/auth-url', protect, authorize('owner', 'admin'), async (req, res) => {
+router.get('/youtube/auth-url', protect, async (req, res) => {
   try {
     const url = getYoutubeAuthUrl();
     res.status(200).json({ url });
@@ -425,7 +568,7 @@ router.get('/youtube/auth-url', protect, authorize('owner', 'admin'), async (req
 // @desc    Callback from YouTube OAuth to connect a channel
 // @route   POST /api/accounts/youtube-callback
 // @access  Private (Owner, Admin)
-router.post('/youtube-callback', protect, authorize('owner', 'admin'), async (req, res) => {
+router.post('/youtube-callback', protect, async (req, res) => {
   const { code, campaignId } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
@@ -438,6 +581,11 @@ router.post('/youtube-callback', protect, authorize('owner', 'admin'), async (re
     }
 
     const accountPayload = await exchangeYoutubeCodeForAccount(code, req.user._id);
+    const linkableCampaignId = await getLinkableCampaignId(req, campaignId, accountPayload);
+    if (campaignId && !linkableCampaignId && !ADMIN_ROLES.includes(req.user?.role)) {
+      return res.status(403).json({ message: 'This YouTube channel does not match the campaign handle.' });
+    }
+
     const account = await SocialAccount.findOneAndUpdate(
       {
         userId: req.user._id,
@@ -446,10 +594,14 @@ router.post('/youtube-callback', protect, authorize('owner', 'admin'), async (re
       },
       {
         ...accountPayload,
-        campaignId: campaignId || undefined,
+        campaignId: linkableCampaignId || undefined,
       },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+      { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
     );
+
+    if (linkableCampaignId) {
+      await linkAccountToCampaign(linkableCampaignId, account._id, 'youtube', account.username, account.name, account.accountId);
+    }
 
     res.status(200).json({
       message: `Successfully connected YouTube channel "${account.name}".`,
@@ -464,7 +616,7 @@ router.post('/youtube-callback', protect, authorize('owner', 'admin'), async (re
 // @desc    Disconnect an account
 // @route   DELETE /api/accounts/:id
 // @access  Private (Owner, Admin)
-router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => {
+router.delete('/:id', protect, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -478,7 +630,7 @@ router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => 
       return res.status(404).json({ message: 'Account not found' });
     }
 
-    await SocialAccount.deleteOne({ _id: id, userId: req.user._id });
+    await SocialAccount.deleteOne(getAccountAccessFilter(req, id));
     res.status(200).json({ message: 'Account disconnected successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -488,7 +640,7 @@ router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => 
 // @desc    Callback from Facebook OAuth to connect accounts
 // @route   POST /api/accounts/facebook-callback
 // @access  Private (Owner, Admin)
-router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (req, res) => {
+router.post('/facebook-callback', protect, async (req, res) => {
   const { code, campaignId } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
@@ -606,12 +758,19 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
       const pagePicUrl = `https://graph.facebook.com/v20.0/${pageId}/picture?type=normal&access_token=${pageAccessToken}`;
 
       
+      const linkableCampaignId = await getLinkableCampaignId(req, campaignId, {
+        platform: 'facebook',
+        accountId: pageId,
+        name: pageName,
+        username: pageUsername,
+      });
+
       // Upsert Facebook Page in database
       let fbAccount = await SocialAccount.findOneAndUpdate(
         { userId: req.user._id, accountId: pageId },
         {
           userId: req.user._id,
-          campaignId: campaignId || undefined,
+          campaignId: linkableCampaignId || undefined,
           platform: 'facebook',
           name: pageName,
           username: pageUsername,
@@ -619,10 +778,16 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
           authProvider: 'facebook',
           avatarUrl: pagePicUrl,
           isConnected: true,
+          tokenStatus: 'healthy',
+          tokenRefreshError: '',
+          tokenLastCheckedAt: new Date(),
         },
-        { upsert: true, new: true }
+        { upsert: true, returnDocument: 'after' }
       );
       connectedAccounts.push(fbAccount);
+      if (linkableCampaignId) {
+        await linkAccountToCampaign(linkableCampaignId, fbAccount._id, 'facebook', fbAccount.username, fbAccount.name, fbAccount.accountId);
+      }
 
       // Find linked Instagram Business Account ID
       const igCheckUrl = `https://graph.facebook.com/v20.0/${pageId}?fields=instagram_business_account&access_token=${pageAccessToken}`;
@@ -641,12 +806,19 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
         const igUsername = igDetailData.username || 'instagram_account';
         const igAvatarUrl = igDetailData.profile_picture_url || 'https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?w=150';
 
+        const instagramLinkableCampaignId = await getLinkableCampaignId(req, campaignId, {
+          platform: 'instagram',
+          accountId: igAccountId,
+          name: igName,
+          username: igUsername,
+        });
+
         // Upsert Instagram Account in database
         let igAccount = await SocialAccount.findOneAndUpdate(
           { userId: req.user._id, accountId: igAccountId },
           {
             userId: req.user._id,
-            campaignId: campaignId || undefined,
+            campaignId: instagramLinkableCampaignId || undefined,
             platform: 'instagram',
             name: igName,
             username: igUsername,
@@ -654,10 +826,16 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
             authProvider: 'facebook',
             avatarUrl: igAvatarUrl,
             isConnected: true,
+            tokenStatus: 'healthy',
+            tokenRefreshError: '',
+            tokenLastCheckedAt: new Date(),
           },
-          { upsert: true, new: true }
+          { upsert: true, returnDocument: 'after' }
         );
         connectedAccounts.push(igAccount);
+        if (instagramLinkableCampaignId) {
+          await linkAccountToCampaign(instagramLinkableCampaignId, igAccount._id, 'instagram', igAccount.username, igAccount.name, igAccount.accountId);
+        }
       }
     }
 
@@ -674,7 +852,7 @@ router.post('/facebook-callback', protect, authorize('owner', 'admin'), async (r
 // @desc    Callback from Instagram OAuth to connect a professional Instagram account directly
 // @route   POST /api/accounts/instagram-callback
 // @access  Private (Owner, Admin)
-router.post('/instagram-callback', protect, authorize('owner', 'admin'), async (req, res) => {
+router.post('/instagram-callback', protect, async (req, res) => {
   const { code, redirectUri: requestRedirectUri, campaignId } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
@@ -742,11 +920,21 @@ router.post('/instagram-callback', protect, authorize('owner', 'admin'), async (
       return res.status(400).json({ message: 'Instagram did not return an account ID.' });
     }
 
+    const linkableCampaignId = await getLinkableCampaignId(req, campaignId, {
+      platform: 'instagram',
+      accountId: instagramAccountId,
+      name,
+      username,
+    });
+    if (campaignId && !linkableCampaignId && !ADMIN_ROLES.includes(req.user?.role)) {
+      return res.status(403).json({ message: `@${username} does not match a pending Instagram handle in this campaign.` });
+    }
+
     const account = await SocialAccount.findOneAndUpdate(
       { userId: req.user._id, platform: 'instagram', accountId: instagramAccountId },
       {
         userId: req.user._id,
-        campaignId: campaignId || undefined,
+        campaignId: linkableCampaignId || undefined,
         platform: 'instagram',
         accountId: instagramAccountId,
         name,
@@ -756,9 +944,16 @@ router.post('/instagram-callback', protect, authorize('owner', 'admin'), async (
         tokenExpiresAt,
         avatarUrl: profileData.profile_picture_url || 'https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?w=150',
         isConnected: true,
+        tokenStatus: 'healthy',
+        tokenRefreshError: '',
+        tokenLastCheckedAt: new Date(),
       },
-      { upsert: true, new: true }
+      { upsert: true, returnDocument: 'after' }
     );
+
+    if (linkableCampaignId) {
+      await linkAccountToCampaign(linkableCampaignId, account._id, 'instagram', account.username, account.name, account.accountId);
+    }
 
     res.status(200).json({
       message: `Successfully connected Instagram account @${username}.`,
@@ -838,6 +1033,8 @@ router.get('/:id/posts', protect, async (req, res) => {
       return res.status(400).json({ message: 'Mock account feed access is disabled.' });
     }
 
+    let liveAccount = account;
+
     // Check for cached posts and their freshness (2 hour threshold)
     const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
     let cachedPosts = [];
@@ -873,12 +1070,19 @@ router.get('/:id/posts', protect, async (req, res) => {
     }
 
     // Cache is stale or empty or force refresh — fetch from Meta
+    try {
+      liveAccount = await ensureFreshAccountToken(liveAccount);
+    } catch (authErr) {
+      await handleProviderAuthFailure(liveAccount, authErr, authErr.message);
+      return res.status(401).json({ message: authErr.message || 'Account requires reauthorization.' });
+    }
+
     const getInsightValue = async (postId, metric) => {
       try {
-        const graphHost = account.platform === 'instagram' && account.authProvider === 'instagram'
+        const graphHost = liveAccount.platform === 'instagram' && liveAccount.authProvider === 'instagram'
           ? 'graph.instagram.com'
           : 'graph.facebook.com';
-        const url = `https://${graphHost}/v20.0/${postId}/insights?metric=${metric}&access_token=${account.accessToken}`;
+        const url = `https://${graphHost}/v20.0/${postId}/insights?metric=${metric}&access_token=${liveAccount.accessToken}`;
         const insightRes = await fetch(url);
         const insightData = await insightRes.json();
 
@@ -896,13 +1100,13 @@ router.get('/:id/posts', protect, async (req, res) => {
 
     const getCommentsPreview = async (postId) => {
       try {
-        const graphHost = account.platform === 'instagram' && account.authProvider === 'instagram'
+        const graphHost = liveAccount.platform === 'instagram' && liveAccount.authProvider === 'instagram'
           ? 'graph.instagram.com'
           : 'graph.facebook.com';
-        const fields = account.platform === 'facebook'
+        const fields = liveAccount.platform === 'facebook'
           ? 'id,from,message,created_time'
           : 'id,username,text,timestamp';
-        const url = `https://${graphHost}/v20.0/${postId}/comments?fields=${fields}&limit=3&access_token=${account.accessToken}`;
+        const url = `https://${graphHost}/v20.0/${postId}/comments?fields=${fields}&limit=3&access_token=${liveAccount.accessToken}`;
         const commentsRes = await fetch(url);
         const commentsData = await commentsRes.json();
 
@@ -920,8 +1124,8 @@ router.get('/:id/posts', protect, async (req, res) => {
 
     // Call actual Meta APIs
     let posts = [];
-    if (account.platform === 'facebook') {
-      const url = `https://graph.facebook.com/v20.0/${account.accountId}/published_posts?fields=id,message,created_time,full_picture,permalink_url&limit=25&access_token=${account.accessToken}`;
+    if (liveAccount.platform === 'facebook') {
+      const url = `https://graph.facebook.com/v20.0/${liveAccount.accountId}/published_posts?fields=id,message,created_time,full_picture,permalink_url&limit=25&access_token=${liveAccount.accessToken}`;
       const apiRes = await fetch(url);
       const apiData = await apiRes.json();
       
@@ -948,17 +1152,18 @@ router.get('/:id/posts', protect, async (req, res) => {
         }));
       } else {
         const message = apiData.error?.message || 'Meta API returned an error fetching posts';
+        await handleProviderAuthFailure(liveAccount, apiData, message);
         const isPermissionError = apiData.error?.code === 10;
-        console.warn(`Meta Facebook feed access failed for ${account.name}: ${message}`);
+        console.warn(`Meta Facebook feed access failed for ${liveAccount.name}: ${message}`);
         return res.status(apiRes.status || 400).json({ 
           message: isPermissionError
             ? 'Meta denied feed access. Make sure the user manages this Page and the Meta app has the required Page read permission or App Review access.'
             : message
         });
       }
-    } else if (account.platform === 'instagram') {
-      const graphHost = account.authProvider === 'instagram' ? 'graph.instagram.com' : 'graph.facebook.com';
-      const url = `https://${graphHost}/v20.0/${account.accountId}/media?fields=id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count&access_token=${account.accessToken}`;
+    } else if (liveAccount.platform === 'instagram') {
+      const graphHost = liveAccount.authProvider === 'instagram' ? 'graph.instagram.com' : 'graph.facebook.com';
+      const url = `https://${graphHost}/v20.0/${liveAccount.accountId}/media?fields=id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count&access_token=${liveAccount.accessToken}`;
       const apiRes = await fetch(url);
       const apiData = await apiRes.json();
 
@@ -987,12 +1192,13 @@ router.get('/:id/posts', protect, async (req, res) => {
         }));
       } else {
         console.error('Meta Instagram Media API error:', apiData);
+        await handleProviderAuthFailure(liveAccount, apiData, apiData.error?.message || 'Meta API returned an error fetching posts');
         return res.status(apiRes.status || 400).json({ 
           message: apiData.error?.message || 'Meta API returned an error fetching posts' 
         });
       }
-    } else if (account.platform === 'youtube') {
-      posts = await fetchYoutubeVideos(account);
+    } else if (liveAccount.platform === 'youtube') {
+      posts = await fetchYoutubeVideos(liveAccount);
     }
 
     // Upsert fetched posts into PublishedPost cache
@@ -1001,11 +1207,11 @@ router.get('/:id/posts', protect, async (req, res) => {
         await PublishedPost.findOneAndUpdate(
           { userId: account.userId, metaPostId: post.id },
           {
-            userId: account.userId,
-            campaignId: account.campaignId,
-            accountId: account._id,
+            userId: liveAccount.userId,
+            campaignId: liveAccount.campaignId,
+            accountId: liveAccount._id,
             metaPostId: post.id,
-            platform: account.platform,
+            platform: liveAccount.platform,
             content: post.content,
             mediaUrl: post.mediaUrl,
             videoUrl: post.videoUrl || '',
@@ -1018,7 +1224,7 @@ router.get('/:id/posts', protect, async (req, res) => {
             latestComments: post.comments,
             commentsPreview: post.commentsPreview || [],
           },
-          { upsert: true, new: true, setDefaultsOnInsert: true }
+          { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
         );
       } catch (upsertErr) {
         if (upsertErr.code !== 11000) {
@@ -1114,6 +1320,73 @@ router.get('/:id/posts/:metaPostId/insights', protect, async (req, res) => {
       },
       dailyInsights,
     });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Get all campaigns where this creator's connected accounts match the campaign channels
+router.get('/creator/campaigns', protect, async (req, res) => {
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      return res.status(200).json([]);
+    }
+
+    // 1. Find all social accounts connected by the logged-in creator
+    const creatorAccounts = await SocialAccount.find({ userId: req.user._id }).lean();
+    if (creatorAccounts.length === 0) {
+      return res.status(200).json([]);
+    }
+
+    // 2. Map handles to lowercase
+    const accountLookupPairs = creatorAccounts.map(acc => {
+      const handle = (acc.username || acc.name || '').replace(/^@/, '').toLowerCase();
+      return { platform: acc.platform, handle };
+    });
+
+    // 3. Find campaigns
+    const orConditions = accountLookupPairs.map(({ platform, handle }) => ({
+      'channels.platform': platform,
+      'channels.handle': { $regex: new RegExp(`^@?${handle}$`, 'i') }
+    }));
+
+    if (orConditions.length === 0) {
+      return res.status(200).json([]);
+    }
+
+    // Fetch campaigns matching any of the conditions
+    const matchedCampaigns = await Campaign.find({ $or: orConditions })
+      .populate('createdBy', 'name email')
+      .lean();
+
+    // 4. Enrich campaigns to highlight which channel matches the creator's account
+    const enrichedCampaigns = matchedCampaigns.map(campaign => {
+      const creatorChannels = (campaign.channels || []).map(ch => {
+        const normalizedChHandle = ch.handle.replace(/^@/, '').toLowerCase();
+        // check if this matches any of the creator's connected accounts
+        const matchedAcc = creatorAccounts.find(acc => 
+          acc.platform === ch.platform &&
+          (acc.username?.replace(/^@/, '').toLowerCase() === normalizedChHandle ||
+           acc.name?.replace(/^@/, '').toLowerCase() === normalizedChHandle)
+        );
+
+        return {
+          ...ch,
+          isVerified: matchedAcc ? matchedAcc.isConnected !== false : false,
+          avatarUrl: matchedAcc?.avatarUrl || null,
+          matchedAccountId: matchedAcc?._id || null,
+        };
+      });
+
+      return {
+        ...campaign,
+        channels: creatorChannels,
+        isCreatorParticipant: true
+      };
+    });
+
+    res.status(200).json(enrichedCampaigns);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

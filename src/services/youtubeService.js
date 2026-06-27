@@ -1,4 +1,5 @@
 import { OAuth2Client } from 'google-auth-library';
+import { ensureFreshAccountToken } from './tokenHealthService.js';
 
 const YOUTUBE_UPLOAD_SCOPE = 'https://www.googleapis.com/auth/youtube.upload';
 const YOUTUBE_READONLY_SCOPE = 'https://www.googleapis.com/auth/youtube.readonly';
@@ -71,6 +72,9 @@ export const exchangeYoutubeCodeForAccount = async (code, userId) => {
     refreshToken: tokens.refresh_token,
     authProvider: 'youtube',
     tokenExpiresAt: tokens.expiry_date ? new Date(tokens.expiry_date) : undefined,
+    tokenStatus: 'healthy',
+    tokenRefreshError: '',
+    tokenLastCheckedAt: new Date(),
     scopes: tokens.scope ? tokens.scope.split(' ') : [YOUTUBE_UPLOAD_SCOPE, YOUTUBE_READONLY_SCOPE],
     avatarUrl: thumbnail,
     metadata: {
@@ -81,24 +85,6 @@ export const exchangeYoutubeCodeForAccount = async (code, userId) => {
     },
     isConnected: true,
   };
-};
-
-const getFreshYoutubeAccessToken = async (account) => {
-  if (!account.refreshToken) {
-    throw new Error(`YouTube account "${account.name}" is missing a refresh token. Reconnect the channel.`);
-  }
-
-  const client = getYoutubeOAuthClient();
-  client.setCredentials({ refresh_token: account.refreshToken });
-
-  const tokenResponse = await client.getAccessToken();
-  const token = tokenResponse?.token;
-
-  if (!token) {
-    throw new Error('Failed to refresh YouTube access token.');
-  }
-
-  return token;
 };
 
 const parseTags = (tags) => {
@@ -135,7 +121,8 @@ export const publishToYoutube = async ({ account, media, caption, specifics }) =
     throw new Error('YouTube publishing requires a video media asset.');
   }
 
-  const accessToken = await getFreshYoutubeAccessToken(account);
+  const freshAccount = await ensureFreshAccountToken(account, { force: true });
+  const accessToken = freshAccount.accessToken;
   const metadata = buildYoutubeMetadata({ caption, specifics });
 
 
@@ -188,8 +175,9 @@ export const publishToYoutube = async ({ account, media, caption, specifics }) =
 };
 
 export const fetchYoutubeVideos = async (account) => {
-  const accessToken = await getFreshYoutubeAccessToken(account);
-  const channelId = account.accountId;
+  const freshAccount = await ensureFreshAccountToken(account, { force: true });
+  const accessToken = freshAccount.accessToken;
+  const channelId = freshAccount.accountId;
   const uploadsPlaylistId = channelId.replace(/^UC/, 'UU');
 
 
@@ -260,4 +248,3 @@ export const fetchYoutubeVideos = async (account) => {
     };
   });
 };
-

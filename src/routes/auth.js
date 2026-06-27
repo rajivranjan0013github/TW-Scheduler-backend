@@ -82,6 +82,7 @@ router.post('/login', async (req, res) => {
         name,
         avatar,
         role: userCount === 0 ? 'owner' : 'editor',
+        userType: req.body.userType,
         googleId,
       });
     }
@@ -166,6 +167,7 @@ router.post('/facebook-login', async (req, res) => {
         name: profile.name || email,
         avatar: profile.picture?.data?.url,
         role: userCount === 0 ? 'owner' : 'editor',
+        userType: req.body.userType,
         facebookId: profile.id,
       });
     } else {
@@ -203,7 +205,7 @@ router.put('/me', protect, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected. Profile updates are disabled.' });
     }
 
-    const { name, avatar } = req.body;
+    const { name, avatar, userType } = req.body;
     const user = await User.findById(req.user._id);
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
@@ -211,6 +213,7 @@ router.put('/me', protect, async (req, res) => {
 
     if (name) user.name = name;
     if (avatar) user.avatar = avatar;
+    if (userType) user.userType = userType;
 
     await user.save();
     res.status(200).json(user);

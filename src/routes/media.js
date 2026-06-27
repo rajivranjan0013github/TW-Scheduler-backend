@@ -4,6 +4,7 @@ import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import Folder from '../models/Folder.js';
 import Media from '../models/Media.js';
+import CampaignChannel from '../models/CampaignChannel.js';
 import SocialAccount from '../models/SocialAccount.js';
 import { uploadFile, deleteFile } from '../services/r2Service.js';
 import { createAndUploadThumbnail, fetchMediaBuffer } from '../services/thumbnailService.js';
@@ -53,13 +54,13 @@ const getValidSocialAccountIds = async (accountIds, campaignId) => {
   const uniqueIds = [...new Set(accountIds)];
   if (uniqueIds.length === 0) return [];
 
-  const accounts = await SocialAccount.find({
-    _id: { $in: uniqueIds },
+  const channels = await CampaignChannel.find({
     campaignId,
-    isConnected: true,
-  }).select('_id');
+    status: 'verified',
+    socialAccountId: { $in: uniqueIds },
+  }).select('socialAccountId');
 
-  return accounts.map((account) => account._id);
+  return channels.map((channel) => channel.socialAccountId);
 };
 
 const thumbnailEligibleTypes = ['image', 'video'];
@@ -487,6 +488,44 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
     res.status(201).json(populated);
   } catch (error) {
     console.error('Upload error in route:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Download a media asset for creator/manual posting flows
+// @route   GET /api/media/:id/download
+// @access  Private
+router.get('/:id/download', protect, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      const mediaItem = mockStore.media.find(m => m._id === id);
+      if (!mediaItem) return res.status(404).json({ message: 'Media not found' });
+      return res.redirect(mediaItem.url);
+    }
+
+    const media = await Media.findById(id).lean();
+    if (!media) return res.status(404).json({ message: 'Media not found' });
+
+    const mediaAccountIds = (media.socialAccountIds || []).map(accountId => String(accountId));
+    let allowed = ADMIN_ROLES.includes(req.user?.role) || String(media.userId) === String(req.user._id);
+
+    if (!allowed && mediaAccountIds.length > 0) {
+      const ownedAccount = await SocialAccount.exists({
+        _id: { $in: mediaAccountIds },
+        userId: req.user._id,
+      });
+      allowed = Boolean(ownedAccount);
+    }
+
+    if (!allowed) {
+      return res.status(403).json({ message: 'Access denied for this media asset.' });
+    }
+
+    res.redirect(media.url);
+  } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
