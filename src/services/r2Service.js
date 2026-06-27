@@ -1,4 +1,5 @@
-import { S3Client, PutObjectCommand, DeleteObjectCommand, CopyObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, DeleteObjectCommand, CopyObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -13,6 +14,7 @@ const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY?.trim();
 
 const useR2 = accessKeyId && secretAccessKey && accountId;
 const bucketName = (process.env.R2_BUCKET_NAME || 'tw-creator-suite').trim();
+const publicBaseUrl = () => (process.env.R2_PUBLIC_URL || 'https://media.theeasypost.com').trim().replace(/\/$/, '');
 
 if (useR2) {
   try {
@@ -50,8 +52,7 @@ export const uploadFile = async (fileInfo) => {
 
       await r2Client.send(command);
 
-      const publicBaseUrl = (process.env.R2_PUBLIC_URL || `https://${bucketName}.r2.cloudflarestorage.com`).trim();
-      const url = `${publicBaseUrl.replace(/\/$/, '')}/${fileKey}`;
+      const url = `${publicBaseUrl()}/${fileKey}`;
 
       return {
         url,
@@ -72,14 +73,49 @@ export const uploadFile = async (fileInfo) => {
     fs.mkdirSync(path.dirname(localFilePath), { recursive: true });
     fs.writeFileSync(localFilePath, fileInfo.buffer);
 
-    const port = process.env.PORT || 5001;
-    const backendUrl = process.env.BACKEND_URL || `http://localhost:${port}`;
+    const backendUrl = process.env.BACKEND_URL || 'https://theeasypost.com';
     const url = `${backendUrl}/uploads/${fileKey}`;
 
     return {
       url,
       storageKey: fileKey,
     };
+  }
+};
+
+export const isR2DirectUploadAvailable = () => Boolean(useR2 && r2Client);
+
+export const createPresignedUploadUrl = async ({ storageKey, contentType }) => {
+  if (!isR2DirectUploadAvailable()) {
+    throw new Error('Cloudflare R2 direct upload is not configured.');
+  }
+
+  const command = new PutObjectCommand({
+    Bucket: bucketName,
+    Key: storageKey,
+    ContentType: contentType || 'application/octet-stream',
+  });
+  const uploadUrl = await getSignedUrl(r2Client, command, { expiresIn: 15 * 60 });
+
+  return {
+    uploadUrl,
+    url: getStorageUrl(storageKey),
+    storageKey,
+    expiresIn: 15 * 60,
+  };
+};
+
+export const fileExists = async (storageKey) => {
+  if (!isR2DirectUploadAvailable()) return false;
+
+  try {
+    await r2Client.send(new HeadObjectCommand({
+      Bucket: bucketName,
+      Key: storageKey,
+    }));
+    return true;
+  } catch {
+    return false;
   }
 };
 
@@ -121,9 +157,8 @@ export const copyFile = async ({ fromKey, toKey, contentType }) => {
 
     await r2Client.send(command);
 
-    const publicBaseUrl = (process.env.R2_PUBLIC_URL || `https://${bucketName}.r2.cloudflarestorage.com`).trim();
     return {
-      url: `${publicBaseUrl.replace(/\/$/, '')}/${toKey}`,
+      url: `${publicBaseUrl()}/${toKey}`,
       storageKey: toKey,
     };
   }
@@ -134,8 +169,7 @@ export const copyFile = async ({ fromKey, toKey, contentType }) => {
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
   fs.copyFileSync(sourcePath, targetPath);
 
-  const port = process.env.PORT || 5001;
-  const backendUrl = process.env.BACKEND_URL || `http://localhost:${port}`;
+  const backendUrl = process.env.BACKEND_URL || 'https://theeasypost.com';
   return {
     url: `${backendUrl}/uploads/${toKey}`,
     storageKey: toKey,
@@ -145,11 +179,9 @@ export const copyFile = async ({ fromKey, toKey, contentType }) => {
 export const getStorageUrl = (storageKey) => {
   if (!storageKey) return '';
   if (useR2 && r2Client) {
-    const publicBaseUrl = (process.env.R2_PUBLIC_URL || `https://${bucketName}.r2.cloudflarestorage.com`).trim();
-    return `${publicBaseUrl.replace(/\/$/, '')}/${storageKey}`;
+    return `${publicBaseUrl()}/${storageKey}`;
   }
 
-  const port = process.env.PORT || 5001;
-  const backendUrl = process.env.BACKEND_URL || `http://localhost:${port}`;
+  const backendUrl = process.env.BACKEND_URL || 'https://theeasypost.com';
   return `${backendUrl}/uploads/${storageKey}`;
 };

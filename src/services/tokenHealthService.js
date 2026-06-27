@@ -7,7 +7,7 @@ const REFRESH_WINDOW_MS = 14 * DAY_MS;
 const getYoutubeOAuthClient = () => {
   const clientId = process.env.YOUTUBE_CLIENT_ID || process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.YOUTUBE_CLIENT_SECRET || process.env.GOOGLE_CLIENT_SECRET;
-  const redirectUri = process.env.YOUTUBE_REDIRECT_URI || 'http://localhost:5173/auth/youtube/callback';
+  const redirectUri = process.env.YOUTUBE_REDIRECT_URI || 'https://theeasypost.com/auth/youtube/callback';
 
   if (!clientId || !clientSecret) {
     throw new Error('YouTube OAuth credentials are not configured on the backend.');

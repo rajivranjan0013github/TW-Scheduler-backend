@@ -739,7 +739,7 @@ router.post('/facebook-callback', protect, async (req, res) => {
 
   const appId = process.env.META_APP_ID;
   const appSecret = process.env.META_APP_SECRET;
-  const redirectUri = process.env.META_REDIRECT_URI || 'http://localhost:5173/auth/facebook/callback';
+  const redirectUri = process.env.META_REDIRECT_URI || 'https://theeasypost.com/auth/facebook/callback';
 
   if (!appId || !appSecret) {
     return res.status(500).json({ message: 'Meta App credentials are not configured on the backend.' });
@@ -951,7 +951,7 @@ router.post('/instagram-callback', protect, async (req, res) => {
 
   const appId = process.env.INSTAGRAM_APP_ID;
   const appSecret = process.env.INSTAGRAM_APP_SECRET;
-  const redirectUri = requestRedirectUri || process.env.INSTAGRAM_REDIRECT_URI || 'http://localhost:5173/auth/instagram/callback';
+  const redirectUri = requestRedirectUri || process.env.INSTAGRAM_REDIRECT_URI || 'https://theeasypost.com/auth/instagram/callback';
 
   if (!appId || !appSecret) {
     return res.status(500).json({ message: 'Instagram App credentials are not configured on the backend. Set INSTAGRAM_APP_ID and INSTAGRAM_APP_SECRET from Instagram > API setup with Instagram login.' });

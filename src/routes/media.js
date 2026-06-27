@@ -6,13 +6,22 @@ import Folder from '../models/Folder.js';
 import Media from '../models/Media.js';
 import CampaignChannel from '../models/CampaignChannel.js';
 import SocialAccount from '../models/SocialAccount.js';
-import { uploadFile, deleteFile } from '../services/r2Service.js';
+import { uploadFile, deleteFile, createPresignedUploadUrl, fileExists, getStorageUrl, isR2DirectUploadAvailable } from '../services/r2Service.js';
 import { createAndUploadThumbnail, fetchMediaBuffer } from '../services/thumbnailService.js';
 import { protect, authorize } from '../middleware/auth.js';
 import { getOriginalStorageKey, getThumbnailStorageKey } from '../utils/storageKeys.js';
 
 const router = express.Router();
 const ADMIN_ROLES = ['owner', 'admin'];
+const MEDIA_PUBLIC_HOST = 'media.theeasypost.com';
+
+const isTrustedMediaUrl = (url) => {
+  try {
+    return new URL(url).hostname === MEDIA_PUBLIC_HOST;
+  } catch {
+    return false;
+  }
+};
 
 const getScopedUserId = (req) => {
   if (ADMIN_ROLES.includes(req.user?.role) && req.query.userId) {
@@ -48,6 +57,21 @@ const parseIdList = (value) => {
     .split(',')
     .map((item) => item.trim())
     .filter(Boolean);
+};
+
+const parseTagList = (value) => {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value.map(tag => String(tag).trim().toLowerCase()).filter(Boolean);
+  }
+  return String(value).split(',').map(t => t.trim().toLowerCase()).filter(Boolean);
+};
+
+const getMediaTypeFromMime = (mimeType = '') => {
+  if (mimeType.startsWith('video/')) return 'video';
+  if (mimeType.startsWith('image/')) return 'image';
+  if (mimeType.startsWith('audio/') || mimeType === 'audio/mpeg' || mimeType === 'audio/mp3') return 'audio';
+  return 'image';
 };
 
 const getValidSocialAccountIds = async (accountIds, campaignId) => {
@@ -112,8 +136,8 @@ router.get('/proxy', async (req, res) => {
   }
 
   try {
-    // Only allow proxying from trusted domains like R2
-    if (!url.startsWith('https://pub-') && !url.includes('r2.cloudflarestorage.com')) {
+    // Only allow proxying from the configured public media domain.
+    if (!isTrustedMediaUrl(url)) {
       return res.status(403).json({ message: 'Access denied: untrusted media origin' });
     }
 
@@ -371,6 +395,137 @@ router.get('/', protect, async (req, res) => {
   }
 });
 
+// @desc    Create a signed R2 upload URL for direct browser upload
+// @route   POST /api/media/direct-upload/init
+// @access  Private (Owner, Admin, Editor)
+router.post('/direct-upload/init', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
+  const campaignId = requireCampaignId(req, res);
+  if (!campaignId) return;
+
+  if (!getDBStatus()) {
+    return res.status(409).json({ message: 'Direct upload requires a database connection.' });
+  }
+  if (!isR2DirectUploadAvailable()) {
+    return res.status(409).json({ message: 'Direct upload requires Cloudflare R2 configuration.' });
+  }
+
+  const { name, contentType, folderId } = req.body || {};
+  if (!name || !contentType) {
+    return res.status(400).json({ message: 'File name and content type are required.' });
+  }
+
+  try {
+    const mediaId = new Media()._id;
+    const resolvedFolderId = folderId && folderId !== 'null' ? folderId : null;
+    const storageKey = getOriginalStorageKey({
+      userId: req.user._id,
+      campaignId,
+      folderId: resolvedFolderId,
+      mediaId,
+      originalName: name,
+    });
+    const upload = await createPresignedUploadUrl({
+      storageKey,
+      contentType,
+    });
+
+    res.status(200).json({
+      mediaId,
+      storageKey,
+      url: upload.url,
+      uploadUrl: upload.uploadUrl,
+      expiresIn: upload.expiresIn,
+    });
+  } catch (error) {
+    console.error('Direct upload init error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Complete a direct R2 upload and create the media metadata record
+// @route   POST /api/media/direct-upload/complete
+// @access  Private (Owner, Admin, Editor)
+router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
+  const campaignId = requireCampaignId(req, res);
+  if (!campaignId) return;
+
+  if (!getDBStatus()) {
+    return res.status(409).json({ message: 'Direct upload requires a database connection.' });
+  }
+  if (!isR2DirectUploadAvailable()) {
+    return res.status(409).json({ message: 'Direct upload requires Cloudflare R2 configuration.' });
+  }
+
+  const {
+    mediaId,
+    name,
+    contentType = '',
+    folderId,
+    storageKey,
+    caption = '',
+    tags,
+    size,
+  } = req.body || {};
+
+  if (!mediaId || !name || !storageKey) {
+    return res.status(400).json({ message: 'Media id, file name, and storage key are required.' });
+  }
+
+  try {
+    const requestedAccountIds = parseIdList(req.body.socialAccountIds);
+    const socialAccountIds = await getValidSocialAccountIds(requestedAccountIds, campaignId);
+    if (requestedAccountIds.length > 0 && socialAccountIds.length !== requestedAccountIds.length) {
+      return res.status(400).json({ message: 'One or more selected publishing channels are not connected.' });
+    }
+
+    const resolvedFolderId = folderId && folderId !== 'null' ? folderId : null;
+    const expectedStorageKey = getOriginalStorageKey({
+      userId: req.user._id,
+      campaignId,
+      folderId: resolvedFolderId,
+      mediaId,
+      originalName: name,
+    });
+    if (storageKey !== expectedStorageKey) {
+      return res.status(400).json({ message: 'Upload storage key does not match this media asset.' });
+    }
+
+    const existing = await Media.findOne({ _id: mediaId, campaignId })
+      .populate('socialAccountIds', 'name username platform avatarUrl isConnected');
+    if (existing) {
+      return res.status(200).json(existing);
+    }
+
+    const exists = await fileExists(storageKey);
+    if (!exists) {
+      return res.status(400).json({ message: 'Uploaded file was not found in R2.' });
+    }
+
+    const media = await Media.create({
+      _id: mediaId,
+      userId: req.user._id,
+      campaignId,
+      folderId: resolvedFolderId,
+      socialAccountIds,
+      name,
+      type: getMediaTypeFromMime(contentType),
+      url: getStorageUrl(storageKey),
+      storageKey,
+      caption: caption || '',
+      tags: parseTagList(tags),
+      size: Number(size) || undefined,
+    });
+
+    const populated = await Media.findById(media._id)
+      .populate('socialAccountIds', 'name username platform avatarUrl isConnected');
+
+    res.status(201).json(populated);
+  } catch (error) {
+    console.error('Direct upload complete error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // @desc    Upload media file
 // @route   POST /api/media/upload
 // @access  Private (Owner, Admin, Editor)
@@ -384,18 +539,10 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
   if (!campaignId) return;
   const requestedAccountIds = parseIdList(req.body.socialAccountIds);
   const mimeType = req.file.mimetype;
-  let mediaType = 'image';
-
-  if (mimeType.startsWith('video/')) {
-    mediaType = 'video';
-  } else if (mimeType.startsWith('image/')) {
-    mediaType = 'image';
-  } else if (mimeType.startsWith('audio/') || mimeType === 'audio/mpeg' || mimeType === 'audio/mp3') {
-    mediaType = 'audio';
-  }
+  const mediaType = getMediaTypeFromMime(mimeType);
 
   try {
-    const tagList = tags ? tags.split(',').map(t => t.trim().toLowerCase()) : [];
+    const tagList = parseTagList(tags);
     const isConnected = getDBStatus();
     let socialAccountIds = requestedAccountIds;
 
