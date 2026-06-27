@@ -10,6 +10,10 @@ import { protect, authorize } from '../middleware/auth.js';
 import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount, fetchYoutubeVideos } from '../services/youtubeService.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
 import {
+  fetchFacebookPostInsightValue,
+  fetchFacebookPostViews,
+} from '../services/facebookMetricsService.js';
+import {
   canAccountVerifyCampaign,
   linkSocialAccountToCampaignChannels,
   normalizeChannelHandle,
@@ -30,16 +34,25 @@ const serializeCommentsPreview = (comments = []) => (
 );
 const INSIGHT_SKIP_MS = 15 * 60 * 1000;
 const ADMIN_ROLES = ['owner', 'admin'];
+const hasAdminAccess = (user) => ADMIN_ROLES.includes(user?.role) && user?.userType !== 'account_handler';
+
+const getAccountMatchHandles = (account = {}) => (
+  [
+    normalizeChannelHandle(account.username),
+    normalizeChannelHandle(account.name),
+    normalizeChannelHandle(account.accountId),
+  ].filter(Boolean)
+);
 
 const getAccountAccessFilter = (req, id) => {
-  if (ADMIN_ROLES.includes(req.user?.role)) {
+  if (hasAdminAccess(req.user)) {
     return { _id: id };
   }
   return { _id: id, userId: req.user._id };
 };
 
 const getScopedUserId = (req) => {
-  if (ADMIN_ROLES.includes(req.user?.role) && req.query.userId) {
+  if (hasAdminAccess(req.user) && req.query.userId) {
     return req.query.userId;
   }
   return req.user._id;
@@ -58,7 +71,7 @@ const getVerifiedCampaignSocialAccountIds = async (campaignId) => {
 
 const canAccessCampaign = async (req, campaignId) => {
   if (!campaignId) return false;
-  if (ADMIN_ROLES.includes(req.user?.role)) return true;
+  if (hasAdminAccess(req.user)) return true;
 
   const userEmail = (req.user.email || '').trim().toLowerCase();
   const campaign = await Campaign.findOne({
@@ -109,7 +122,7 @@ const getScopedAccountQuery = async (req, extra = {}) => {
 
 const getLinkableCampaignId = async (req, campaignId, accountPayload) => {
   if (!campaignId) return undefined;
-  if (ADMIN_ROLES.includes(req.user?.role)) return campaignId;
+  if (hasAdminAccess(req.user)) return campaignId;
   return await canAccountVerifyCampaign(campaignId, accountPayload) ? campaignId : undefined;
 };
 
@@ -147,8 +160,12 @@ router.get('/', protect, async (req, res) => {
       }
 
       const accountIds = await getVerifiedCampaignSocialAccountIds(campaignId);
+      let query = { _id: { $in: accountIds }, isConnected: true };
+      if (req.user?.userType === 'account_handler') {
+        query.userId = req.user._id;
+      }
       const accounts = accountIds.length > 0
-        ? await SocialAccount.find({ _id: { $in: accountIds }, isConnected: true })
+        ? await SocialAccount.find(query)
         : [];
       return res.status(200).json(accounts);
     }
@@ -183,6 +200,76 @@ router.get('/publishing-channels', protect, async (req, res) => {
     const campaign = await Campaign.findById(campaignId).select('channels status').lean();
     if (!campaign || campaign.status === 'archived') {
       return res.status(404).json({ message: 'Campaign not found.' });
+    }
+
+    if (req.user?.userType === 'account_handler') {
+      const creatorAccounts = await SocialAccount.find({ userId: req.user._id }).lean();
+      const creatorAccountIds = creatorAccounts.map((account) => account._id);
+      const creatorAccountsById = new Map(
+        creatorAccounts.map((account) => [String(account._id), account])
+      );
+      const accountLookupPairs = creatorAccounts.flatMap((account) => (
+        getAccountMatchHandles(account).map((handle) => ({
+          platform: account.platform,
+          handle,
+        }))
+      ));
+      const channelConditions = [
+        { socialAccountId: { $in: creatorAccountIds } },
+        ...accountLookupPairs.map(({ platform, handle }) => ({
+          platform,
+          normalizedHandle: handle,
+        })),
+      ];
+
+      if (channelConditions.length === 0) {
+        return res.status(200).json([]);
+      }
+
+      const creatorChannels = await CampaignChannel.find({
+        campaignId,
+        $or: channelConditions,
+      }).sort({ createdAt: 1 }).lean();
+
+      const channels = creatorChannels
+        .map((channel) => {
+          const linkedAccountId = channel.socialAccountId ? String(channel.socialAccountId) : '';
+          const linkedCreatorAccount = linkedAccountId
+            ? creatorAccountsById.get(linkedAccountId)
+            : null;
+          const normalizedHandle = channel.normalizedHandle || normalizeChannelHandle(channel.requestedHandle);
+          const matchedAcc = linkedCreatorAccount || creatorAccounts.find((account) => (
+            account.platform === channel.platform &&
+            getAccountMatchHandles(account).includes(normalizedHandle)
+          ));
+          if (!matchedAcc) return null;
+
+          const isVerified = Boolean(matchedAcc.isConnected !== false);
+          return {
+            _id: channel._id,
+            platform: channel.platform,
+            handle: channel.requestedHandle,
+            requestedHandle: channel.requestedHandle,
+            displayName: channel.displayName || '',
+            addedAt: channel.createdAt,
+            socialAccountId: isVerified ? matchedAcc._id : null,
+            accountId: matchedAcc.accountId || '',
+            name: matchedAcc.name || channel.displayName || channel.requestedHandle,
+            username: matchedAcc.username || normalizedHandle,
+            avatarUrl: matchedAcc.avatarUrl || null,
+            isConnected: isVerified,
+            isVerified,
+            status: isVerified ? 'verified' : 'disconnected',
+            userId: matchedAcc.userId,
+            campaignId,
+            tokenExpiresAt: matchedAcc.tokenExpiresAt || null,
+            verifiedAt: isVerified ? (matchedAcc.updatedAt || matchedAcc.createdAt || null) : null,
+            verifiedByUserId: isVerified ? matchedAcc.userId : null,
+          };
+        })
+        .filter(Boolean);
+
+      return res.status(200).json(channels);
     }
 
     const channels = await resolveCampaignPublishingChannels(campaign, { persist: true });
@@ -285,8 +372,12 @@ router.get('/insights', protect, async (req, res) => {
         return res.status(403).json({ message: 'Campaign access denied.' });
       }
       const accountIds = await getVerifiedCampaignSocialAccountIds(campaignId);
+      let query = { _id: { $in: accountIds }, isConnected: true };
+      if (req.user?.userType === 'account_handler') {
+        query.userId = req.user._id;
+      }
       accounts = accountIds.length > 0
-        ? await SocialAccount.find({ _id: { $in: accountIds }, isConnected: true })
+        ? await SocialAccount.find(query)
         : [];
     } else {
       accounts = await SocialAccount.find(await getScopedAccountQuery(req, { isConnected: true }));
@@ -582,7 +673,7 @@ router.post('/youtube-callback', protect, async (req, res) => {
 
     const accountPayload = await exchangeYoutubeCodeForAccount(code, req.user._id);
     const linkableCampaignId = await getLinkableCampaignId(req, campaignId, accountPayload);
-    if (campaignId && !linkableCampaignId && !ADMIN_ROLES.includes(req.user?.role)) {
+    if (campaignId && !linkableCampaignId && !hasAdminAccess(req.user)) {
       return res.status(403).json({ message: 'This YouTube channel does not match the campaign handle.' });
     }
 
@@ -926,7 +1017,7 @@ router.post('/instagram-callback', protect, async (req, res) => {
       name,
       username,
     });
-    if (campaignId && !linkableCampaignId && !ADMIN_ROLES.includes(req.user?.role)) {
+    if (campaignId && !linkableCampaignId && !hasAdminAccess(req.user)) {
       return res.status(403).json({ message: `@${username} does not match a pending Instagram handle in this campaign.` });
     }
 
@@ -997,6 +1088,8 @@ router.get('/posts/recent', protect, async (req, res) => {
       mediaUrl: post.mediaUrl,
       videoUrl: post.videoUrl,
       mediaType: post.mediaType,
+      facebookVideoId: post.facebookVideoId || '',
+      viewsSource: post.viewsSource || '',
       views: post.latestViews || 0,
       likes: post.latestLikes || 0,
       comments: post.latestComments || 0,
@@ -1058,6 +1151,8 @@ router.get('/:id/posts', protect, async (req, res) => {
             mediaUrl: post.mediaUrl,
             videoUrl: post.videoUrl,
             mediaType: post.mediaType,
+            facebookVideoId: post.facebookVideoId || '',
+            viewsSource: post.viewsSource || '',
             views: post.latestViews || 0,
             likes: post.latestLikes || 0,
             comments: post.latestComments || 0,
@@ -1131,12 +1226,15 @@ router.get('/:id/posts', protect, async (req, res) => {
       
       if (apiRes.ok) {
         posts = await Promise.all((apiData.data || []).map(async (post) => {
-          const [views, likes, activityByType, commentsPreview] = await Promise.all([
-            getInsightValue(post.id, 'post_impressions_unique'),
-            getInsightValue(post.id, 'post_reactions_like_total'),
-            getInsightValue(post.id, 'post_activity_by_action_type'),
+          const [viewResult, likes, commentsPreview] = await Promise.all([
+            fetchFacebookPostViews(liveAccount.accessToken, post),
+            fetchFacebookPostInsightValue(liveAccount.accessToken, post.id, 'post_reactions_like_total').catch((error) => {
+              console.warn(`Meta insight "post_reactions_like_total" failed for post ${post.id}:`, error.message);
+              return 0;
+            }),
             getCommentsPreview(post.id),
           ]);
+          const facebookVideoId = viewResult.videoId || '';
 
           return {
             id: post.id,
@@ -1144,9 +1242,12 @@ router.get('/:id/posts', protect, async (req, res) => {
             createdAt: post.created_time,
             permalink: post.permalink_url || `https://facebook.com/${post.id}`,
             mediaUrl: post.full_picture || '',
-            views: Number(views) || 0,
+            mediaType: facebookVideoId ? 'VIDEO' : (post.full_picture ? 'IMAGE' : ''),
+            facebookVideoId,
+            viewsSource: viewResult.source,
+            views: Number(viewResult.views) || 0,
             likes: Number(likes) || 0,
-            comments: Number(activityByType?.comment) || 0,
+            comments: 0,
             commentsPreview,
           };
         }));
@@ -1216,6 +1317,8 @@ router.get('/:id/posts', protect, async (req, res) => {
             mediaUrl: post.mediaUrl,
             videoUrl: post.videoUrl || '',
             mediaType: post.mediaType || '',
+            facebookVideoId: post.facebookVideoId || '',
+            viewsSource: post.viewsSource || '',
             permalink: post.permalink,
             publishedAt: new Date(post.createdAt),
             lastSyncedAt: new Date(),
@@ -1333,60 +1436,121 @@ router.get('/creator/campaigns', protect, async (req, res) => {
       return res.status(200).json([]);
     }
 
-    // 1. Find all social accounts connected by the logged-in creator
+    // 1. Find social accounts controlled by the logged-in creator
     const creatorAccounts = await SocialAccount.find({ userId: req.user._id }).lean();
     if (creatorAccounts.length === 0) {
       return res.status(200).json([]);
     }
 
-    // 2. Map handles to lowercase
-    const accountLookupPairs = creatorAccounts.map(acc => {
-      const handle = (acc.username || acc.name || '').replace(/^@/, '').toLowerCase();
-      return { platform: acc.platform, handle };
-    });
+    const accountLookupPairs = creatorAccounts.flatMap((account) => (
+      getAccountMatchHandles(account).map((handle) => ({
+        platform: account.platform,
+        handle,
+      }))
+    ));
+    const creatorAccountKeys = new Set(
+      accountLookupPairs.map(({ platform, handle }) => `${platform}:${handle}`)
+    );
+    const creatorAccountIds = creatorAccounts.map((account) => account._id);
+    const creatorAccountsById = new Map(
+      creatorAccounts.map((account) => [String(account._id), account])
+    );
 
-    // 3. Find campaigns
-    const orConditions = accountLookupPairs.map(({ platform, handle }) => ({
-      'channels.platform': platform,
-      'channels.handle': { $regex: new RegExp(`^@?${handle}$`, 'i') }
-    }));
+    const channelConditions = [
+      { socialAccountId: { $in: creatorAccountIds } },
+      ...accountLookupPairs.map(({ platform, handle }) => ({
+        platform,
+        normalizedHandle: handle,
+      })),
+    ];
 
-    if (orConditions.length === 0) {
+    if (channelConditions.length === 0) {
       return res.status(200).json([]);
     }
 
-    // Fetch campaigns matching any of the conditions
-    const matchedCampaigns = await Campaign.find({ $or: orConditions })
+    const matchedChannelDocs = await CampaignChannel.find({ $or: channelConditions })
+      .sort({ createdAt: 1 })
+      .lean();
+    if (matchedChannelDocs.length === 0) {
+      return res.status(200).json([]);
+    }
+
+    const matchedCampaignIds = [...new Set(matchedChannelDocs.map((channel) => String(channel.campaignId)))];
+    const matchedCampaigns = await Campaign.find({
+      _id: { $in: matchedCampaignIds },
+      status: { $ne: 'archived' },
+    })
       .populate('createdBy', 'name email')
       .lean();
 
-    // 4. Enrich campaigns to highlight which channel matches the creator's account
-    const enrichedCampaigns = matchedCampaigns.map(campaign => {
-      const creatorChannels = (campaign.channels || []).map(ch => {
-        const normalizedChHandle = ch.handle.replace(/^@/, '').toLowerCase();
-        // check if this matches any of the creator's connected accounts
-        const matchedAcc = creatorAccounts.find(acc => 
-          acc.platform === ch.platform &&
-          (acc.username?.replace(/^@/, '').toLowerCase() === normalizedChHandle ||
-           acc.name?.replace(/^@/, '').toLowerCase() === normalizedChHandle)
-        );
+    const channelsByCampaign = new Map();
+    matchedChannelDocs.forEach((channel) => {
+      const key = String(channel.campaignId);
+      if (!channelsByCampaign.has(key)) channelsByCampaign.set(key, []);
+      channelsByCampaign.get(key).push(channel);
+    });
 
-        return {
-          ...ch,
-          isVerified: matchedAcc ? matchedAcc.isConnected !== false : false,
-          avatarUrl: matchedAcc?.avatarUrl || null,
-          matchedAccountId: matchedAcc?._id || null,
-        };
-      });
+    // 2. Return only the channels controlled by this creator.
+    const enrichedCampaigns = matchedCampaigns.map((campaign) => {
+      const creatorChannels = (channelsByCampaign.get(String(campaign._id)) || [])
+        .map((channel) => {
+          const linkedAccountId = channel.socialAccountId ? String(channel.socialAccountId) : '';
+          const linkedCreatorAccount = linkedAccountId
+            ? creatorAccountsById.get(linkedAccountId)
+            : null;
+          const normalizedHandle = channel.normalizedHandle || normalizeChannelHandle(channel.requestedHandle || channel.handle);
+          const matchedAcc = linkedCreatorAccount || creatorAccounts.find((account) => (
+            account.platform === channel.platform &&
+            getAccountMatchHandles(account).includes(normalizedHandle)
+          ));
+          const isControlledByCreator = Boolean(
+            linkedCreatorAccount || (matchedAcc && creatorAccountKeys.has(`${channel.platform}:${normalizedHandle}`))
+          );
+          if (!isControlledByCreator) return null;
+
+          const isVerified = Boolean(matchedAcc.isConnected !== false);
+          const status = isVerified
+            ? 'verified'
+            : matchedAcc._id
+              ? 'disconnected'
+              : 'pending_verification';
+
+          return {
+            _id: channel._id,
+            platform: channel.platform,
+            handle: channel.requestedHandle,
+            requestedHandle: channel.requestedHandle,
+            displayName: channel.displayName || '',
+            addedAt: channel.createdAt,
+            accountId: matchedAcc.accountId || '',
+            name: matchedAcc.name || channel.displayName || channel.handle,
+            username: matchedAcc.username || normalizedHandle,
+            avatarUrl: matchedAcc.avatarUrl || null,
+            isConnected: isVerified,
+            isVerified,
+            status,
+            socialAccountId: isVerified ? matchedAcc._id : null,
+            matchedAccountId: matchedAcc._id,
+            userId: matchedAcc.userId,
+            campaignId: campaign._id,
+            tokenExpiresAt: matchedAcc.tokenExpiresAt || null,
+            verifiedAt: isVerified ? (matchedAcc.updatedAt || matchedAcc.createdAt || null) : null,
+            verifiedByUserId: isVerified ? matchedAcc.userId : null,
+          };
+        })
+        .filter(Boolean);
 
       return {
         ...campaign,
+        accountIds: creatorChannels
+          .map((channel) => channel.socialAccountId)
+          .filter(Boolean),
         channels: creatorChannels,
-        isCreatorParticipant: true
+        isCreatorParticipant: creatorChannels.length > 0,
       };
     });
 
-    res.status(200).json(enrichedCampaigns);
+    res.status(200).json(enrichedCampaigns.filter((campaign) => campaign.channels.length > 0));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

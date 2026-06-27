@@ -12,9 +12,7 @@ if (!MONGODB_URI) {
 
 const run = async () => {
   try {
-    console.log('Connecting to MongoDB...');
     await mongoose.connect(MONGODB_URI);
-    console.log('Connected successfully!');
 
     // 1. Find the SocialAccount for @themedicalmind2
     const socialAcc = await SocialAccount.findOne({ username: '@themedicalmind2', platform: 'youtube' });
@@ -22,7 +20,6 @@ const run = async () => {
       console.error('❌ SocialAccount for @themedicalmind2 not found!');
       process.exit(1);
     }
-    console.log(`Found SocialAccount: ID ${socialAcc._id}, Name: ${socialAcc.name}`);
 
     // 2. Find the Campaign "odyssey"
     const campaign = await Campaign.findOne({ name: 'odyssey' });
@@ -30,13 +27,11 @@ const run = async () => {
       console.error('❌ Campaign "odyssey" not found!');
       process.exit(1);
     }
-    console.log(`Found Campaign: ID ${campaign._id}, Name: ${campaign.name}`);
 
     // 3. Link them:
     // Update SocialAccount campaignId
     socialAcc.campaignId = campaign._id;
     await socialAcc.save();
-    console.log('✅ Updated SocialAccount with campaignId.');
 
     // Update Campaign channels and accountIds
     let updatedChannels = false;
@@ -53,14 +48,12 @@ const run = async () => {
     }
 
     await campaign.save();
-    console.log('✅ Updated Campaign document with channel and accountIds references.');
-    console.log('Link complete!');
+  
 
   } catch (error) {
     console.error('❌ Error:', error.message);
   } finally {
     await mongoose.disconnect();
-    console.log('Disconnected from MongoDB.');
   }
 };
 

@@ -12,6 +12,7 @@ import PostInsight from '../models/PostInsight.js';
 import { sendBatchRequests } from '../services/metaBatchService.js';
 import { getDBStatus } from '../config/db.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
+import { fetchFacebookPostInsightValue, fetchFacebookPostViews } from '../services/facebookMetricsService.js';
 
 /**
  * Extracts metric values from a Meta insights API response body.
@@ -101,6 +102,54 @@ export const runInsightSync = async () => {
     for (const [accountKey, { account, posts: accountPosts }] of accountPostsMap) {
       try {
         const freshAccount = await ensureFreshAccountToken(account);
+        if (freshAccount.platform === 'facebook') {
+          for (const post of accountPosts) {
+            try {
+              const [viewResult, likes] = await Promise.all([
+                fetchFacebookPostViews(freshAccount.accessToken, post),
+                fetchFacebookPostInsightValue(freshAccount.accessToken, post.metaPostId, 'post_reactions_like_total').catch(() => 0),
+              ]);
+
+              const metrics = {
+                views: Number(viewResult.views) || 0,
+                likes: Number(likes) || 0,
+                comments: 0,
+              };
+
+              await PostInsight.findOneAndUpdate(
+                { postId: post._id, dateStr: todayStr },
+                {
+                  campaignId: freshAccount.campaignId,
+                  postId: post._id,
+                  accountId: freshAccount._id,
+                  dateStr: todayStr,
+                  views: metrics.views,
+                  likes: metrics.likes,
+                  comments: metrics.comments,
+                },
+                { upsert: true, returnDocument: 'after' }
+              );
+
+              await PublishedPost.updateOne(
+                { _id: post._id },
+                {
+                  latestViews: metrics.views,
+                  latestLikes: metrics.likes,
+                  latestComments: metrics.comments,
+                  facebookVideoId: viewResult.videoId || post.facebookVideoId || '',
+                  viewsSource: viewResult.source,
+                }
+              );
+
+              totalInsightsUpserted++;
+            } catch (postErr) {
+              totalErrors++;
+              console.error(`❌ [Insight Sync] Facebook metrics failed for post ${post.metaPostId}:`, postErr.message);
+            }
+          }
+          continue;
+        }
+
         // Build batch request items for this account's posts
         const batchRequests = accountPosts.map(post => {
           let metricParam;

@@ -84,4 +84,8 @@ const ScheduledPostSchema = new mongoose.Schema({
   },
 }, { timestamps: true });
 
+ScheduledPostSchema.index({ campaignId: 1, scheduledAt: 1 });
+ScheduledPostSchema.index({ socialAccountIds: 1, scheduledAt: 1 });
+ScheduledPostSchema.index({ status: 1, scheduleMode: 1, scheduledAt: 1 });
+
 export default mongoose.models.ScheduledPost || mongoose.model('ScheduledPost', ScheduledPostSchema);

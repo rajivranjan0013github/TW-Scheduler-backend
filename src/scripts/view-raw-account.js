@@ -13,7 +13,6 @@ const run = async () => {
   try {
     await mongoose.connect(MONGODB_URI);
     const account = await SocialAccount.findOne({ username: '@themedicalmind2' }).lean();
-    console.log('Raw YouTube SocialAccount:', JSON.stringify(account, null, 2));
   } catch (err) {
     console.error(err);
   } finally {

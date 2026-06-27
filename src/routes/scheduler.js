@@ -10,9 +10,10 @@ import { addPostToQueue, removePostFromQueue } from '../queues/publisherQueue.js
 
 const router = express.Router();
 const ADMIN_ROLES = ['owner', 'admin'];
+const hasAdminAccess = (user) => ADMIN_ROLES.includes(user?.role) && user?.userType !== 'account_handler';
 
 const getScopedUserId = (req) => {
-  if (ADMIN_ROLES.includes(req.user?.role) && req.query.userId) {
+  if (hasAdminAccess(req.user) && req.query.userId) {
     return req.query.userId;
   }
   return req.user._id;
@@ -47,7 +48,7 @@ const shouldQueuePost = (post) => (
 
 const canAccessManualPost = async (post, user) => {
   if (!post || !user) return false;
-  if (ADMIN_ROLES.includes(user.role)) return true;
+  if (hasAdminAccess(user)) return true;
   if (String(post.userId) === String(user._id)) return true;
 
   const postAccountIds = idsToStrings(post.socialAccountIds);
@@ -559,15 +560,16 @@ router.get('/creator/posts', protect, async (req, res) => {
       return res.status(200).json([]);
     }
 
-    // 1. Find creator accounts
+    // 1. Find social accounts controlled by this handler
     const creatorAccounts = await SocialAccount.find({ userId: req.user._id }).select('_id').lean();
     const creatorAccountIds = creatorAccounts.map(acc => acc._id);
+    const creatorAccountIdSet = new Set(creatorAccountIds.map((id) => String(id)));
 
     if (creatorAccountIds.length === 0) {
       return res.status(200).json([]);
     }
 
-    // 2. Find scheduled posts containing these accounts
+    // 2. Find scheduled posts containing these accounts, but only expose this handler's accounts
     const posts = await ScheduledPost.find({
       socialAccountIds: { $in: creatorAccountIds }
     })
@@ -576,7 +578,12 @@ router.get('/creator/posts', protect, async (req, res) => {
       .sort({ scheduledAt: 1 })
       .lean();
 
-    res.status(200).json(posts);
+    res.status(200).json(posts.map((post) => ({
+      ...post,
+      socialAccountIds: (post.socialAccountIds || []).filter((account) => (
+        creatorAccountIdSet.has(String(account?._id || account))
+      )),
+    })));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

@@ -55,7 +55,6 @@ const main = async () => {
       });
 
       if (!thumbnail) {
-        console.log(`skipped ${item._id} ${item.name}`);
         continue;
       }
 
@@ -64,14 +63,12 @@ const main = async () => {
       item.thumbnailGeneratedAt = thumbnail.thumbnailGeneratedAt;
       await item.save();
       generated += 1;
-      console.log(`generated ${item._id} ${item.name}`);
     } catch (error) {
       failed += 1;
       console.error(`failed ${item._id} ${item.name}: ${error.message}`);
     }
   }
 
-  console.log(JSON.stringify({ matched: mediaItems.length, generated, failed }, null, 2));
   await mongoose.disconnect();
 };
 

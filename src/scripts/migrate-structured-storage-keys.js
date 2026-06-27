@@ -133,7 +133,6 @@ const main = async () => {
     deleteOld,
   };
 
-  console.log(JSON.stringify({ summary, results }, null, 2));
   await mongoose.disconnect();
 };
 

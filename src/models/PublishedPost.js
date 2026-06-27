@@ -41,6 +41,14 @@ const PublishedPostSchema = new mongoose.Schema({
     type: String,
     default: '',
   },
+  facebookVideoId: {
+    type: String,
+    default: '',
+  },
+  viewsSource: {
+    type: String,
+    default: '',
+  },
   permalink: {
     type: String,
     default: '',
@@ -89,5 +97,7 @@ const PublishedPostSchema = new mongoose.Schema({
 PublishedPostSchema.index({ userId: 1, metaPostId: 1 }, { unique: true });
 // Fast account-level queries sorted by publish date
 PublishedPostSchema.index({ accountId: 1, publishedAt: -1 });
+PublishedPostSchema.index({ campaignId: 1, publishedAt: -1 });
+PublishedPostSchema.index({ userId: 1, publishedAt: -1 });
 
 export default mongoose.models.PublishedPost || mongoose.model('PublishedPost', PublishedPostSchema);
