@@ -8,6 +8,8 @@
     "start": "node index.js",
     "dev": "nodemon index.js",
     "backfill:thumbnails": "node src/scripts/backfill-thumbnails.js",
+    "backfill:user-avatars": "node src/scripts/backfill-user-avatars.js",
+    "migrate:split-merged-posts": "node src/scripts/split-merged-scheduled-posts.js",
     "migrate:storage-keys": "node src/scripts/migrate-structured-storage-keys.js"
   },
   "dependencies": {

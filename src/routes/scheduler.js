@@ -46,6 +46,12 @@ const shouldQueuePost = (post) => (
   ['auto', 'hybrid'].includes(post.scheduleMode || 'auto') && post.status === 'scheduled'
 );
 
+const getUniqueIds = (items = []) => (
+  [...new Set(idsToStrings(items).filter(Boolean))]
+);
+
+const activeQueueStatuses = ['scheduled', 'manual_ready', 'downloaded', 'publishing'];
+
 const canAccessManualPost = async (post, user) => {
   if (!post || !user) return false;
   if (hasAdminAccess(user)) return true;
@@ -149,9 +155,10 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
         const mediaItem = mockStore.media.find(m => String(m._id) === String(mediaIds[0]));
         postCaption = mediaItem?.caption || '';
       }
-      const newPost = {
+      const accountIds = getUniqueIds(socialAccountIds);
+      const newPosts = accountIds.map((accountId) => ({
         _id: `sp_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        socialAccountIds,
+        socialAccountIds: [accountId],
         mediaIds,
         caption: postCaption,
         scheduledAt: scheduledDate,
@@ -160,9 +167,15 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
         platformSpecifics: withPostCaption(platformSpecifics, postCaption, platformSpecifics?.type || 'reels'),
         createdAt: new Date(),
         updatedAt: new Date(),
-      };
-      mockStore.scheduledPosts.push(newPost);
-      return res.status(201).json(newPost);
+      }));
+      mockStore.scheduledPosts.push(...newPosts);
+      return accountIds.length === 1
+        ? res.status(201).json(newPosts[0])
+        : res.status(201).json({
+          message: `Successfully scheduled ${newPosts.length} posts.`,
+          postsCount: newPosts.length,
+          posts: newPosts,
+        });
     }
 
     const access = await validateSchedulingAccess({
@@ -180,22 +193,34 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
       postCaption = mediaItem?.caption || '';
     }
 
-    const post = await ScheduledPost.create({
-      userId: req.user._id,
-      campaignId,
-      socialAccountIds,
-      mediaIds,
-      caption: postCaption,
-      scheduledAt: scheduledDate,
-      scheduleMode,
-      status: getInitialStatusForMode(scheduleMode),
-      platformSpecifics: withPostCaption(platformSpecifics, postCaption, platformSpecifics?.type || 'reels'),
-    });
-    if (shouldQueuePost(post)) {
-      await addPostToQueue(post);
+    const accountIds = getUniqueIds(socialAccountIds);
+    const posts = [];
+
+    for (const accountId of accountIds) {
+      const post = await ScheduledPost.create({
+        userId: req.user._id,
+        campaignId,
+        socialAccountIds: [accountId],
+        mediaIds,
+        caption: postCaption,
+        scheduledAt: scheduledDate,
+        scheduleMode,
+        status: getInitialStatusForMode(scheduleMode),
+        platformSpecifics: withPostCaption(platformSpecifics, postCaption, platformSpecifics?.type || 'reels'),
+      });
+      if (shouldQueuePost(post)) {
+        await addPostToQueue(post);
+      }
+      posts.push(post);
     }
 
-    res.status(201).json(post);
+    res.status(201).json(posts.length === 1
+      ? posts[0]
+      : {
+        message: `Successfully scheduled ${posts.length} posts.`,
+        postsCount: posts.length,
+        posts,
+      });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -514,6 +539,60 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
       .populate('mediaIds');
       
     res.status(200).json(populated);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Delete/cancel active schedule queue for one account
+// @route   DELETE /api/scheduler/queue/account/:accountId
+// @access  Private (Owner, Admin, Editor)
+router.delete('/queue/account/:accountId', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
+  const { accountId } = req.params;
+
+  try {
+    const isConnected = getDBStatus();
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+
+    if (!isConnected) {
+      const beforeCount = mockStore.scheduledPosts.length;
+      const shouldDelete = (post) => (
+        activeQueueStatuses.includes(post.status)
+        && idsToStrings(post.socialAccountIds).includes(String(accountId))
+      );
+      mockStore.scheduledPosts = mockStore.scheduledPosts.filter((post) => !shouldDelete(post));
+      return res.status(200).json({
+        message: 'Account schedule queue removed successfully',
+        deletedCount: beforeCount - mockStore.scheduledPosts.length,
+      });
+    }
+
+    const query = {
+      campaignId,
+      status: { $in: activeQueueStatuses },
+      socialAccountIds: accountId,
+    };
+
+    const posts = await ScheduledPost.find(query).select('_id socialAccountIds');
+    let deletedCount = 0;
+
+    for (const post of posts) {
+      const accountIds = idsToStrings(post.socialAccountIds);
+      if (accountIds.length > 1) {
+        post.socialAccountIds = post.socialAccountIds.filter((id) => String(id) !== String(accountId));
+        await post.save();
+      } else {
+        await removePostFromQueue(post._id);
+        await ScheduledPost.deleteOne({ _id: post._id, campaignId });
+        deletedCount += 1;
+      }
+    }
+
+    res.status(200).json({
+      message: 'Account schedule queue removed successfully',
+      deletedCount,
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

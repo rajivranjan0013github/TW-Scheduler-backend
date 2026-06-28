@@ -33,6 +33,15 @@ export const getThumbnailStorageKey = ({ userId, folderId, mediaId }) => (
   ].join('/')
 );
 
+export const getUserAvatarStorageKey = ({ userId, extension = '.jpg' }) => (
+  [
+    'users',
+    sanitizeSegment(userId),
+    'profile',
+    `avatar${extension}`,
+  ].join('/')
+);
+
 export const isStructuredMediaKey = (storageKey) => (
   /^users\/[^/]+\/folders\/[^/]+\/media\/[^/]+\/original\.[^/]+$/i.test(String(storageKey || ''))
 );

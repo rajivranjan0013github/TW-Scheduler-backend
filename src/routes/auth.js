@@ -6,6 +6,7 @@ import { mockStore } from '../models/mockStore.js';
 import User from '../models/User.js';
 import SocialAccount from '../models/SocialAccount.js';
 import { protect } from '../middleware/auth.js';
+import { storeRemoteAvatarForUser } from '../services/avatarStorageService.js';
 
 const router = express.Router();
 
@@ -87,6 +88,10 @@ router.post('/login', async (req, res) => {
       });
     }
 
+    if (avatar) {
+      await storeRemoteAvatarForUser(user, avatar);
+    }
+
     const token = generateToken(user._id);
 
     res.status(200).json({
@@ -160,12 +165,14 @@ router.post('/facebook-login', async (req, res) => {
       ],
     });
 
+    const facebookAvatar = profile.picture?.data?.url || '';
+
     if (!user) {
       const userCount = await User.countDocuments();
       user = await User.create({
         email,
         name: profile.name || email,
-        avatar: profile.picture?.data?.url,
+        avatar: facebookAvatar,
         role: userCount === 0 ? 'owner' : 'editor',
         userType: req.body.userType,
         facebookId: profile.id,
@@ -173,8 +180,12 @@ router.post('/facebook-login', async (req, res) => {
     } else {
       user.facebookId = user.facebookId || profile.id;
       user.name = user.name || profile.name || email;
-      user.avatar = user.avatar || profile.picture?.data?.url;
+      user.avatar = user.avatar || facebookAvatar;
       await user.save();
+    }
+
+    if (facebookAvatar) {
+      await storeRemoteAvatarForUser(user, facebookAvatar);
     }
 
     const token = generateToken(user._id);
@@ -212,7 +223,10 @@ router.put('/me', protect, async (req, res) => {
     }
 
     if (name) user.name = name;
-    if (avatar) user.avatar = avatar;
+    if (avatar) {
+      user.avatar = avatar;
+      await storeRemoteAvatarForUser(user, avatar);
+    }
     if (userType) user.userType = userType;
 
     await user.save();
