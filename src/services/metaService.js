@@ -80,6 +80,208 @@ const publishInstagramContainer = async ({ baseUrl, accessToken, instagramBusine
   return publishData.id;
 };
 
+const fetchInstagramMediaDetails = async ({ baseUrl, accessToken, mediaId }) => {
+  const fields = 'id,media_type,media_product_type,permalink,children{id,media_type}';
+  const url = `${baseUrl}/${mediaId}?fields=${fields}&access_token=${encodeURIComponent(accessToken)}`;
+  const response = await fetch(url);
+  const data = await response.json();
+
+  return { response, data, url };
+};
+
+const fetchInstagramAccountMediaDetails = async ({ baseUrl, accessToken, instagramBusinessAccountId, mediaId }) => {
+  const fields = 'id,media_type,media_product_type,permalink,children{id,media_type}';
+  const url = `${baseUrl}/${instagramBusinessAccountId}/media?fields=${fields}&limit=50&access_token=${encodeURIComponent(accessToken)}`;
+  const response = await fetch(url);
+  const data = await response.json();
+  const item = Array.isArray(data.data)
+    ? data.data.find((media) => String(media.id) === String(mediaId))
+    : null;
+
+  return { response, data: item || data, url, found: Boolean(item) };
+};
+
+const assertPublishedCarouselDetails = ({ data, publishedId, expectedChildrenCount }) => {
+  const childrenCount = Array.isArray(data.children?.data) ? data.children.data.length : 0;
+  const isCarousel = data.media_type === 'CAROUSEL_ALBUM';
+  const hasExpectedChildren = childrenCount === expectedChildrenCount;
+
+  return {
+    ok: isCarousel && hasExpectedChildren,
+    childrenCount,
+    message: [
+      'Instagram carousel publish verification failed',
+      `publishedId=${publishedId}`,
+      `media_type=${data.media_type || 'unknown'}`,
+      `children=${childrenCount}`,
+      `expected=${expectedChildrenCount}`,
+    ].join(' | '),
+  };
+};
+
+const verifyPublishedInstagramCarousel = async ({
+  baseUrl,
+  accessToken,
+  instagramBusinessAccountId,
+  publishedId,
+  expectedChildrenCount,
+  graphHost,
+  authProvider,
+}) => {
+  const maxAttempts = 6;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (attempt > 1) {
+      await new Promise(resolve => setTimeout(resolve, 5000));
+    }
+
+    const { response, data, url } = await fetchInstagramMediaDetails({
+      baseUrl,
+      accessToken,
+      mediaId: publishedId,
+    });
+
+    if (!response.ok) {
+      lastError = getMetaErrorMessage('Instagram carousel publish verification', response, data);
+      console.error('❌ Instagram Carousel Verification Lookup Failed:', {
+        attempt,
+        status: response.status,
+        url: url.replace(encodeURIComponent(accessToken), '[redacted]'),
+        accountId: instagramBusinessAccountId,
+        publishedId,
+        graphHost,
+        authProvider,
+        response: data,
+      });
+
+      const feedLookup = await fetchInstagramAccountMediaDetails({
+        baseUrl,
+        accessToken,
+        instagramBusinessAccountId,
+        mediaId: publishedId,
+      });
+
+      if (feedLookup.response.ok && feedLookup.found) {
+        const feedResult = assertPublishedCarouselDetails({
+          data: feedLookup.data,
+          publishedId,
+          expectedChildrenCount,
+        });
+
+        if (feedResult.ok) {
+          console.log('✅ Instagram carousel publish verified from account media feed:', {
+            accountId: instagramBusinessAccountId,
+            publishedId,
+            childrenCount: feedResult.childrenCount,
+            expectedChildrenCount,
+            permalink: feedLookup.data.permalink,
+          });
+          return feedLookup.data;
+        }
+
+        lastError = feedResult.message;
+        console.error('❌ Instagram Carousel Feed Verification Mismatch:', {
+          attempt,
+          accountId: instagramBusinessAccountId,
+          publishedId,
+          mediaType: feedLookup.data.media_type,
+          mediaProductType: feedLookup.data.media_product_type,
+          childrenCount: feedResult.childrenCount,
+          expectedChildrenCount,
+          permalink: feedLookup.data.permalink,
+        });
+      } else if (!feedLookup.response.ok) {
+        console.error('❌ Instagram Carousel Feed Verification Lookup Failed:', {
+          attempt,
+          status: feedLookup.response.status,
+          url: feedLookup.url.replace(encodeURIComponent(accessToken), '[redacted]'),
+          accountId: instagramBusinessAccountId,
+          publishedId,
+          response: feedLookup.data,
+        });
+      }
+
+      continue;
+    }
+
+    const result = assertPublishedCarouselDetails({ data, publishedId, expectedChildrenCount });
+
+    if (result.ok) {
+      console.log('✅ Instagram carousel publish verified:', {
+        accountId: instagramBusinessAccountId,
+        publishedId,
+        childrenCount: result.childrenCount,
+        expectedChildrenCount,
+        permalink: data.permalink,
+      });
+      return data;
+    }
+
+    lastError = result.message;
+
+    console.error('❌ Instagram Carousel Verification Mismatch:', {
+      attempt,
+      accountId: instagramBusinessAccountId,
+      publishedId,
+      mediaType: data.media_type,
+      mediaProductType: data.media_product_type,
+      childrenCount: result.childrenCount,
+      expectedChildrenCount,
+      permalink: data.permalink,
+    });
+
+    const feedLookup = await fetchInstagramAccountMediaDetails({
+      baseUrl,
+      accessToken,
+      instagramBusinessAccountId,
+      mediaId: publishedId,
+    });
+
+    if (feedLookup.response.ok && feedLookup.found) {
+      const feedResult = assertPublishedCarouselDetails({
+        data: feedLookup.data,
+        publishedId,
+        expectedChildrenCount,
+      });
+
+      if (feedResult.ok) {
+        console.log('✅ Instagram carousel publish verified from account media feed:', {
+          accountId: instagramBusinessAccountId,
+          publishedId,
+          childrenCount: feedResult.childrenCount,
+          expectedChildrenCount,
+          permalink: feedLookup.data.permalink,
+        });
+        return feedLookup.data;
+      }
+
+      lastError = feedResult.message;
+      console.error('❌ Instagram Carousel Feed Verification Mismatch:', {
+        attempt,
+        accountId: instagramBusinessAccountId,
+        publishedId,
+        mediaType: feedLookup.data.media_type,
+        mediaProductType: feedLookup.data.media_product_type,
+        childrenCount: feedResult.childrenCount,
+        expectedChildrenCount,
+        permalink: feedLookup.data.permalink,
+      });
+    } else if (!feedLookup.response.ok) {
+      console.error('❌ Instagram Carousel Feed Verification Lookup Failed:', {
+        attempt,
+        status: feedLookup.response.status,
+        url: feedLookup.url.replace(encodeURIComponent(accessToken), '[redacted]'),
+        accountId: instagramBusinessAccountId,
+        publishedId,
+        response: feedLookup.data,
+      });
+    }
+  }
+
+  throw new Error(lastError || 'Instagram carousel publish verification failed.');
+};
+
 /**
  * Publishes a post to Instagram (Reels or Image Feed Posts)
  * @param {string} accessToken - Instagram/Facebook access token
@@ -174,6 +376,8 @@ export const publishCarouselToInstagram = async (accessToken, instagramBusinessA
   const baseUrl = `https://${graphHost}/${apiVersion}`;
   const containerUrl = `${baseUrl}/${instagramBusinessAccountId}/media`;
 
+  console.log(`📸 [publishCarouselToInstagram] Starting carousel publishing. Total slides: ${mediaFiles.length}`);
+
   if (!Array.isArray(mediaFiles) || mediaFiles.length < 2) {
     throw new Error('Instagram carousel publishing requires at least two media files.');
   }
@@ -183,7 +387,8 @@ export const publishCarouselToInstagram = async (accessToken, instagramBusinessA
 
   const childContainerIds = [];
 
-  for (const media of mediaFiles) {
+  for (let idx = 0; idx < mediaFiles.length; idx++) {
+    const media = mediaFiles[idx];
     const isVideo = media.type === 'video';
     const childParams = new URLSearchParams();
     childParams.append('is_carousel_item', 'true');
@@ -194,6 +399,8 @@ export const publishCarouselToInstagram = async (accessToken, instagramBusinessA
     } else {
       childParams.append('image_url', media.url);
     }
+
+    console.log(`⏳ [publishCarouselToInstagram] Creating container for Slide ${idx + 1}/${mediaFiles.length}: Name="${media.name}", URL="${media.url}"`);
 
     const childRes = await fetch(containerUrl, {
       method: 'POST',
@@ -216,14 +423,20 @@ export const publishCarouselToInstagram = async (accessToken, instagramBusinessA
       throw new Error(message);
     }
 
+    console.log(`✅ [publishCarouselToInstagram] Slide ${idx + 1} container created with ID: ${childData.id}. Polling status...`);
+
     await waitForInstagramContainer({
       baseUrl,
       containerId: childData.id,
       accessToken,
       authProvider,
     });
+    
+    console.log(`🎉 [publishCarouselToInstagram] Slide ${idx + 1} processed successfully.`);
     childContainerIds.push(childData.id);
   }
+
+  console.log(`🔗 [publishCarouselToInstagram] All slides processed. Container IDs:`, childContainerIds);
 
   const carouselParams = new URLSearchParams();
   carouselParams.append('media_type', 'CAROUSEL');
@@ -251,6 +464,8 @@ export const publishCarouselToInstagram = async (accessToken, instagramBusinessA
     throw new Error(message);
   }
 
+  console.log(`✅ [publishCarouselToInstagram] Parent container created with ID: ${carouselData.id}. Polling parent container...`);
+
   await waitForInstagramContainer({
     baseUrl,
     containerId: carouselData.id,
@@ -258,13 +473,25 @@ export const publishCarouselToInstagram = async (accessToken, instagramBusinessA
     authProvider,
   });
 
-  return publishInstagramContainer({
+  const publishedId = await publishInstagramContainer({
     baseUrl,
     accessToken,
     instagramBusinessAccountId,
     creationId: carouselData.id,
     context: { graphHost, authProvider, mediaType: 'carousel' },
   });
+
+  await verifyPublishedInstagramCarousel({
+    baseUrl,
+    accessToken,
+    instagramBusinessAccountId,
+    publishedId,
+    expectedChildrenCount: mediaFiles.length,
+    graphHost,
+    authProvider,
+  });
+
+  return publishedId;
 };
 
 /**
