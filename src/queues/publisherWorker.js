@@ -5,7 +5,7 @@ import { mockStore } from '../models/mockStore.js';
 import ScheduledPost from '../models/ScheduledPost.js';
 import SocialAccount from '../models/SocialAccount.js';
 import Media from '../models/Media.js';
-import { publishToInstagram, publishToFacebook } from '../services/metaService.js';
+import { publishCarouselToInstagram, publishToInstagram, publishToFacebook } from '../services/metaService.js';
 import { runFeedSync } from './feedSyncWorker.js';
 import { runInsightSync } from './insightSyncWorker.js';
 import { publishToYoutube } from '../services/youtubeService.js';
@@ -141,14 +141,24 @@ export const publishPostJob = async (postId) => {
             if (!mainMedia) {
               throw new Error('Instagram requires an attached image or video file to publish.');
             }
-            publishedId = await publishToInstagram(
-              freshAccount.accessToken,
-              freshAccount.accountId,
-              mainMedia.url,
-              mainMedia.type,
-              post.caption,
-              freshAccount.authProvider
-            );
+            if (format === 'carousel') {
+              publishedId = await publishCarouselToInstagram(
+                freshAccount.accessToken,
+                freshAccount.accountId,
+                mediaFiles,
+                post.caption,
+                freshAccount.authProvider
+              );
+            } else {
+              publishedId = await publishToInstagram(
+                freshAccount.accessToken,
+                freshAccount.accountId,
+                mainMedia.url,
+                mainMedia.type,
+                post.caption,
+                freshAccount.authProvider
+              );
+            }
           } else if (freshAccount.platform === 'facebook') {
             publishedId = await publishToFacebook(
               freshAccount.accessToken,

@@ -17,6 +17,69 @@ const logInstagramRequest = (stage, context) => {
 
 };
 
+const waitForInstagramContainer = async ({ baseUrl, containerId, accessToken, authProvider }) => {
+  const pollFields = authProvider === 'instagram' ? 'status_code' : 'status_code,error_info';
+  const pollUrl = `${baseUrl}/${containerId}?fields=${pollFields}&access_token=${accessToken}`;
+  const maxAttempts = 30;
+  let attempt = 0;
+
+  while (attempt < maxAttempts) {
+    attempt++;
+    await new Promise(resolve => setTimeout(resolve, 5000));
+
+    const pollRes = await fetch(pollUrl);
+    const pollData = await pollRes.json();
+
+    if (!pollRes.ok) {
+      const message = getMetaErrorMessage('Instagram container polling', pollRes, pollData);
+      console.error('❌ Instagram Container Poll Failed:', {
+        status: pollRes.status,
+        url: pollUrl.replace(accessToken, '[redacted]'),
+        response: pollData,
+      });
+      throw new Error(message);
+    }
+
+    const statusCode = pollData.status_code;
+    if (statusCode === 'FINISHED') return;
+    if (statusCode === 'ERROR') {
+      console.error('❌ Instagram Container Processing Error:', pollData.error_info);
+      throw new Error(`Instagram media container processing failed: ${JSON.stringify(pollData.error_info || pollData)}`);
+    }
+  }
+
+  throw new Error('Timeout waiting for Instagram media container to finish processing');
+};
+
+const publishInstagramContainer = async ({ baseUrl, accessToken, instagramBusinessAccountId, creationId, context = {} }) => {
+  const publishUrl = `${baseUrl}/${instagramBusinessAccountId}/media_publish`;
+  const publishParams = new URLSearchParams();
+  publishParams.append('creation_id', creationId);
+  publishParams.append('access_token', accessToken);
+
+  const publishRes = await fetch(publishUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: publishParams
+  });
+
+  const publishData = await publishRes.json();
+
+  if (!publishRes.ok || !publishData.id) {
+    const message = getMetaErrorMessage('Instagram media publish', publishRes, publishData);
+    console.error('❌ Instagram Publishing Failed:', {
+      status: publishRes.status,
+      url: publishUrl,
+      accountId: instagramBusinessAccountId,
+      response: publishData,
+      ...context,
+    });
+    throw new Error(message);
+  }
+
+  return publishData.id;
+};
+
 /**
  * Publishes a post to Instagram (Reels or Image Feed Posts)
  * @param {string} accessToken - Instagram/Facebook access token
@@ -83,44 +146,7 @@ export const publishToInstagram = async (accessToken, instagramBusinessAccountId
   const containerId = containerData.id;
 
   // Step 2: Poll status of the container (required for video/reels, good practice for images)
-  const pollFields = authProvider === 'instagram' ? 'status_code' : 'status_code,error_info';
-  const pollUrl = `${baseUrl}/${containerId}?fields=${pollFields}&access_token=${accessToken}`;
-  const maxAttempts = 30; // 30 attempts * 5s = 150 seconds max wait
-  let attempt = 0;
-  let finished = false;
-
-  while (attempt < maxAttempts && !finished) {
-    attempt++;
-    
-    // Wait 5 seconds
-    await new Promise(resolve => setTimeout(resolve, 5000));
-
-    const pollRes = await fetch(pollUrl);
-    const pollData = await pollRes.json();
-
-    if (!pollRes.ok) {
-      const message = getMetaErrorMessage('Instagram container polling', pollRes, pollData);
-      console.error('❌ Instagram Container Poll Failed:', {
-        status: pollRes.status,
-        url: pollUrl.replace(accessToken, '[redacted]'),
-        response: pollData,
-      });
-      throw new Error(message);
-    }
-
-    const statusCode = pollData.status_code;
-
-    if (statusCode === 'FINISHED') {
-      finished = true;
-    } else if (statusCode === 'ERROR') {
-      console.error('❌ Instagram Container Processing Error:', pollData.error_info);
-      throw new Error(`Instagram media container processing failed: ${JSON.stringify(pollData.error_info || pollData)}`);
-    }
-  }
-
-  if (!finished) {
-    throw new Error('Timeout waiting for Instagram media container to finish processing');
-  }
+  await waitForInstagramContainer({ baseUrl, containerId, accessToken, authProvider });
 
   logInstagramRequest('media-publish', {
     graphHost,
@@ -133,34 +159,112 @@ export const publishToInstagram = async (accessToken, instagramBusinessAccountId
   });
 
   // Step 3: Publish the container
-  const publishUrl = `${baseUrl}/${instagramBusinessAccountId}/media_publish`;
-  const publishParams = new URLSearchParams();
-  publishParams.append('creation_id', containerId);
-  publishParams.append('access_token', accessToken);
+  return publishInstagramContainer({
+    baseUrl,
+    accessToken,
+    instagramBusinessAccountId,
+    creationId: containerId,
+    context: { graphHost, authProvider, mediaType },
+  });
+};
 
-  const publishRes = await fetch(publishUrl, {
+export const publishCarouselToInstagram = async (accessToken, instagramBusinessAccountId, mediaFiles = [], caption, authProvider = 'facebook') => {
+  const apiVersion = 'v20.0';
+  const graphHost = authProvider === 'instagram' ? 'graph.instagram.com' : 'graph.facebook.com';
+  const baseUrl = `https://${graphHost}/${apiVersion}`;
+  const containerUrl = `${baseUrl}/${instagramBusinessAccountId}/media`;
+
+  if (!Array.isArray(mediaFiles) || mediaFiles.length < 2) {
+    throw new Error('Instagram carousel publishing requires at least two media files.');
+  }
+  if (mediaFiles.length > 10) {
+    throw new Error('Instagram carousel publishing supports up to 10 media files.');
+  }
+
+  const childContainerIds = [];
+
+  for (const media of mediaFiles) {
+    const isVideo = media.type === 'video';
+    const childParams = new URLSearchParams();
+    childParams.append('is_carousel_item', 'true');
+    childParams.append('access_token', accessToken);
+    if (isVideo) {
+      childParams.append('media_type', 'VIDEO');
+      childParams.append('video_url', media.url);
+    } else {
+      childParams.append('image_url', media.url);
+    }
+
+    const childRes = await fetch(containerUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: childParams,
+    });
+    const childData = await childRes.json();
+    if (!childRes.ok || !childData.id) {
+      const message = getMetaErrorMessage('Instagram carousel child container creation', childRes, childData);
+      console.error('❌ Instagram Carousel Child Container Creation Failed:', {
+        status: childRes.status,
+        url: containerUrl,
+        graphHost,
+        accountId: instagramBusinessAccountId,
+        authProvider,
+        mediaType: media.type,
+        mediaUrl: media.url,
+        response: childData,
+      });
+      throw new Error(message);
+    }
+
+    await waitForInstagramContainer({
+      baseUrl,
+      containerId: childData.id,
+      accessToken,
+      authProvider,
+    });
+    childContainerIds.push(childData.id);
+  }
+
+  const carouselParams = new URLSearchParams();
+  carouselParams.append('media_type', 'CAROUSEL');
+  carouselParams.append('children', childContainerIds.join(','));
+  carouselParams.append('caption', caption || '');
+  carouselParams.append('access_token', accessToken);
+
+  const carouselRes = await fetch(containerUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: publishParams
+    body: carouselParams,
   });
-
-  const publishData = await publishRes.json();
-
-  if (!publishRes.ok || !publishData.id) {
-    const message = getMetaErrorMessage('Instagram media publish', publishRes, publishData);
-    console.error('❌ Instagram Publishing Failed:', {
-      status: publishRes.status,
-      url: publishUrl,
+  const carouselData = await carouselRes.json();
+  if (!carouselRes.ok || !carouselData.id) {
+    const message = getMetaErrorMessage('Instagram carousel parent container creation', carouselRes, carouselData);
+    console.error('❌ Instagram Carousel Parent Container Creation Failed:', {
+      status: carouselRes.status,
+      url: containerUrl,
       graphHost,
       accountId: instagramBusinessAccountId,
       authProvider,
-      mediaType,
-      response: publishData,
+      childrenCount: childContainerIds.length,
+      response: carouselData,
     });
     throw new Error(message);
   }
 
-  return publishData.id;
+  await waitForInstagramContainer({
+    baseUrl,
+    containerId: carouselData.id,
+    accessToken,
+    authProvider,
+  });
+
+  return publishInstagramContainer({
+    baseUrl,
+    accessToken,
+    instagramBusinessAccountId,
+    creationId: carouselData.id,
+    context: { graphHost, authProvider, mediaType: 'carousel' },
+  });
 };
 
 /**

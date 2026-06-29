@@ -3,6 +3,7 @@ import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import ScheduledPost from '../models/ScheduledPost.js';
 import Media from '../models/Media.js';
+import Folder from '../models/Folder.js';
 import SocialAccount from '../models/SocialAccount.js';
 import CampaignChannel from '../models/CampaignChannel.js';
 import { protect, authorize } from '../middleware/auth.js';
@@ -326,6 +327,160 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
       message: `Successfully scheduled ${createdPosts.length} posts.`,
       postsCount: createdPosts.length,
       posts: createdPosts
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Bulk schedule carousel sets sequentially
+// @route   POST /api/scheduler/carousels
+// @access  Private (Owner, Admin, Editor)
+router.post('/carousels', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
+  const { socialAccountIds, carouselSetIds, caption, startDate, intervalHours, platformSpecifics } = req.body;
+  const scheduleMode = normalizeScheduleMode(req.body.scheduleMode);
+
+  if (!socialAccountIds || !carouselSetIds || carouselSetIds.length === 0) {
+    return res.status(400).json({ message: 'Must select publishing channels and at least one carousel set' });
+  }
+
+  try {
+    const isConnected = getDBStatus();
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+    const baseDate = new Date(startDate || Date.now());
+    const intervalMs = (parseFloat(intervalHours) || 2) * 60 * 60 * 1000;
+    const accountIds = getUniqueIds(socialAccountIds);
+    const setIds = getUniqueIds(carouselSetIds);
+    const createdPosts = [];
+
+    if (!isConnected) {
+      let index = 0;
+      for (const accountId of accountIds) {
+        let currentScheduleTime = new Date(baseDate.getTime());
+        for (const setId of setIds) {
+          const folder = mockStore.folders.find(f => String(f._id) === String(setId));
+          const folderMedia = mockStore.media.filter(m => String(m.folderId) === String(setId));
+          const orderedIds = (folder?.carouselOrder || []).filter(mediaId => folderMedia.some(m => String(m._id) === String(mediaId)));
+          const unorderedIds = folderMedia.map(m => m._id).filter(mediaId => !orderedIds.includes(mediaId));
+          const mediaIds = [...orderedIds, ...unorderedIds];
+          if (mediaIds.length === 0) continue;
+
+          const postCaption = folder?.carouselCaption || caption || '';
+          const post = {
+            _id: `sp_carousel_${Date.now()}_${index++}`,
+            socialAccountIds: [accountId],
+            mediaIds,
+            caption: postCaption,
+            scheduledAt: new Date(currentScheduleTime.getTime()),
+            scheduleMode,
+            status: getInitialStatusForMode(scheduleMode),
+            platformSpecifics: {
+              ...(platformSpecifics || {}),
+              type: 'carousel',
+              carouselSetId: setId,
+              carouselSetName: folder?.name || 'Carousel Set',
+              carouselOrder: mediaIds,
+            },
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+          mockStore.scheduledPosts.push(post);
+          createdPosts.push(post);
+          currentScheduleTime = new Date(currentScheduleTime.getTime() + intervalMs);
+        }
+      }
+
+      return res.status(201).json({
+        message: `Successfully scheduled ${createdPosts.length} carousel posts.`,
+        postsCount: createdPosts.length,
+        posts: createdPosts,
+      });
+    }
+
+    const channelAccess = await CampaignChannel.find({
+      campaignId,
+      status: 'verified',
+      socialAccountId: { $in: accountIds },
+    }).select('socialAccountId');
+    const verifiedAccountIds = new Set(channelAccess.map((channel) => String(channel.socialAccountId)));
+    if (!accountIds.every((accountId) => verifiedAccountIds.has(String(accountId)))) {
+      return res.status(400).json({ message: 'One or more selected publishing channels are not connected.' });
+    }
+
+    const folders = await Folder.find({
+      _id: { $in: setIds },
+      campaignId,
+      kind: 'carousel_set',
+    }).lean();
+    if (folders.length !== setIds.length) {
+      return res.status(400).json({ message: 'One or more carousel sets were not found.' });
+    }
+
+    const mediaItems = await Media.find({
+      campaignId,
+      folderId: { $in: setIds },
+      type: { $in: ['image', 'video'] },
+    }).select('_id folderId createdAt');
+    const mediaByFolder = new Map();
+    mediaItems.forEach((item) => {
+      const folderId = String(item.folderId);
+      if (!mediaByFolder.has(folderId)) mediaByFolder.set(folderId, []);
+      mediaByFolder.get(folderId).push(item);
+    });
+
+    for (const accountId of accountIds) {
+      let currentScheduleTime = new Date(baseDate.getTime());
+
+      for (const setId of setIds) {
+        const folder = folders.find(f => String(f._id) === String(setId));
+        const folderMedia = mediaByFolder.get(String(setId)) || [];
+        const mediaIdSet = new Set(folderMedia.map(item => String(item._id)));
+        const orderedIds = (folder.carouselOrder || [])
+          .map(id => String(id))
+          .filter(mediaId => mediaIdSet.has(mediaId));
+        const unorderedIds = folderMedia
+          .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+          .map(item => String(item._id))
+          .filter(mediaId => !orderedIds.includes(mediaId));
+        const mediaIds = [...orderedIds, ...unorderedIds];
+
+        if (mediaIds.length === 0) {
+          return res.status(400).json({ message: `${folder.name} has no supported carousel slides.` });
+        }
+
+        const postCaption = folder.carouselCaption || caption || '';
+        const postPlatformSpecifics = withPostCaption({
+          ...(platformSpecifics || {}),
+          type: 'carousel',
+          carouselSetId: folder._id,
+          carouselSetName: folder.name,
+          carouselOrder: mediaIds,
+        }, postCaption, 'carousel');
+
+        const post = await ScheduledPost.create({
+          userId: req.user._id,
+          campaignId,
+          socialAccountIds: [accountId],
+          mediaIds,
+          caption: postCaption,
+          scheduledAt: new Date(currentScheduleTime.getTime()),
+          scheduleMode,
+          status: getInitialStatusForMode(scheduleMode),
+          platformSpecifics: postPlatformSpecifics,
+        });
+        if (shouldQueuePost(post)) {
+          await addPostToQueue(post);
+        }
+        createdPosts.push(post);
+        currentScheduleTime = new Date(currentScheduleTime.getTime() + intervalMs);
+      }
+    }
+
+    res.status(201).json({
+      message: `Successfully scheduled ${createdPosts.length} carousel posts.`,
+      postsCount: createdPosts.length,
+      posts: createdPosts,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });

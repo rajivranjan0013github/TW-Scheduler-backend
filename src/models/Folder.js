@@ -22,6 +22,20 @@ const FolderSchema = new mongoose.Schema({
     ref: 'Folder',
     default: null,
   },
+  kind: {
+    type: String,
+    enum: ['folder', 'carousel_set'],
+    default: 'folder',
+    index: true,
+  },
+  carouselCaption: {
+    type: String,
+    default: '',
+  },
+  carouselOrder: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Media',
+  }],
 }, { timestamps: true });
 
 export default mongoose.models.Folder || mongoose.model('Folder', FolderSchema);

@@ -211,7 +211,7 @@ router.get('/folders', protect, async (req, res) => {
 // @route   POST /api/media/folders
 // @access  Private (Owner, Admin, Editor)
 router.post('/folders', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
-  const { name, parentFolderId } = req.body;
+  const { name, parentFolderId, kind, carouselCaption, carouselOrder } = req.body;
 
   try {
     const isConnected = getDBStatus();
@@ -220,6 +220,9 @@ router.post('/folders', protect, authorize('owner', 'admin', 'editor'), async (r
         _id: `f_${Date.now()}`,
         name,
         parentFolderId: parentFolderId || null,
+        kind: kind === 'carousel_set' ? 'carousel_set' : 'folder',
+        carouselCaption: carouselCaption || '',
+        carouselOrder: Array.isArray(carouselOrder) ? carouselOrder : [],
         createdAt: new Date(),
       };
       mockStore.folders.push(newFolder);
@@ -228,8 +231,68 @@ router.post('/folders', protect, authorize('owner', 'admin', 'editor'), async (r
 
     const campaignId = requireCampaignId(req, res);
     if (!campaignId) return;
-    const folder = await Folder.create({ userId: req.user._id, campaignId, name, parentFolderId: parentFolderId || null });
+    const folder = await Folder.create({
+      userId: req.user._id,
+      campaignId,
+      name,
+      parentFolderId: parentFolderId || null,
+      kind: kind === 'carousel_set' ? 'carousel_set' : 'folder',
+      carouselCaption: carouselCaption || '',
+      carouselOrder: Array.isArray(carouselOrder) ? carouselOrder : [],
+    });
     res.status(201).json(folder);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Update carousel set metadata
+// @route   PUT /api/media/folders/:id/carousel
+// @access  Private (Owner, Admin, Editor)
+router.put('/folders/:id/carousel', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
+  const { id } = req.params;
+  const carouselCaption = String(req.body?.carouselCaption || '');
+  const carouselOrder = Array.isArray(req.body?.carouselOrder) ? req.body.carouselOrder : [];
+
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      const folder = mockStore.folders.find(f => f._id === id);
+      if (!folder) {
+        return res.status(404).json({ message: 'Folder not found' });
+      }
+      folder.kind = 'carousel_set';
+      folder.carouselCaption = carouselCaption;
+      folder.carouselOrder = carouselOrder;
+      folder.updatedAt = new Date();
+      return res.status(200).json(folder);
+    }
+
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+
+    if (carouselOrder.length > 0) {
+      const mediaCount = await Media.countDocuments({ _id: { $in: carouselOrder }, campaignId, folderId: id });
+      if (mediaCount !== carouselOrder.length) {
+        return res.status(400).json({ message: 'Carousel order contains media outside this folder.' });
+      }
+    }
+
+    const folder = await Folder.findOneAndUpdate(
+      { _id: id, campaignId },
+      {
+        kind: 'carousel_set',
+        carouselCaption,
+        carouselOrder,
+      },
+      { new: true }
+    );
+
+    if (!folder) {
+      return res.status(404).json({ message: 'Folder not found' });
+    }
+
+    res.status(200).json(folder);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
