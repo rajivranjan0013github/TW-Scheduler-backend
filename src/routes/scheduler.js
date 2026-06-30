@@ -8,6 +8,7 @@ import SocialAccount from '../models/SocialAccount.js';
 import CampaignChannel from '../models/CampaignChannel.js';
 import { protect, authorize } from '../middleware/auth.js';
 import { addPostToQueue, removePostFromQueue } from '../queues/publisherQueue.js';
+import { normalizeChannelHandle } from '../utils/campaignChannels.js';
 
 const router = express.Router();
 const ADMIN_ROLES = ['owner', 'admin'];
@@ -59,14 +60,26 @@ const canAccessManualPost = async (post, user) => {
   if (String(post.userId) === String(user._id)) return true;
 
   const postAccountIds = idsToStrings(post.socialAccountIds);
-  if (postAccountIds.length === 0) return false;
+  if (postAccountIds.length > 0) {
+    const ownedAccount = await SocialAccount.exists({
+      _id: { $in: postAccountIds },
+      userId: user._id,
+    });
+    if (ownedAccount) return true;
+  }
 
-  const ownedAccount = await SocialAccount.exists({
-    _id: { $in: postAccountIds },
-    userId: user._id,
+  const postChannelIds = idsToStrings(post.campaignChannelIds);
+  if (postChannelIds.length === 0) return false;
+  const userEmail = (user.email || '').trim().toLowerCase();
+  const assignedChannel = await CampaignChannel.exists({
+    _id: { $in: postChannelIds },
+    $or: [
+      { assignedHandlerUserId: user._id },
+      ...(userEmail ? [{ assignedHandlerEmail: userEmail }] : []),
+    ],
   });
 
-  return Boolean(ownedAccount);
+  return Boolean(assignedChannel);
 };
 
 const withPostCaption = (platformSpecifics, postCaption, type) => {
@@ -84,29 +97,118 @@ const withPostCaption = (platformSpecifics, postCaption, type) => {
   return nextSpecifics;
 };
 
-const validateSchedulingAccess = async ({ campaignId, socialAccountIds, mediaIds, requireEveryAccount = true }) => {
+const getAccountMatchHandles = (account = {}) => (
+  [
+    normalizeChannelHandle(account.username),
+    normalizeChannelHandle(account.name),
+    normalizeChannelHandle(account.accountId),
+  ].filter(Boolean)
+);
+
+const normalizeChannelTargets = ({ channelTargets = [], socialAccountIds = [], campaignChannelIds = [] } = {}) => {
+  const normalizedTargets = channelTargets
+    .map((target) => ({
+      socialAccountId: target?.socialAccountId || null,
+      campaignChannelId: target?.campaignChannelId || null,
+    }))
+    .filter((target) => target.socialAccountId || target.campaignChannelId);
+
+  if (normalizedTargets.length > 0) return normalizedTargets;
+
+  const accountIds = getUniqueIds(socialAccountIds);
+  const channelIds = getUniqueIds(campaignChannelIds);
+  if (accountIds.length > 0) {
+    return accountIds.map((accountId, index) => ({
+      socialAccountId: accountId,
+      campaignChannelId: channelIds[index] || null,
+    }));
+  }
+
+  return channelIds.map((channelId) => ({
+    socialAccountId: null,
+    campaignChannelId: channelId,
+  }));
+};
+
+const validateSchedulingAccess = async ({ campaignId, socialAccountIds, campaignChannelIds, channelTargets, mediaIds, allowDisconnectedAccounts = false }) => {
   const accountIds = idsToStrings(socialAccountIds);
+  const channelIds = idsToStrings(campaignChannelIds);
+  const targets = normalizeChannelTargets({ channelTargets, socialAccountIds, campaignChannelIds });
   const mediaIdList = idsToStrings(mediaIds);
 
-  if (accountIds.length === 0 || mediaIdList.length === 0) {
+  if (targets.length === 0 || mediaIdList.length === 0) {
     return { ok: false, message: 'Must select publishing channels and at least one media file' };
   }
 
-  const [accounts, mediaItems] = await Promise.all([
-    CampaignChannel.find({
+  const mediaItems = await Media.find({ _id: { $in: mediaIdList }, campaignId }).select('_id socialAccountIds');
+  if (mediaItems.length !== mediaIdList.length) {
+    return { ok: false, message: 'One or more selected media assets were not found.' };
+  }
+
+  if (!allowDisconnectedAccounts) {
+    if (accountIds.length === 0) {
+      return { ok: false, message: 'One or more selected publishing channels are not connected.' };
+    }
+    const accounts = await CampaignChannel.find({
       campaignId,
       status: 'verified',
       socialAccountId: { $in: accountIds },
-    }).select('socialAccountId'),
-    Media.find({ _id: { $in: mediaIdList }, campaignId }).select('_id socialAccountIds'),
-  ]);
-  const verifiedAccountIds = new Set(accounts.map((channel) => String(channel.socialAccountId)));
+    }).select('socialAccountId');
+    const verifiedAccountIds = new Set(accounts.map((channel) => String(channel.socialAccountId)));
 
-  if (!accountIds.every((accountId) => verifiedAccountIds.has(String(accountId)))) {
-    return { ok: false, message: 'One or more selected publishing channels are not connected.' };
+    if (!accountIds.every((accountId) => verifiedAccountIds.has(String(accountId)))) {
+      return { ok: false, message: 'One or more selected publishing channels are not connected.' };
+    }
+    return { ok: true };
   }
-  if (mediaItems.length !== mediaIdList.length) {
-    return { ok: false, message: 'One or more selected media assets were not found.' };
+
+  if (channelIds.length > 0) {
+    const channels = await CampaignChannel.find({
+      _id: { $in: channelIds },
+      campaignId,
+    }).select('_id status socialAccountId assignedHandlerEmail assignedHandlerUserId').lean();
+    if (channels.length !== getUniqueIds(channelIds).length) {
+      return { ok: false, message: 'One or more selected channels are not assigned to this campaign.' };
+    }
+    const unusableManualChannel = channels.some((channel) => (
+      channel.status !== 'verified'
+      && !channel.socialAccountId
+      && !channel.assignedHandlerEmail
+      && !channel.assignedHandlerUserId
+    ));
+    if (unusableManualChannel) {
+      return { ok: false, message: 'Assign a handler email before scheduling an unverified channel manually.' };
+    }
+  }
+
+  if (accountIds.length === 0) {
+    return { ok: true };
+  }
+
+  const selectedAccounts = await SocialAccount.find({ _id: { $in: accountIds } })
+    .select('_id platform username name accountId')
+    .lean();
+  if (selectedAccounts.length !== accountIds.length) {
+    return { ok: false, message: 'One or more selected publishing channels were not found.' };
+  }
+
+  const accountKeys = new Set(
+    selectedAccounts.flatMap((account) => (
+      getAccountMatchHandles(account).map((handle) => `${account.platform}:${handle}`)
+    ))
+  );
+  const assignedChannels = await CampaignChannel.find({ campaignId })
+    .select('platform normalizedHandle')
+    .lean();
+  const assignedKeys = new Set(
+    assignedChannels.map((channel) => `${channel.platform}:${normalizeChannelHandle(channel.normalizedHandle)}`)
+  );
+
+  const allAccountsAssigned = selectedAccounts.every((account) => (
+    getAccountMatchHandles(account).some((handle) => assignedKeys.has(`${account.platform}:${handle}`))
+  ));
+  if (!allAccountsAssigned || accountKeys.size === 0) {
+    return { ok: false, message: 'One or more selected channels are not assigned to this campaign.' };
   }
 
   return { ok: true };
@@ -128,6 +230,7 @@ router.get('/', protect, async (req, res) => {
     if (!campaignId) return;
     const posts = await ScheduledPost.find({ campaignId })
       .populate('socialAccountIds')
+      .populate('campaignChannelIds')
       .populate('mediaIds')
       .sort({ scheduledAt: 1 });
     
@@ -141,7 +244,7 @@ router.get('/', protect, async (req, res) => {
 // @route   POST /api/scheduler
 // @access  Private (Owner, Admin, Editor)
 router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
-  const { socialAccountIds, mediaIds, caption, scheduledAt, platformSpecifics } = req.body;
+  const { socialAccountIds, campaignChannelIds, channelTargets, mediaIds, caption, scheduledAt, platformSpecifics } = req.body;
   const scheduleMode = normalizeScheduleMode(req.body.scheduleMode);
 
   try {
@@ -156,10 +259,11 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
         const mediaItem = mockStore.media.find(m => String(m._id) === String(mediaIds[0]));
         postCaption = mediaItem?.caption || '';
       }
-      const accountIds = getUniqueIds(socialAccountIds);
-      const newPosts = accountIds.map((accountId) => ({
+      const targets = normalizeChannelTargets({ channelTargets, socialAccountIds, campaignChannelIds });
+      const newPosts = targets.map((target) => ({
         _id: `sp_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        socialAccountIds: [accountId],
+        socialAccountIds: target.socialAccountId ? [target.socialAccountId] : [],
+        campaignChannelIds: target.campaignChannelId ? [target.campaignChannelId] : [],
         mediaIds,
         caption: postCaption,
         scheduledAt: scheduledDate,
@@ -170,7 +274,7 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
         updatedAt: new Date(),
       }));
       mockStore.scheduledPosts.push(...newPosts);
-      return accountIds.length === 1
+      return targets.length === 1
         ? res.status(201).json(newPosts[0])
         : res.status(201).json({
           message: `Successfully scheduled ${newPosts.length} posts.`,
@@ -182,8 +286,10 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
     const access = await validateSchedulingAccess({
       campaignId,
       socialAccountIds,
+      campaignChannelIds,
+      channelTargets,
       mediaIds,
-      requireEveryAccount: true,
+      allowDisconnectedAccounts: scheduleMode === 'manual',
     });
     if (!access.ok) {
       return res.status(400).json({ message: access.message });
@@ -194,14 +300,15 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
       postCaption = mediaItem?.caption || '';
     }
 
-    const accountIds = getUniqueIds(socialAccountIds);
+    const targets = normalizeChannelTargets({ channelTargets, socialAccountIds, campaignChannelIds });
     const posts = [];
 
-    for (const accountId of accountIds) {
+    for (const target of targets) {
       const post = await ScheduledPost.create({
         userId: req.user._id,
         campaignId,
-        socialAccountIds: [accountId],
+        socialAccountIds: target.socialAccountId ? [target.socialAccountId] : [],
+        campaignChannelIds: target.campaignChannelId ? [target.campaignChannelId] : [],
         mediaIds,
         caption: postCaption,
         scheduledAt: scheduledDate,
@@ -231,10 +338,11 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
 // @route   POST /api/scheduler/bulk
 // @access  Private (Owner, Admin, Editor)
 router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
-  const { socialAccountIds, mediaIds, caption, startDate, intervalHours, type, platformSpecifics } = req.body;
+  const { socialAccountIds, campaignChannelIds, channelTargets, mediaIds, caption, startDate, intervalHours, type, platformSpecifics } = req.body;
   const scheduleMode = normalizeScheduleMode(req.body.scheduleMode);
+  const targets = normalizeChannelTargets({ channelTargets, socialAccountIds, campaignChannelIds });
 
-  if (!socialAccountIds || !mediaIds || mediaIds.length === 0) {
+  if (targets.length === 0 || !mediaIds || mediaIds.length === 0) {
     return res.status(400).json({ message: 'Must select publishing channels and at least one media file' });
   }
 
@@ -251,8 +359,10 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
       const access = await validateSchedulingAccess({
         campaignId,
         socialAccountIds,
+        campaignChannelIds,
+        channelTargets,
         mediaIds,
-        requireEveryAccount: true,
+        allowDisconnectedAccounts: scheduleMode === 'manual',
       });
       if (!access.ok) {
         return res.status(400).json({ message: access.message });
@@ -276,7 +386,7 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
     // we sequence the media files with the specified hour gap.
     // e.g. 5 accounts, 50 reels = 250 scheduled posts
     let index = 0;
-    for (const accountId of socialAccountIds) {
+    for (const target of targets) {
       let currentScheduleTime = new Date(baseDate.getTime());
       
       for (const mediaId of mediaIds) {
@@ -288,7 +398,8 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
         if (!isConnected) {
           const newPost = {
             _id: `sp_bulk_${Date.now()}_${index++}`,
-            socialAccountIds: [accountId],
+            socialAccountIds: target.socialAccountId ? [target.socialAccountId] : [],
+            campaignChannelIds: target.campaignChannelId ? [target.campaignChannelId] : [],
             mediaIds: [mediaId],
             caption: postCaption,
             scheduledAt: scheduledTime,
@@ -304,7 +415,8 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
           const post = await ScheduledPost.create({
             userId: req.user._id,
             campaignId,
-            socialAccountIds: [accountId],
+            socialAccountIds: target.socialAccountId ? [target.socialAccountId] : [],
+            campaignChannelIds: target.campaignChannelId ? [target.campaignChannelId] : [],
             mediaIds: [mediaId],
             caption: postCaption,
             scheduledAt: scheduledTime,
@@ -337,10 +449,11 @@ router.post('/bulk', protect, authorize('owner', 'admin', 'editor'), async (req,
 // @route   POST /api/scheduler/carousels
 // @access  Private (Owner, Admin, Editor)
 router.post('/carousels', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
-  const { socialAccountIds, carouselSetIds, caption, startDate, intervalHours, platformSpecifics } = req.body;
+  const { socialAccountIds, campaignChannelIds, channelTargets, carouselSetIds, caption, startDate, intervalHours, platformSpecifics } = req.body;
   const scheduleMode = normalizeScheduleMode(req.body.scheduleMode);
+  const targets = normalizeChannelTargets({ channelTargets, socialAccountIds, campaignChannelIds });
 
-  if (!socialAccountIds || !carouselSetIds || carouselSetIds.length === 0) {
+  if (targets.length === 0 || !carouselSetIds || carouselSetIds.length === 0) {
     return res.status(400).json({ message: 'Must select publishing channels and at least one carousel set' });
   }
 
@@ -351,12 +464,13 @@ router.post('/carousels', protect, authorize('owner', 'admin', 'editor'), async 
     const baseDate = new Date(startDate || Date.now());
     const intervalMs = (parseFloat(intervalHours) || 2) * 60 * 60 * 1000;
     const accountIds = getUniqueIds(socialAccountIds);
+    const channelIds = getUniqueIds(campaignChannelIds);
     const setIds = getUniqueIds(carouselSetIds);
     const createdPosts = [];
 
     if (!isConnected) {
       let index = 0;
-      for (const accountId of accountIds) {
+      for (const target of targets) {
         let currentScheduleTime = new Date(baseDate.getTime());
         for (const setId of setIds) {
           const folder = mockStore.folders.find(f => String(f._id) === String(setId));
@@ -369,7 +483,8 @@ router.post('/carousels', protect, authorize('owner', 'admin', 'editor'), async 
           const postCaption = folder?.carouselCaption || caption || '';
           const post = {
             _id: `sp_carousel_${Date.now()}_${index++}`,
-            socialAccountIds: [accountId],
+            socialAccountIds: target.socialAccountId ? [target.socialAccountId] : [],
+            campaignChannelIds: target.campaignChannelId ? [target.campaignChannelId] : [],
             mediaIds,
             caption: postCaption,
             scheduledAt: new Date(currentScheduleTime.getTime()),
@@ -398,14 +513,53 @@ router.post('/carousels', protect, authorize('owner', 'admin', 'editor'), async 
       });
     }
 
-    const channelAccess = await CampaignChannel.find({
-      campaignId,
-      status: 'verified',
-      socialAccountId: { $in: accountIds },
-    }).select('socialAccountId');
-    const verifiedAccountIds = new Set(channelAccess.map((channel) => String(channel.socialAccountId)));
-    if (!accountIds.every((accountId) => verifiedAccountIds.has(String(accountId)))) {
-      return res.status(400).json({ message: 'One or more selected publishing channels are not connected.' });
+    if (scheduleMode === 'manual') {
+      if (channelIds.length > 0) {
+        const channels = await CampaignChannel.find({
+          _id: { $in: channelIds },
+          campaignId,
+        }).select('_id status socialAccountId assignedHandlerEmail assignedHandlerUserId').lean();
+        if (channels.length !== channelIds.length) {
+          return res.status(400).json({ message: 'One or more selected channels are not assigned to this campaign.' });
+        }
+        const unusableManualChannel = channels.some((channel) => (
+          channel.status !== 'verified'
+          && !channel.socialAccountId
+          && !channel.assignedHandlerEmail
+          && !channel.assignedHandlerUserId
+        ));
+        if (unusableManualChannel) {
+          return res.status(400).json({ message: 'Assign a handler email before scheduling an unverified channel manually.' });
+        }
+      }
+      const selectedAccounts = await SocialAccount.find({ _id: { $in: accountIds } })
+        .select('_id platform username name accountId')
+        .lean();
+      const assignedChannels = await CampaignChannel.find({ campaignId })
+        .select('platform normalizedHandle')
+        .lean();
+      const assignedKeys = new Set(
+        assignedChannels.map((channel) => `${channel.platform}:${normalizeChannelHandle(channel.normalizedHandle)}`)
+      );
+      const allAccountsAssigned = accountIds.length === 0 || (selectedAccounts.length === accountIds.length && selectedAccounts.every((account) => (
+        getAccountMatchHandles(account).some((handle) => assignedKeys.has(`${account.platform}:${handle}`))
+      )));
+      if (!allAccountsAssigned) {
+        return res.status(400).json({ message: 'One or more selected channels are not assigned to this campaign.' });
+      }
+    } else {
+      if (accountIds.length === 0) {
+        return res.status(400).json({ message: 'One or more selected publishing channels are not connected.' });
+      }
+      const channelAccess = await CampaignChannel.find({
+        campaignId,
+        status: 'verified',
+        socialAccountId: { $in: accountIds },
+      }).select('socialAccountId');
+      const verifiedAccountIds = new Set(channelAccess.map((channel) => String(channel.socialAccountId)));
+      if (!accountIds.every((accountId) => verifiedAccountIds.has(String(accountId)))) {
+        return res.status(400).json({ message: 'One or more selected publishing channels are not connected.' });
+      }
     }
 
     const folders = await Folder.find({
@@ -429,7 +583,7 @@ router.post('/carousels', protect, authorize('owner', 'admin', 'editor'), async 
       mediaByFolder.get(folderId).push(item);
     });
 
-    for (const accountId of accountIds) {
+    for (const target of targets) {
       let currentScheduleTime = new Date(baseDate.getTime());
 
       for (const setId of setIds) {
@@ -461,7 +615,8 @@ router.post('/carousels', protect, authorize('owner', 'admin', 'editor'), async 
         const post = await ScheduledPost.create({
           userId: req.user._id,
           campaignId,
-          socialAccountIds: [accountId],
+          socialAccountIds: target.socialAccountId ? [target.socialAccountId] : [],
+          campaignChannelIds: target.campaignChannelId ? [target.campaignChannelId] : [],
           mediaIds,
           caption: postCaption,
           scheduledAt: new Date(currentScheduleTime.getTime()),
@@ -506,6 +661,7 @@ router.post('/:id/downloaded', protect, async (req, res) => {
 
     const post = await ScheduledPost.findById(id)
       .populate('socialAccountIds')
+      .populate('campaignChannelIds')
       .populate('mediaIds');
     if (!post) return res.status(404).json({ message: 'Post not found' });
     if (!['manual', 'hybrid'].includes(post.scheduleMode || 'auto')) {
@@ -551,6 +707,7 @@ router.post('/:id/manual-posted', protect, async (req, res) => {
 
     const post = await ScheduledPost.findById(id)
       .populate('socialAccountIds')
+      .populate('campaignChannelIds')
       .populate('mediaIds');
     if (!post) return res.status(404).json({ message: 'Post not found' });
     if (!['manual', 'hybrid'].includes(post.scheduleMode || 'auto')) {
@@ -617,6 +774,7 @@ router.post('/:id/return-to-auto', protect, authorize('owner', 'admin', 'editor'
 
     const populated = await ScheduledPost.findOne({ _id: id, campaignId })
       .populate('socialAccountIds')
+      .populate('campaignChannelIds')
       .populate('mediaIds');
     res.status(200).json(populated);
   } catch (error) {
@@ -691,6 +849,7 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
     
     const populated = await ScheduledPost.findOne({ _id: id, campaignId })
       .populate('socialAccountIds')
+      .populate('campaignChannelIds')
       .populate('mediaIds');
       
     res.status(200).json(populated);
@@ -794,20 +953,33 @@ router.get('/creator/posts', protect, async (req, res) => {
       return res.status(200).json([]);
     }
 
-    // 1. Find social accounts controlled by this handler
+    // 1. Find social accounts and manual channel assignments controlled by this handler
     const creatorAccounts = await SocialAccount.find({ userId: req.user._id }).select('_id').lean();
     const creatorAccountIds = creatorAccounts.map(acc => acc._id);
     const creatorAccountIdSet = new Set(creatorAccountIds.map((id) => String(id)));
+    const handlerEmail = (req.user.email || '').trim().toLowerCase();
+    const assignedChannels = await CampaignChannel.find({
+      $or: [
+        { assignedHandlerUserId: req.user._id },
+        ...(handlerEmail ? [{ assignedHandlerEmail: handlerEmail }] : []),
+      ],
+    }).select('_id').lean();
+    const assignedChannelIds = assignedChannels.map((channel) => channel._id);
+    const assignedChannelIdSet = new Set(assignedChannelIds.map((id) => String(id)));
 
-    if (creatorAccountIds.length === 0) {
+    if (creatorAccountIds.length === 0 && assignedChannelIds.length === 0) {
       return res.status(200).json([]);
     }
 
-    // 2. Find scheduled posts containing these accounts, but only expose this handler's accounts
+    // 2. Find scheduled posts containing these accounts/channels, but only expose this handler's targets
     const posts = await ScheduledPost.find({
-      socialAccountIds: { $in: creatorAccountIds }
+      $or: [
+        { socialAccountIds: { $in: creatorAccountIds } },
+        { campaignChannelIds: { $in: assignedChannelIds } },
+      ],
     })
       .populate('socialAccountIds')
+      .populate('campaignChannelIds')
       .populate('mediaIds')
       .sort({ scheduledAt: 1 })
       .lean();
@@ -816,6 +988,9 @@ router.get('/creator/posts', protect, async (req, res) => {
       ...post,
       socialAccountIds: (post.socialAccountIds || []).filter((account) => (
         creatorAccountIdSet.has(String(account?._id || account))
+      )),
+      campaignChannelIds: (post.campaignChannelIds || []).filter((channel) => (
+        assignedChannelIdSet.has(String(channel?._id || channel))
       )),
     })));
   } catch (error) {

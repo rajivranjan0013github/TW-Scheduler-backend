@@ -1,6 +1,7 @@
 import Campaign from '../models/Campaign.js';
 import CampaignChannel from '../models/CampaignChannel.js';
 import SocialAccount from '../models/SocialAccount.js';
+import User from '../models/User.js';
 
 export const normalizeChannelHandle = (value = '') => (
   String(value).trim().replace(/^@/, '').toLowerCase()
@@ -62,6 +63,7 @@ const buildAccountLookupQuery = (channels = []) => {
 const normalizeChannelInput = (channel) => {
   const requestedHandle = String(channel.requestedHandle || channel.handle || '').trim();
   const normalizedHandle = normalizeChannelHandle(requestedHandle);
+  const assignedHandlerEmail = String(channel.assignedHandlerEmail || '').trim().toLowerCase();
   return {
     _id: channel._id,
     platform: channel.platform,
@@ -69,6 +71,8 @@ const normalizeChannelInput = (channel) => {
     normalizedHandle,
     displayName: channel.displayName?.trim?.() || '',
     socialAccountId: channel.socialAccountId || null,
+    assignedHandlerEmail,
+    assignedHandlerUserId: channel.assignedHandlerUserId || null,
     addedAt: channel.addedAt || channel.createdAt || new Date(),
   };
 };
@@ -94,6 +98,8 @@ const loadCampaignChannels = async (campaign, { persist = false, addedByUserId =
       normalizedHandle: channel.normalizedHandle,
       displayName: channel.displayName,
       socialAccountId: channel.socialAccountId || null,
+      assignedHandlerEmail: channel.assignedHandlerEmail || '',
+      assignedHandlerUserId: channel.assignedHandlerUserId || null,
       addedByUserId,
       createdAt: channel.addedAt,
       updatedAt: channel.addedAt,
@@ -131,6 +137,9 @@ export const syncCampaignChannelList = async (campaignId, channels = [], { userI
 
   for (const channel of cleanChannels) {
     const existingChannel = existingByKey.get(`${channel.platform}:${channel.normalizedHandle}`);
+    const assignedUser = channel.assignedHandlerEmail
+      ? await User.findOne({ email: channel.assignedHandlerEmail }).select('_id').lean()
+      : null;
     await CampaignChannel.findOneAndUpdate(
       {
         campaignId,
@@ -144,6 +153,10 @@ export const syncCampaignChannelList = async (campaignId, channels = [], { userI
         normalizedHandle: channel.normalizedHandle,
         displayName: channel.displayName,
         socialAccountId: existingChannel?.socialAccountId || channel.socialAccountId || null,
+        assignedHandlerEmail: channel.assignedHandlerEmail,
+        assignedHandlerUserId: existingChannel?.status === 'verified'
+          ? existingChannel?.assignedHandlerUserId || null
+          : assignedUser?._id || channel.assignedHandlerUserId || null,
         addedByUserId: existingChannel?.addedByUserId || userId || undefined,
       },
       { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
@@ -186,10 +199,18 @@ export const resolveCampaignPublishingChannels = async (
         .select('_id userId platform accountId name username avatarUrl isConnected tokenExpiresAt authProvider')
         .lean()
     : [];
+  const accountOwnerIds = [...new Set(accounts.map((account) => idToString(account.userId)).filter(Boolean))];
+  const accountOwners = accountOwnerIds.length > 0
+    ? await User.find({ _id: { $in: accountOwnerIds } }).select('_id name email').lean()
+    : [];
+  const accountOwnerById = new Map(
+    accountOwners.map((owner) => [idToString(owner._id), owner])
+  );
 
   const resolvedChannels = channelDocs.map((channel) => {
     const matched = findMatchingAccount(channel, accounts);
     const isConnected = Boolean(matched && matched.isConnected !== false);
+    const matchedOwner = matched?.userId ? accountOwnerById.get(idToString(matched.userId)) : null;
     const socialAccountId = matched?._id || channel.socialAccountId || null;
     const status = isConnected
       ? 'verified'
@@ -214,6 +235,14 @@ export const resolveCampaignPublishingChannels = async (
       isVerified: isConnected,
       status,
       userId: matched?.userId || null,
+      matchedAccountId: matched?._id || null,
+      assignedHandlerEmail: isConnected
+        ? (matchedOwner?.email || '')
+        : (channel.assignedHandlerEmail || ''),
+      assignedHandlerName: isConnected
+        ? (matchedOwner?.name || matched?.name || matched?.username || '')
+        : '',
+      assignedHandlerUserId: matched?.userId || channel.assignedHandlerUserId || null,
       campaignId,
       tokenExpiresAt: matched?.tokenExpiresAt || null,
       verifiedAt: isConnected ? (channel.verifiedAt || new Date()) : null,
@@ -230,6 +259,8 @@ export const resolveCampaignPublishingChannels = async (
       CampaignChannel.findByIdAndUpdate(channel._id, {
         socialAccountId: channel.isVerified ? channel.socialAccountId : null,
         status: channel.status,
+        assignedHandlerEmail: channel.assignedHandlerEmail || '',
+        assignedHandlerUserId: channel.isVerified ? (channel.verifiedByUserId || channel.assignedHandlerUserId || null) : (channel.assignedHandlerUserId || null),
         verifiedAt: channel.isVerified ? channel.verifiedAt : null,
         verifiedByUserId: channel.isVerified ? channel.verifiedByUserId : null,
       })
@@ -241,6 +272,8 @@ export const resolveCampaignPublishingChannels = async (
         handle: channel.requestedHandle,
         displayName: channel.displayName,
         socialAccountId: channel.isVerified ? channel.socialAccountId : null,
+        assignedHandlerEmail: channel.assignedHandlerEmail || '',
+        assignedHandlerUserId: channel.assignedHandlerUserId || null,
         addedAt: channel.addedAt || new Date(),
       })),
       accountIds: validAccountIds,
@@ -279,6 +312,10 @@ export const linkSocialAccountToCampaignChannels = async (campaignId, accountPay
     channel.status = accountPayload.isConnected === false ? 'disconnected' : 'verified';
     channel.verifiedAt = channel.status === 'verified' ? new Date() : null;
     channel.verifiedByUserId = channel.status === 'verified' ? accountPayload.userId : null;
+    if (channel.status === 'verified') {
+      channel.assignedHandlerUserId = accountPayload.userId || null;
+      channel.assignedHandlerEmail = accountPayload.userEmail || channel.assignedHandlerEmail || '';
+    }
     await channel.save();
   }
 

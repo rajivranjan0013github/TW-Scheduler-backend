@@ -211,7 +211,7 @@ router.get('/folders', protect, async (req, res) => {
 // @route   POST /api/media/folders
 // @access  Private (Owner, Admin, Editor)
 router.post('/folders', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
-  const { name, parentFolderId, kind, carouselCaption, carouselOrder } = req.body;
+  const { name, parentFolderId, kind, carouselCaption, carouselOrder, tags } = req.body;
 
   try {
     const isConnected = getDBStatus();
@@ -223,6 +223,7 @@ router.post('/folders', protect, authorize('owner', 'admin', 'editor'), async (r
         kind: kind === 'carousel_set' ? 'carousel_set' : 'folder',
         carouselCaption: carouselCaption || '',
         carouselOrder: Array.isArray(carouselOrder) ? carouselOrder : [],
+        tags: parseTagList(tags),
         createdAt: new Date(),
       };
       mockStore.folders.push(newFolder);
@@ -239,6 +240,7 @@ router.post('/folders', protect, authorize('owner', 'admin', 'editor'), async (r
       kind: kind === 'carousel_set' ? 'carousel_set' : 'folder',
       carouselCaption: carouselCaption || '',
       carouselOrder: Array.isArray(carouselOrder) ? carouselOrder : [],
+      tags: parseTagList(tags),
     });
     res.status(201).json(folder);
   } catch (error) {
@@ -298,14 +300,20 @@ router.put('/folders/:id/carousel', protect, authorize('owner', 'admin', 'editor
   }
 });
 
-// @desc    Rename folder
+// @desc    Update folder metadata
 // @route   PUT /api/media/folders/:id
 // @access  Private (Owner, Admin, Editor)
 router.put('/folders/:id', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
   const { id } = req.params;
-  const nextName = String(req.body?.name || '').trim();
+  const hasName = Object.prototype.hasOwnProperty.call(req.body || {}, 'name');
+  const hasTags = Object.prototype.hasOwnProperty.call(req.body || {}, 'tags');
+  const nextName = hasName ? String(req.body?.name || '').trim() : '';
 
-  if (!nextName) {
+  if (!hasName && !hasTags) {
+    return res.status(400).json({ message: 'No folder updates were provided.' });
+  }
+
+  if (hasName && !nextName) {
     return res.status(400).json({ message: 'Folder name is required.' });
   }
 
@@ -316,16 +324,21 @@ router.put('/folders/:id', protect, authorize('owner', 'admin', 'editor'), async
       if (!folder) {
         return res.status(404).json({ message: 'Folder not found' });
       }
-      folder.name = nextName;
+      if (hasName) folder.name = nextName;
+      if (hasTags) folder.tags = parseTagList(req.body.tags);
       folder.updatedAt = new Date();
       return res.status(200).json(folder);
     }
 
     const campaignId = requireCampaignId(req, res);
     if (!campaignId) return;
+    const updates = {};
+    if (hasName) updates.name = nextName;
+    if (hasTags) updates.tags = parseTagList(req.body.tags);
+
     const folder = await Folder.findOneAndUpdate(
       { _id: id, campaignId },
-      { name: nextName },
+      updates,
       { new: true }
     );
 

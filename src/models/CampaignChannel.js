@@ -45,6 +45,19 @@ const CampaignChannelSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
   },
+  assignedHandlerEmail: {
+    type: String,
+    default: '',
+    trim: true,
+    lowercase: true,
+    index: true,
+  },
+  assignedHandlerUserId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null,
+    index: true,
+  },
   verifiedByUserId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',

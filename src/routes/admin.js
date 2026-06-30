@@ -522,6 +522,8 @@ const enrichChannels = async (channels = []) => {
       handle: ch.handle,
       displayName: ch.displayName || '',
       socialAccountId: matched?._id || ch.socialAccountId || null,
+      assignedHandlerEmail: ch.assignedHandlerEmail || '',
+      assignedHandlerUserId: ch.assignedHandlerUserId || null,
       isVerified: matched ? matched.isConnected !== false : false,
       avatarUrl: matched?.avatarUrl || null,
       addedAt: ch.addedAt,
@@ -1013,6 +1015,7 @@ router.post('/campaigns', protect, authorize('owner', 'admin'), async (req, res)
         platform: ch.platform,
         handle: ch.handle.trim(),
         displayName: ch.displayName?.trim() || '',
+        assignedHandlerEmail: ch.assignedHandlerEmail?.trim?.().toLowerCase?.() || '',
       }));
 
     const campaign = await Campaign.create({

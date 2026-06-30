@@ -69,6 +69,17 @@ const CampaignSchema = new mongoose.Schema({
       ref: 'SocialAccount',
       default: null,
     },
+    assignedHandlerEmail: {
+      type: String,
+      default: '',
+      trim: true,
+      lowercase: true,
+    },
+    assignedHandlerUserId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
     addedAt: {
       type: Date,
       default: Date.now,

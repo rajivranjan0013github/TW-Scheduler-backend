@@ -86,6 +86,15 @@ const canAccessCampaign = async (req, campaignId) => {
 
   if (campaign) return true;
 
+  const assignedChannel = await CampaignChannel.exists({
+    campaignId,
+    $or: [
+      { assignedHandlerUserId: req.user._id },
+      ...(userEmail ? [{ assignedHandlerEmail: userEmail }] : []),
+    ],
+  });
+  if (assignedChannel) return true;
+
   const userAccounts = await SocialAccount.find({ userId: req.user._id, isConnected: true })
     .select('platform username name accountId')
     .lean();
@@ -126,7 +135,7 @@ const getLinkableCampaignId = async (req, campaignId, accountPayload) => {
   return await canAccountVerifyCampaign(campaignId, accountPayload) ? campaignId : undefined;
 };
 
-const linkAccountToCampaign = async (campaignId, socialAccountId, platform, username, name, accountId) => {
+const linkAccountToCampaign = async (campaignId, socialAccountId, platform, username, name, accountId, userId = null, userEmail = '') => {
   if (!campaignId || !socialAccountId) return;
   try {
     await linkSocialAccountToCampaignChannels(campaignId, {
@@ -136,6 +145,8 @@ const linkAccountToCampaign = async (campaignId, socialAccountId, platform, user
       name,
       accountId,
       isConnected: true,
+      userId,
+      userEmail,
     });
   } catch (err) {
     console.error('Failed to link account to campaign:', err.message);
@@ -203,6 +214,7 @@ router.get('/publishing-channels', protect, async (req, res) => {
     }
 
     if (req.user?.userType === 'account_handler') {
+      const handlerEmail = (req.user.email || '').trim().toLowerCase();
       const creatorAccounts = await SocialAccount.find({ userId: req.user._id }).lean();
       const creatorAccountIds = creatorAccounts.map((account) => account._id);
       const creatorAccountsById = new Map(
@@ -215,16 +227,14 @@ router.get('/publishing-channels', protect, async (req, res) => {
         }))
       ));
       const channelConditions = [
+        { assignedHandlerUserId: req.user._id },
+        ...(handlerEmail ? [{ assignedHandlerEmail: handlerEmail }] : []),
         { socialAccountId: { $in: creatorAccountIds } },
         ...accountLookupPairs.map(({ platform, handle }) => ({
           platform,
           normalizedHandle: handle,
         })),
       ];
-
-      if (channelConditions.length === 0) {
-        return res.status(200).json([]);
-      }
 
       const creatorChannels = await CampaignChannel.find({
         campaignId,
@@ -242,9 +252,13 @@ router.get('/publishing-channels', protect, async (req, res) => {
             account.platform === channel.platform &&
             getAccountMatchHandles(account).includes(normalizedHandle)
           ));
-          if (!matchedAcc) return null;
+          const isAssignedToHandler = Boolean(
+            String(channel.assignedHandlerUserId || '') === String(req.user._id)
+            || (handlerEmail && channel.assignedHandlerEmail === handlerEmail)
+          );
+          if (!matchedAcc && !isAssignedToHandler) return null;
 
-          const isVerified = Boolean(matchedAcc.isConnected !== false);
+          const isVerified = Boolean(matchedAcc && matchedAcc.isConnected !== false);
           return {
             _id: channel._id,
             platform: channel.platform,
@@ -253,16 +267,19 @@ router.get('/publishing-channels', protect, async (req, res) => {
             displayName: channel.displayName || '',
             addedAt: channel.createdAt,
             socialAccountId: isVerified ? matchedAcc._id : null,
-            accountId: matchedAcc.accountId || '',
-            name: matchedAcc.name || channel.displayName || channel.requestedHandle,
-            username: matchedAcc.username || normalizedHandle,
-            avatarUrl: matchedAcc.avatarUrl || null,
+            accountId: matchedAcc?.accountId || '',
+            name: matchedAcc?.name || channel.displayName || channel.requestedHandle,
+            username: matchedAcc?.username || normalizedHandle,
+            avatarUrl: matchedAcc?.avatarUrl || null,
             isConnected: isVerified,
             isVerified,
-            status: isVerified ? 'verified' : 'disconnected',
-            userId: matchedAcc.userId,
+            status: isVerified ? 'verified' : isAssignedToHandler ? 'manual_only' : 'disconnected',
+            matchedAccountId: matchedAcc?._id || null,
+            userId: matchedAcc?.userId || channel.assignedHandlerUserId || null,
+            assignedHandlerEmail: channel.assignedHandlerEmail || '',
+            assignedHandlerUserId: channel.assignedHandlerUserId || null,
             campaignId,
-            tokenExpiresAt: matchedAcc.tokenExpiresAt || null,
+            tokenExpiresAt: matchedAcc?.tokenExpiresAt || null,
             verifiedAt: isVerified ? (matchedAcc.updatedAt || matchedAcc.createdAt || null) : null,
             verifiedByUserId: isVerified ? matchedAcc.userId : null,
           };
@@ -635,7 +652,7 @@ router.post('/connect', protect, async (req, res) => {
     }
 
     if (linkableCampaignId) {
-      await linkAccountToCampaign(linkableCampaignId, account._id, platform, username, name, accountId);
+      await linkAccountToCampaign(linkableCampaignId, account._id, platform, username, name, accountId, req.user._id, req.user.email || '');
     }
 
     res.status(201).json(account);
@@ -691,7 +708,7 @@ router.post('/youtube-callback', protect, async (req, res) => {
     );
 
     if (linkableCampaignId) {
-      await linkAccountToCampaign(linkableCampaignId, account._id, 'youtube', account.username, account.name, account.accountId);
+      await linkAccountToCampaign(linkableCampaignId, account._id, 'youtube', account.username, account.name, account.accountId, req.user._id, req.user.email || '');
     }
 
     res.status(200).json({
@@ -877,7 +894,7 @@ router.post('/facebook-callback', protect, async (req, res) => {
       );
       connectedAccounts.push(fbAccount);
       if (linkableCampaignId) {
-        await linkAccountToCampaign(linkableCampaignId, fbAccount._id, 'facebook', fbAccount.username, fbAccount.name, fbAccount.accountId);
+        await linkAccountToCampaign(linkableCampaignId, fbAccount._id, 'facebook', fbAccount.username, fbAccount.name, fbAccount.accountId, req.user._id, req.user.email || '');
       }
 
       // Find linked Instagram Business Account ID
@@ -925,7 +942,7 @@ router.post('/facebook-callback', protect, async (req, res) => {
         );
         connectedAccounts.push(igAccount);
         if (instagramLinkableCampaignId) {
-          await linkAccountToCampaign(instagramLinkableCampaignId, igAccount._id, 'instagram', igAccount.username, igAccount.name, igAccount.accountId);
+          await linkAccountToCampaign(instagramLinkableCampaignId, igAccount._id, 'instagram', igAccount.username, igAccount.name, igAccount.accountId, req.user._id, req.user.email || '');
         }
       }
     }
@@ -1043,7 +1060,7 @@ router.post('/instagram-callback', protect, async (req, res) => {
     );
 
     if (linkableCampaignId) {
-      await linkAccountToCampaign(linkableCampaignId, account._id, 'instagram', account.username, account.name, account.accountId);
+      await linkAccountToCampaign(linkableCampaignId, account._id, 'instagram', account.username, account.name, account.accountId, req.user._id, req.user.email || '');
     }
 
     res.status(200).json({
@@ -1437,11 +1454,8 @@ router.get('/creator/campaigns', protect, async (req, res) => {
     }
 
     // 1. Find social accounts controlled by the logged-in creator
+    const handlerEmail = (req.user.email || '').trim().toLowerCase();
     const creatorAccounts = await SocialAccount.find({ userId: req.user._id }).lean();
-    if (creatorAccounts.length === 0) {
-      return res.status(200).json([]);
-    }
-
     const accountLookupPairs = creatorAccounts.flatMap((account) => (
       getAccountMatchHandles(account).map((handle) => ({
         platform: account.platform,
@@ -1457,16 +1471,14 @@ router.get('/creator/campaigns', protect, async (req, res) => {
     );
 
     const channelConditions = [
+      { assignedHandlerUserId: req.user._id },
+      ...(handlerEmail ? [{ assignedHandlerEmail: handlerEmail }] : []),
       { socialAccountId: { $in: creatorAccountIds } },
       ...accountLookupPairs.map(({ platform, handle }) => ({
         platform,
         normalizedHandle: handle,
       })),
     ];
-
-    if (channelConditions.length === 0) {
-      return res.status(200).json([]);
-    }
 
     const matchedChannelDocs = await CampaignChannel.find({ $or: channelConditions })
       .sort({ createdAt: 1 })
@@ -1503,15 +1515,23 @@ router.get('/creator/campaigns', protect, async (req, res) => {
             account.platform === channel.platform &&
             getAccountMatchHandles(account).includes(normalizedHandle)
           ));
+          const isAssignedToCreator = Boolean(
+            String(channel.assignedHandlerUserId || '') === String(req.user._id)
+            || (handlerEmail && channel.assignedHandlerEmail === handlerEmail)
+          );
           const isControlledByCreator = Boolean(
-            linkedCreatorAccount || (matchedAcc && creatorAccountKeys.has(`${channel.platform}:${normalizedHandle}`))
+            isAssignedToCreator
+            || linkedCreatorAccount
+            || (matchedAcc && creatorAccountKeys.has(`${channel.platform}:${normalizedHandle}`))
           );
           if (!isControlledByCreator) return null;
 
-          const isVerified = Boolean(matchedAcc.isConnected !== false);
+          const isVerified = Boolean(matchedAcc && matchedAcc.isConnected !== false);
           const status = isVerified
             ? 'verified'
-            : matchedAcc._id
+            : isAssignedToCreator
+              ? 'manual_only'
+              : matchedAcc?._id
               ? 'disconnected'
               : 'pending_verification';
 
@@ -1522,18 +1542,20 @@ router.get('/creator/campaigns', protect, async (req, res) => {
             requestedHandle: channel.requestedHandle,
             displayName: channel.displayName || '',
             addedAt: channel.createdAt,
-            accountId: matchedAcc.accountId || '',
-            name: matchedAcc.name || channel.displayName || channel.handle,
-            username: matchedAcc.username || normalizedHandle,
-            avatarUrl: matchedAcc.avatarUrl || null,
+            accountId: matchedAcc?.accountId || '',
+            name: matchedAcc?.name || channel.displayName || channel.handle,
+            username: matchedAcc?.username || normalizedHandle,
+            avatarUrl: matchedAcc?.avatarUrl || null,
             isConnected: isVerified,
             isVerified,
             status,
             socialAccountId: isVerified ? matchedAcc._id : null,
-            matchedAccountId: matchedAcc._id,
-            userId: matchedAcc.userId,
+            matchedAccountId: matchedAcc?._id || null,
+            userId: matchedAcc?.userId || channel.assignedHandlerUserId || null,
+            assignedHandlerEmail: channel.assignedHandlerEmail || '',
+            assignedHandlerUserId: channel.assignedHandlerUserId || null,
             campaignId: campaign._id,
-            tokenExpiresAt: matchedAcc.tokenExpiresAt || null,
+            tokenExpiresAt: matchedAcc?.tokenExpiresAt || null,
             verifiedAt: isVerified ? (matchedAcc.updatedAt || matchedAcc.createdAt || null) : null,
             verifiedByUserId: isVerified ? matchedAcc.userId : null,
           };

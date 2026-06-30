@@ -16,6 +16,10 @@ const ScheduledPostSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'SocialAccount',
   }],
+  campaignChannelIds: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'CampaignChannel',
+  }],
   mediaIds: [{
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Media',

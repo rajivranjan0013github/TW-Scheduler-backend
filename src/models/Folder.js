@@ -36,6 +36,9 @@ const FolderSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Media',
   }],
+  tags: [String],
 }, { timestamps: true });
+
+FolderSchema.index({ campaignId: 1, tags: 1 });
 
 export default mongoose.models.Folder || mongoose.model('Folder', FolderSchema);
