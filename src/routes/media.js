@@ -579,6 +579,16 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
       size: Number(size) || undefined,
     });
 
+    try {
+      const thumbnailFields = await buildThumbnailFromMedia(media);
+      if (thumbnailFields) {
+        Object.assign(media, thumbnailFields);
+        await media.save();
+      }
+    } catch (thumbnailError) {
+      console.error('Direct upload thumbnail generation failed:', thumbnailError.message);
+    }
+
     const populated = await Media.findById(media._id)
       .populate('socialAccountIds', 'name username platform avatarUrl isConnected');
 
