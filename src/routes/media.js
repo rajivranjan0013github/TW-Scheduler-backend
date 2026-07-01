@@ -7,9 +7,8 @@ import Media from '../models/Media.js';
 import CampaignChannel from '../models/CampaignChannel.js';
 import SocialAccount from '../models/SocialAccount.js';
 import { uploadFile, deleteFile, createPresignedUploadUrl, fileExists, getStorageUrl, isR2DirectUploadAvailable } from '../services/r2Service.js';
-import { createAndUploadThumbnail, fetchMediaBuffer } from '../services/thumbnailService.js';
 import { protect, authorize } from '../middleware/auth.js';
-import { getOriginalStorageKey, getThumbnailStorageKey } from '../utils/storageKeys.js';
+import { getOriginalStorageKey } from '../utils/storageKeys.js';
 
 const router = express.Router();
 const ADMIN_ROLES = ['owner', 'admin'];
@@ -85,36 +84,6 @@ const getValidSocialAccountIds = async (accountIds, campaignId) => {
   }).select('socialAccountId');
 
   return channels.map((channel) => channel.socialAccountId);
-};
-
-const thumbnailEligibleTypes = ['image', 'video'];
-
-const buildThumbnailFromUpload = async ({ file, mediaType, storageKey, thumbnailStorageKey }) => {
-  if (!thumbnailEligibleTypes.includes(mediaType)) return {};
-  const thumbnail = await createAndUploadThumbnail({
-    buffer: file.buffer,
-    mediaType,
-    originalName: file.originalname,
-    baseStorageKey: storageKey,
-    thumbnailStorageKey,
-  });
-  return thumbnail || {};
-};
-
-const buildThumbnailFromMedia = async (mediaItem) => {
-  if (!mediaItem?.url || !thumbnailEligibleTypes.includes(mediaItem.type)) return null;
-  const buffer = await fetchMediaBuffer(mediaItem.url);
-  return createAndUploadThumbnail({
-    buffer,
-    mediaType: mediaItem.type,
-    originalName: mediaItem.name,
-    baseStorageKey: mediaItem.storageKey || mediaItem._id,
-    thumbnailStorageKey: getThumbnailStorageKey({
-      userId: mediaItem.userId,
-      folderId: mediaItem.folderId,
-      mediaId: mediaItem._id,
-    }),
-  });
 };
 
 // Multer in-memory storage configuration
@@ -592,16 +561,6 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
       size: Number(size) || undefined,
     });
 
-    try {
-      const thumbnailFields = await buildThumbnailFromMedia(media);
-      if (thumbnailFields) {
-        Object.assign(media, thumbnailFields);
-        await media.save();
-      }
-    } catch (thumbnailError) {
-      console.error('Direct upload thumbnail generation failed:', thumbnailError.message);
-    }
-
     const populated = await Media.findById(media._id)
       .populate('socialAccountIds', 'name username platform avatarUrl isConnected');
 
@@ -650,16 +609,6 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
         originalName: req.file.originalname,
       });
       const { url } = await uploadFile({ ...req.file, storageKey });
-      const thumbnailFields = await buildThumbnailFromUpload({
-        file: req.file,
-        mediaType,
-        storageKey,
-        thumbnailStorageKey: getThumbnailStorageKey({
-          userId: req.user?._id || 'mock-user',
-          folderId: resolvedFolderId,
-          mediaId,
-        }),
-      });
       const newMedia = {
         _id: mediaId,
         folderId: resolvedFolderId,
@@ -667,7 +616,6 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
         type: mediaType,
         url,
         storageKey,
-        ...thumbnailFields,
         caption: caption || '',
         socialAccountIds,
         tags: tagList,
@@ -688,16 +636,6 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
       originalName: req.file.originalname,
     });
     const { url } = await uploadFile({ ...req.file, storageKey });
-    const thumbnailFields = await buildThumbnailFromUpload({
-      file: req.file,
-      mediaType,
-      storageKey,
-      thumbnailStorageKey: getThumbnailStorageKey({
-        userId: req.user._id,
-        folderId: resolvedFolderId,
-        mediaId,
-      }),
-    });
 
     const media = await Media.create({
       _id: mediaId,
@@ -709,7 +647,6 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
       type: mediaType,
       url,
       storageKey,
-      ...thumbnailFields,
       caption: caption || '',
       tags: tagList,
       size: req.file.size,
@@ -864,100 +801,6 @@ router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => 
     }
     await Media.deleteOne({ _id: id, campaignId });
     res.status(200).json({ message: 'Media asset deleted successfully' });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-});
-
-// @desc    Generate missing low-quality thumbnails for existing media
-// @route   POST /api/media/thumbnails/backfill
-// @access  Private (Owner, Admin, Editor)
-router.post('/thumbnails/backfill', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
-  const { folderId, overwrite = false } = req.body;
-
-  try {
-    const isConnected = getDBStatus();
-    const campaignId = requireCampaignId(req, res);
-    if (!campaignId) return;
-    const query = {
-      campaignId,
-      type: { $in: thumbnailEligibleTypes },
-    };
-
-    if (folderId) {
-      query.folderId = folderId === 'root' ? null : folderId;
-    }
-
-    if (!overwrite) {
-      query.$or = [
-        { thumbnailUrl: { $exists: false } },
-        { thumbnailUrl: '' },
-        { thumbnailUrl: null },
-      ];
-    }
-
-    if (!isConnected) {
-      const candidates = mockStore.media.filter((item) => {
-        if (!thumbnailEligibleTypes.includes(item.type)) return false;
-        if (!overwrite && item.thumbnailUrl) return false;
-        if (!folderId) return true;
-        if (folderId === 'root') return !item.folderId;
-        return item.folderId === folderId;
-      });
-
-      const results = [];
-      for (const item of candidates) {
-        try {
-          const thumbnail = await buildThumbnailFromMedia(item);
-          if (thumbnail) {
-            Object.assign(item, thumbnail);
-            results.push({ id: item._id, status: 'generated' });
-          } else {
-            results.push({ id: item._id, status: 'skipped' });
-          }
-        } catch (error) {
-          results.push({ id: item._id, status: 'failed', message: error.message });
-        }
-      }
-
-      return res.status(200).json({
-        matched: candidates.length,
-        generated: results.filter(item => item.status === 'generated').length,
-        failed: results.filter(item => item.status === 'failed').length,
-        results,
-      });
-    }
-
-    const mediaItems = await Media.find(query);
-    const results = [];
-
-    for (const item of mediaItems) {
-      try {
-        if (overwrite && item.thumbnailStorageKey) {
-          await deleteFile(item.thumbnailStorageKey);
-        }
-
-        const thumbnail = await buildThumbnailFromMedia(item);
-        if (thumbnail) {
-          item.thumbnailUrl = thumbnail.thumbnailUrl;
-          item.thumbnailStorageKey = thumbnail.thumbnailStorageKey;
-          item.thumbnailGeneratedAt = thumbnail.thumbnailGeneratedAt;
-          await item.save();
-          results.push({ id: item._id, status: 'generated' });
-        } else {
-          results.push({ id: item._id, status: 'skipped' });
-        }
-      } catch (error) {
-        results.push({ id: item._id, status: 'failed', message: error.message });
-      }
-    }
-
-    res.status(200).json({
-      matched: mediaItems.length,
-      generated: results.filter(item => item.status === 'generated').length,
-      failed: results.filter(item => item.status === 'failed').length,
-      results,
-    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
