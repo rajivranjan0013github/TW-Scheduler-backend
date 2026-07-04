@@ -170,13 +170,6 @@ const verifyPublishedInstagramCarousel = async ({
         });
 
         if (feedResult.ok) {
-          console.log('✅ Instagram carousel publish verified from account media feed:', {
-            accountId: instagramBusinessAccountId,
-            publishedId,
-            childrenCount: feedResult.childrenCount,
-            expectedChildrenCount,
-            permalink: feedLookup.data.permalink,
-          });
           return feedLookup.data;
         }
 
@@ -208,13 +201,6 @@ const verifyPublishedInstagramCarousel = async ({
     const result = assertPublishedCarouselDetails({ data, publishedId, expectedChildrenCount });
 
     if (result.ok) {
-      console.log('✅ Instagram carousel publish verified:', {
-        accountId: instagramBusinessAccountId,
-        publishedId,
-        childrenCount: result.childrenCount,
-        expectedChildrenCount,
-        permalink: data.permalink,
-      });
       return data;
     }
 
@@ -246,13 +232,6 @@ const verifyPublishedInstagramCarousel = async ({
       });
 
       if (feedResult.ok) {
-        console.log('✅ Instagram carousel publish verified from account media feed:', {
-          accountId: instagramBusinessAccountId,
-          publishedId,
-          childrenCount: feedResult.childrenCount,
-          expectedChildrenCount,
-          permalink: feedLookup.data.permalink,
-        });
         return feedLookup.data;
       }
 
@@ -376,8 +355,6 @@ export const publishCarouselToInstagram = async (accessToken, instagramBusinessA
   const baseUrl = `https://${graphHost}/${apiVersion}`;
   const containerUrl = `${baseUrl}/${instagramBusinessAccountId}/media`;
 
-  console.log(`📸 [publishCarouselToInstagram] Starting carousel publishing. Total slides: ${mediaFiles.length}`);
-
   if (!Array.isArray(mediaFiles) || mediaFiles.length < 2) {
     throw new Error('Instagram carousel publishing requires at least two media files.');
   }
@@ -400,8 +377,6 @@ export const publishCarouselToInstagram = async (accessToken, instagramBusinessA
       childParams.append('image_url', media.url);
     }
 
-    console.log(`⏳ [publishCarouselToInstagram] Creating container for Slide ${idx + 1}/${mediaFiles.length}: Name="${media.name}", URL="${media.url}"`);
-
     const childRes = await fetch(containerUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -423,20 +398,14 @@ export const publishCarouselToInstagram = async (accessToken, instagramBusinessA
       throw new Error(message);
     }
 
-    console.log(`✅ [publishCarouselToInstagram] Slide ${idx + 1} container created with ID: ${childData.id}. Polling status...`);
-
     await waitForInstagramContainer({
       baseUrl,
       containerId: childData.id,
       accessToken,
       authProvider,
     });
-    
-    console.log(`🎉 [publishCarouselToInstagram] Slide ${idx + 1} processed successfully.`);
     childContainerIds.push(childData.id);
   }
-
-  console.log(`🔗 [publishCarouselToInstagram] All slides processed. Container IDs:`, childContainerIds);
 
   const carouselParams = new URLSearchParams();
   carouselParams.append('media_type', 'CAROUSEL');
@@ -463,8 +432,6 @@ export const publishCarouselToInstagram = async (accessToken, instagramBusinessA
     });
     throw new Error(message);
   }
-
-  console.log(`✅ [publishCarouselToInstagram] Parent container created with ID: ${carouselData.id}. Polling parent container...`);
 
   await waitForInstagramContainer({
     baseUrl,

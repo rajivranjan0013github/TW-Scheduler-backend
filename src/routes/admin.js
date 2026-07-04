@@ -541,6 +541,27 @@ const serializeCampaign = async (campaign) => {
   };
 };
 
+const serializeCampaignDetail = async (campaign) => {
+  const campaignObject = campaign.toObject ? campaign.toObject() : campaign;
+  const channels = await resolveCampaignPublishingChannels(campaign, { persist: false });
+  return {
+    ...campaignObject,
+    channels,
+  };
+};
+
+const serializeCampaignListItem = (campaign) => {
+  const campaignObject = campaign.toObject ? campaign.toObject() : campaign;
+  return {
+    _id: campaignObject._id,
+    name: campaignObject.name || '',
+    status: campaignObject.status || 'active',
+    mainEmail: campaignObject.mainEmail || '',
+    createdBy: campaignObject.createdBy || null,
+    updatedAt: campaignObject.updatedAt,
+  };
+};
+
 const syncCampaignAccounts = async (req, campaignId, accountIds = []) => {
   const uniqueAccountIds = [...new Set(accountIds.map(toKey).filter(Boolean))];
   const validAccounts = await SocialAccount.find(await getAssignableAccountQuery(req, uniqueAccountIds)).select('_id');
@@ -604,41 +625,6 @@ router.get('/users', protect, authorize('owner', 'admin'), async (req, res) => {
       socialAccountId: { $ne: null },
     }).distinct('socialAccountId');
 
-    const accountUserIds = await SocialAccount.find({
-      $or: [
-        { campaignId: campaignObject._id },
-        { _id: { $in: campaignObject.accountIds || [] } },
-        { _id: { $in: channelSocialAccountIds } },
-      ],
-    }).distinct('userId');
-
-    const [
-      scheduledUserIds,
-      publishedUserIds,
-      mediaUserIds,
-    ] = await Promise.all([
-      ScheduledPost.find({ campaignId: campaignObject._id }).distinct('userId'),
-      PublishedPost.find({ campaignId: campaignObject._id }).distinct('userId'),
-      Media.find({ campaignId: campaignObject._id }).distinct('userId'),
-    ]);
-
-    [
-      ...accountUserIds,
-      ...scheduledUserIds,
-      ...publishedUserIds,
-      ...mediaUserIds,
-    ].forEach((userId) => {
-      if (userId) campaignUserIds.add(toKey(userId));
-    });
-
-    const scopedUserIds = [...campaignUserIds].filter(Boolean);
-    if (scopedUserIds.length === 0) {
-      return res.status(200).json([]);
-    }
-
-    const userMatch = {
-      _id: { $in: scopedUserIds.map((userId) => userId) },
-    };
     const campaignMatch = { campaignId: campaignObject._id };
     const accountMatch = {
       $or: [
@@ -649,28 +635,20 @@ router.get('/users', protect, authorize('owner', 'admin'), async (req, res) => {
     };
 
     const [
-      users,
-      accountCounts,
-      connectedAccountCounts,
       accountPlatformRows,
       scheduledRows,
       publishedCounts,
       mediaRows,
     ] = await Promise.all([
-      User.find(userMatch).sort({ createdAt: -1 }).lean(),
-      SocialAccount.aggregate([
-        { $match: accountMatch },
-        { $group: { _id: '$userId', count: { $sum: 1 } } },
-      ]),
-      SocialAccount.aggregate([
-        { $match: { ...accountMatch, isConnected: true } },
-        { $group: { _id: '$userId', count: { $sum: 1 } } },
-      ]),
       SocialAccount.aggregate([
         { $match: accountMatch },
         {
           $group: {
             _id: '$userId',
+            accounts: { $sum: 1 },
+            connectedAccounts: {
+              $sum: { $cond: [{ $eq: ['$isConnected', true] }, 1, 0] },
+            },
             platforms: { $addToSet: '$platform' },
             tokenExpiresAt: { $min: '$tokenExpiresAt' },
             tokenStatuses: { $addToSet: '$tokenStatus' },
@@ -698,14 +676,17 @@ router.get('/users', protect, authorize('owner', 'admin'), async (req, res) => {
       ]),
     ]);
 
-    const accountCountMap = buildCountMap(accountCounts);
-    const connectedAccountCountMap = buildCountMap(connectedAccountCounts);
     const scheduledStatusMap = buildStatusMap(scheduledRows);
     const publishedCountMap = buildCountMap(publishedCounts);
 
     const platformMap = new Map();
     accountPlatformRows.forEach((row) => {
-      platformMap.set(toKey(row._id), {
+      const userId = toKey(row._id);
+      if (!userId) return;
+      campaignUserIds.add(userId);
+      platformMap.set(userId, {
+        accounts: row.accounts || 0,
+        connectedAccounts: row.connectedAccounts || 0,
         platforms: row.platforms || [],
         tokenExpiresAt: row.tokenExpiresAt || null,
         tokenStatuses: row.tokenStatuses || [],
@@ -713,19 +694,43 @@ router.get('/users', protect, authorize('owner', 'admin'), async (req, res) => {
       });
     });
 
+    scheduledRows.forEach((row) => {
+      const userId = toKey(row._id?.userId);
+      if (userId) campaignUserIds.add(userId);
+    });
+    publishedCounts.forEach((row) => {
+      const userId = toKey(row._id);
+      if (userId) campaignUserIds.add(userId);
+    });
+
     const mediaMap = new Map();
     mediaRows.forEach((row) => {
-      mediaMap.set(toKey(row._id), {
+      const userId = toKey(row._id);
+      if (!userId) return;
+      campaignUserIds.add(userId);
+      mediaMap.set(userId, {
         count: row.count || 0,
         storageBytes: row.storageBytes || 0,
       });
     });
+
+    const scopedUserIds = [...campaignUserIds].filter(Boolean);
+    if (scopedUserIds.length === 0) {
+      return res.status(200).json([]);
+    }
+
+    const users = await User.find({ _id: { $in: scopedUserIds } })
+      .select('name email avatar role userType createdAt')
+      .sort({ createdAt: -1 })
+      .lean();
 
     const payload = users.map((user) => {
       const userId = toKey(user._id);
       const scheduled = scheduledStatusMap.get(userId) || {};
       const media = mediaMap.get(userId) || { count: 0, storageBytes: 0 };
       const accountHealth = platformMap.get(userId) || {
+        accounts: 0,
+        connectedAccounts: 0,
         platforms: [],
         tokenExpiresAt: null,
         tokenStatuses: [],
@@ -736,8 +741,8 @@ router.get('/users', protect, authorize('owner', 'admin'), async (req, res) => {
         ...user,
         campaignRole: campaignOwnerUserIds.has(userId) ? 'owner' : 'account_handler',
         metrics: {
-          accounts: accountCountMap.get(userId) || 0,
-          connectedAccounts: connectedAccountCountMap.get(userId) || 0,
+          accounts: accountHealth.accounts || 0,
+          connectedAccounts: accountHealth.connectedAccounts || 0,
           scheduledPosts: scheduled.scheduled || 0,
           publishingPosts: scheduled.publishing || 0,
           publishedScheduledPosts: scheduled.published || 0,
@@ -746,7 +751,12 @@ router.get('/users', protect, authorize('owner', 'admin'), async (req, res) => {
           media: media.count,
           storageBytes: media.storageBytes,
         },
-        accountHealth,
+        accountHealth: {
+          platforms: accountHealth.platforms || [],
+          tokenExpiresAt: accountHealth.tokenExpiresAt || null,
+          tokenStatuses: accountHealth.tokenStatuses || [],
+          tokenRefreshErrors: accountHealth.tokenRefreshErrors || [],
+        },
       };
     });
 
@@ -959,9 +969,74 @@ router.get('/social-accounts', protect, authorize('owner', 'admin'), async (req,
   }
 });
 
-// @desc    List campaigns with metrics
-// @route   GET /api/admin/campaigns
+// @desc    List campaigns without metric/detail payloads
+// @route   GET /api/admin/campaigns/list
 // @access  Private (Owner, Admin)
+router.get('/campaigns/list', protect, authorize('owner', 'admin'), async (req, res) => {
+  try {
+    if (!getDBStatus()) {
+      return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
+    }
+
+    const campaigns = await Campaign.find(getCampaignAccessQuery(req, { forceWorkspaceScope: req.query.scope === 'workspace' }))
+      .select('name status mainEmail createdBy updatedAt')
+      .populate('createdBy', 'name email')
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    res.status(200).json(campaigns.map(serializeCampaignListItem));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+router.get('/campaigns/:id/metrics', protect, authorize('owner', 'admin'), async (req, res) => {
+  try {
+    if (!getDBStatus()) {
+      return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
+    }
+
+    const campaign = await findAccessibleCampaign(req, req.params.id);
+    if (!campaign) {
+      return res.status(404).json({ message: 'Campaign not found.' });
+    }
+
+    const campaignObject = campaign.toObject ? campaign.toObject() : campaign;
+    const metrics = await getCampaignMetrics(campaignObject);
+
+    res.status(200).json({
+      _id: campaignObject._id,
+      metrics,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+router.get('/campaigns/:id', protect, authorize('owner', 'admin'), async (req, res) => {
+  try {
+    if (!getDBStatus()) {
+      return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
+    }
+
+    const campaign = await findAccessibleCampaign(req, req.params.id)
+      .populate({
+        path: 'accountIds',
+        select: 'name username platform avatarUrl isConnected tokenExpiresAt userId',
+        populate: { path: 'userId', select: 'name email' },
+      })
+      .populate('createdBy', 'name email');
+
+    if (!campaign) {
+      return res.status(404).json({ message: 'Campaign not found.' });
+    }
+
+    res.status(200).json(await serializeCampaignDetail(campaign));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 router.get('/campaigns', protect, authorize('owner', 'admin'), async (req, res) => {
   try {
     if (!getDBStatus()) {

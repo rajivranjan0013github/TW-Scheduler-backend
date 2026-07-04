@@ -156,16 +156,6 @@ const main = async () => {
     results.push(await splitPost(post));
   }
 
-  console.log(JSON.stringify({
-    dryRun,
-    statuses,
-    matched: posts.length,
-    split: results.filter((item) => item.status === 'split').length,
-    normalized: results.filter((item) => item.status === 'normalized').length,
-    queuedSplitJobs: results.reduce((total, item) => total + (item.queuedSplitJobs?.length || 0), 0),
-    samples: results.slice(0, 10),
-  }, null, 2));
-
   if (publishQueue) await publishQueue.close();
   const connection = getRedisConnection() || redisConnection;
   if (connection) await connection.quit();

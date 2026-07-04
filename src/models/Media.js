@@ -62,5 +62,6 @@ const MediaSchema = new mongoose.Schema({
 
 MediaSchema.index({ campaignId: 1, folderId: 1, createdAt: -1 });
 MediaSchema.index({ campaignId: 1, socialAccountIds: 1, createdAt: -1 });
+MediaSchema.index({ campaignId: 1, userId: 1 });
 
 export default mongoose.models.Media || mongoose.model('Media', MediaSchema);

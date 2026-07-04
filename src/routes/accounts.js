@@ -10,9 +10,11 @@ import { protect, authorize } from '../middleware/auth.js';
 import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount, fetchYoutubeVideos } from '../services/youtubeService.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
 import {
+  fetchFacebookPostCommentsCount,
   fetchFacebookPostInsightValue,
   fetchFacebookPostViews,
 } from '../services/facebookMetricsService.js';
+import { storeRemoteSocialAccountAvatar } from '../services/avatarStorageService.js';
 import {
   canAccountVerifyCampaign,
   linkSocialAccountToCampaignChannels,
@@ -626,11 +628,17 @@ router.post('/connect', protect, async (req, res) => {
       name,
       username,
     });
+    const storedAvatarUrl = await storeRemoteSocialAccountAvatar({
+      platform,
+      accountId,
+      avatarUrl,
+    });
 
     let account = await SocialAccount.findOne({ userId: req.user._id, accountId });
     if (account) {
       account.isConnected = true;
       account.accessToken = accessToken || 'mock-access-token';
+      if (storedAvatarUrl) account.avatarUrl = storedAvatarUrl;
       account.campaignId = linkableCampaignId || undefined;
       account.tokenStatus = 'healthy';
       account.tokenRefreshError = '';
@@ -645,7 +653,7 @@ router.post('/connect', protect, async (req, res) => {
         name,
         username,
         accessToken: accessToken || 'mock-access-token',
-        avatarUrl,
+        avatarUrl: storedAvatarUrl,
         tokenStatus: 'healthy',
         tokenLastCheckedAt: new Date(),
       });
@@ -864,6 +872,11 @@ router.post('/facebook-callback', protect, async (req, res) => {
 
       // Get page avatar from metadata or fallback
       const pagePicUrl = `https://graph.facebook.com/v20.0/${pageId}/picture?type=normal&access_token=${pageAccessToken}`;
+      const pageAvatarUrl = await storeRemoteSocialAccountAvatar({
+        platform: 'facebook',
+        accountId: pageId,
+        avatarUrl: pagePicUrl,
+      });
 
       
       const linkableCampaignId = await getLinkableCampaignId(req, campaignId, {
@@ -884,7 +897,7 @@ router.post('/facebook-callback', protect, async (req, res) => {
           username: pageUsername,
           accessToken: pageAccessToken,
           authProvider: 'facebook',
-          avatarUrl: pagePicUrl,
+          avatarUrl: pageAvatarUrl,
           isConnected: true,
           tokenStatus: 'healthy',
           tokenRefreshError: '',
@@ -913,6 +926,11 @@ router.post('/facebook-callback', protect, async (req, res) => {
         const igName = igDetailData.name || 'Instagram Account';
         const igUsername = igDetailData.username || 'instagram_account';
         const igAvatarUrl = igDetailData.profile_picture_url || 'https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?w=150';
+        const storedIgAvatarUrl = await storeRemoteSocialAccountAvatar({
+          platform: 'instagram',
+          accountId: igAccountId,
+          avatarUrl: igAvatarUrl,
+        });
 
         const instagramLinkableCampaignId = await getLinkableCampaignId(req, campaignId, {
           platform: 'instagram',
@@ -932,7 +950,7 @@ router.post('/facebook-callback', protect, async (req, res) => {
             username: igUsername,
             accessToken: pageAccessToken, // Instagram operations use page tokens or long-lived user tokens
             authProvider: 'facebook',
-            avatarUrl: igAvatarUrl,
+            avatarUrl: storedIgAvatarUrl,
             isConnected: true,
             tokenStatus: 'healthy',
             tokenRefreshError: '',
@@ -1028,6 +1046,12 @@ router.post('/instagram-callback', protect, async (req, res) => {
       return res.status(400).json({ message: 'Instagram did not return an account ID.' });
     }
 
+    const avatarUrl = await storeRemoteSocialAccountAvatar({
+      platform: 'instagram',
+      accountId: instagramAccountId,
+      avatarUrl: profileData.profile_picture_url || 'https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?w=150',
+    });
+
     const linkableCampaignId = await getLinkableCampaignId(req, campaignId, {
       platform: 'instagram',
       accountId: instagramAccountId,
@@ -1050,7 +1074,7 @@ router.post('/instagram-callback', protect, async (req, res) => {
         accessToken: longLivedToken,
         authProvider: 'instagram',
         tokenExpiresAt,
-        avatarUrl: profileData.profile_picture_url || 'https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?w=150',
+        avatarUrl,
         isConnected: true,
         tokenStatus: 'healthy',
         tokenRefreshError: '',
@@ -1155,8 +1179,11 @@ router.get('/:id/posts', protect, async (req, res) => {
         .limit(25);
 
       if (cachedPosts.length > 0) {
-        const mostRecentSync = cachedPosts[0].lastSyncedAt;
-        const isFresh = mostRecentSync && (Date.now() - new Date(mostRecentSync).getTime()) < TWO_HOURS_MS;
+        const syncTimes = cachedPosts
+          .map((post) => post.lastSyncedAt ? new Date(post.lastSyncedAt).getTime() : null)
+          .filter((time) => Number.isFinite(time));
+        const oldestReturnedSync = syncTimes.length > 0 ? Math.min(...syncTimes) : null;
+        const isFresh = oldestReturnedSync && (Date.now() - oldestReturnedSync) < TWO_HOURS_MS;
 
         if (isFresh) {
           // Return cached data directly
@@ -1200,13 +1227,13 @@ router.get('/:id/posts', protect, async (req, res) => {
 
         if (!insightRes.ok) {
           console.warn(`Meta insight "${metric}" failed for post ${postId}:`, insightData.error?.message || 'Unknown error');
-          return 0;
+          return null;
         }
 
-        return insightData.data?.[0]?.values?.[0]?.value || 0;
+        return insightData.data?.[0]?.values?.[0]?.value ?? null;
       } catch (error) {
         console.warn(`Meta insight "${metric}" failed for post ${postId}:`, error.message);
-        return 0;
+        return null;
       }
     };
 
@@ -1234,6 +1261,13 @@ router.get('/:id/posts', protect, async (req, res) => {
       }
     };
 
+    const existingPostMap = new Map(
+      (cachedPosts.length > 0
+        ? cachedPosts
+        : await PublishedPost.find({ accountId: account._id }).select('metaPostId latestViews latestLikes latestComments').lean()
+      ).map((post) => [post.metaPostId, post])
+    );
+
     // Call actual Meta APIs
     let posts = [];
     if (liveAccount.platform === 'facebook') {
@@ -1243,15 +1277,19 @@ router.get('/:id/posts', protect, async (req, res) => {
       
       if (apiRes.ok) {
         posts = await Promise.all((apiData.data || []).map(async (post) => {
-          const [viewResult, likes, commentsPreview] = await Promise.all([
+          const existingPost = existingPostMap.get(post.id);
+          const [viewResult, likes, commentsCount, commentsPreview] = await Promise.all([
             fetchFacebookPostViews(liveAccount.accessToken, post),
             fetchFacebookPostInsightValue(liveAccount.accessToken, post.id, 'post_reactions_like_total').catch((error) => {
               console.warn(`Meta insight "post_reactions_like_total" failed for post ${post.id}:`, error.message);
-              return 0;
+              return null;
             }),
+            fetchFacebookPostCommentsCount(liveAccount.accessToken, post.id),
             getCommentsPreview(post.id),
           ]);
           const facebookVideoId = viewResult.videoId || '';
+          const hasFreshViews = viewResult.source !== 'unavailable';
+          const hasFreshLikes = likes !== null;
 
           return {
             id: post.id,
@@ -1262,9 +1300,12 @@ router.get('/:id/posts', protect, async (req, res) => {
             mediaType: facebookVideoId ? 'VIDEO' : (post.full_picture ? 'IMAGE' : ''),
             facebookVideoId,
             viewsSource: viewResult.source,
-            views: Number(viewResult.views) || 0,
-            likes: Number(likes) || 0,
-            comments: 0,
+            views: hasFreshViews ? Number(viewResult.views) || 0 : Number(existingPost?.latestViews || 0),
+            likes: hasFreshLikes ? Number(likes) || 0 : Number(existingPost?.latestLikes || 0),
+            comments: commentsCount ?? existingPost?.latestComments ?? 0,
+            hasFreshViews,
+            hasFreshLikes,
+            hasFreshCommentsCount: commentsCount !== null,
             commentsPreview,
           };
         }));
@@ -1287,12 +1328,16 @@ router.get('/:id/posts', protect, async (req, res) => {
 
       if (apiRes.ok) {
         posts = await Promise.all((apiData.data || []).map(async (post) => {
+          const existingPost = existingPostMap.get(post.id);
           const [views, insightLikes, insightComments, commentsPreview] = await Promise.all([
             getInsightValue(post.id, 'views'),
             getInsightValue(post.id, 'likes'),
             getInsightValue(post.id, 'comments'),
             getCommentsPreview(post.id),
           ]);
+          const hasFreshViews = views !== null;
+          const hasFreshLikes = insightLikes !== null || post.like_count !== undefined;
+          const hasFreshCommentsCount = insightComments !== null || post.comments_count !== undefined;
 
           return {
             id: post.id,
@@ -1302,9 +1347,12 @@ router.get('/:id/posts', protect, async (req, res) => {
             mediaUrl: post.thumbnail_url || post.media_url || '',
             videoUrl: post.media_type === 'VIDEO' ? post.media_url : '',
             mediaType: post.media_type,
-            views: Number(views) || 0,
-            likes: Number(insightLikes || post.like_count) || 0,
-            comments: Number(insightComments || post.comments_count) || 0,
+            views: hasFreshViews ? Number(views) || 0 : Number(existingPost?.latestViews || 0),
+            likes: hasFreshLikes ? Number(insightLikes ?? post.like_count) || 0 : Number(existingPost?.latestLikes || 0),
+            comments: hasFreshCommentsCount ? Number(insightComments ?? post.comments_count) || 0 : Number(existingPost?.latestComments || 0),
+            hasFreshViews,
+            hasFreshLikes,
+            hasFreshCommentsCount,
             commentsPreview,
           };
         }));
@@ -1320,6 +1368,8 @@ router.get('/:id/posts', protect, async (req, res) => {
     }
 
     // Upsert fetched posts into PublishedPost cache
+    const syncTime = new Date();
+
     for (const post of posts) {
       try {
         await PublishedPost.findOneAndUpdate(
@@ -1338,10 +1388,10 @@ router.get('/:id/posts', protect, async (req, res) => {
             viewsSource: post.viewsSource || '',
             permalink: post.permalink,
             publishedAt: new Date(post.createdAt),
-            lastSyncedAt: new Date(),
-            latestViews: post.views,
-            latestLikes: post.likes,
-            latestComments: post.comments,
+            lastSyncedAt: syncTime,
+            ...(post.hasFreshViews !== false && { latestViews: post.views }),
+            ...(post.hasFreshLikes !== false && { latestLikes: post.likes }),
+            ...(post.hasFreshCommentsCount !== false && post.comments !== undefined && { latestComments: post.comments }),
             commentsPreview: post.commentsPreview || [],
           },
           { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
@@ -1356,7 +1406,7 @@ router.get('/:id/posts', protect, async (req, res) => {
     // Add lastSyncedAt to each post in the response
     const result = posts.map(post => ({
       ...post,
-      lastSyncedAt: new Date(),
+      lastSyncedAt: syncTime,
       commentsPreview: serializeCommentsPreview(post.commentsPreview || []),
     }));
 

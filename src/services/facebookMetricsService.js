@@ -103,6 +103,20 @@ export const fetchFacebookPostInsightValue = async (accessToken, postId, metric)
   return getInsightValue(data);
 };
 
+export const fetchFacebookPostCommentsCount = async (accessToken, postId) => {
+  if (!postId) return null;
+
+  try {
+    const data = await fetchGraphJson(postId, accessToken, {
+      fields: 'comments.summary(true).limit(0)',
+    });
+    return toNumber(data?.comments?.summary?.total_count);
+  } catch (error) {
+    console.warn(`Facebook comments count failed for post ${postId}:`, error.message);
+    return null;
+  }
+};
+
 export const fetchFacebookPostViews = async (accessToken, post) => {
   const postId = typeof post === 'string' ? post : post?.id || post?.metaPostId;
   let zeroVideoResult = null;

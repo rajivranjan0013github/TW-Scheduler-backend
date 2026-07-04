@@ -35,10 +35,65 @@ const requireCampaignId = (req, res) => {
 const idsToStrings = (items = []) => items.map((item) => String(item?._id || item));
 const validScheduleModes = new Set(['auto', 'manual', 'hybrid']);
 const terminalManualStatuses = new Set(['posted_manual', 'published', 'published_auto', 'cancelled']);
+const dashboardUpcomingStatuses = ['scheduled', 'publishing'];
 
 const normalizeScheduleMode = (mode) => (
   validScheduleModes.has(mode) ? mode : 'auto'
 );
+const getScheduleRangeQuery = (query = {}) => {
+  const range = {};
+  const from = query.from ? new Date(query.from) : null;
+  const to = query.to ? new Date(query.to) : null;
+
+  if (from && !Number.isNaN(from.getTime())) {
+    if (!String(query.from).includes('T')) {
+      from.setHours(0, 0, 0, 0);
+    }
+    range.$gte = from;
+  }
+
+  if (to && !Number.isNaN(to.getTime())) {
+    if (!String(query.to).includes('T')) {
+      to.setHours(23, 59, 59, 999);
+    }
+    range.$lte = to;
+  }
+
+  return Object.keys(range).length > 0 ? { scheduledAt: range } : {};
+};
+const splitQueryList = (value) => String(value || '')
+  .split(',')
+  .map((item) => item.trim())
+  .filter(Boolean);
+
+const getSchedulerPostListQuery = (campaignId, query = {}) => {
+  const accountIds = splitQueryList(query.accountIds);
+  const statuses = splitQueryList(query.statuses);
+  const filters = {
+    campaignId,
+    ...getScheduleRangeQuery(query),
+  };
+
+  if (statuses.length > 0) {
+    filters.status = { $in: statuses };
+  }
+
+  if (accountIds.length > 0) {
+    filters.$or = [
+      { socialAccountIds: { $in: accountIds } },
+      { campaignChannelIds: { $in: accountIds } },
+    ];
+  }
+
+  return filters;
+};
+const populateSchedulerPostList = (query) => query
+  .select('campaignId socialAccountIds campaignChannelIds mediaIds caption scheduledAt scheduleMode status publishSource manualDownloadedAt manualPostedAt manualPostUrl publishError platformSpecifics createdAt updatedAt')
+  .populate({ path: 'socialAccountIds', select: 'username name platform avatarUrl isConnected tokenStatus' })
+  .populate({ path: 'campaignChannelIds', select: 'requestedHandle normalizedHandle displayName platform status socialAccountId assignedHandlerEmail assignedHandlerUserId' })
+  .populate({ path: 'mediaIds', select: 'name type url folderId caption' })
+  .sort({ scheduledAt: 1 })
+  .lean();
 
 const getInitialStatusForMode = (mode) => (
   mode === 'manual' ? 'manual_ready' : 'scheduled'
@@ -52,7 +107,7 @@ const getUniqueIds = (items = []) => (
   [...new Set(idsToStrings(items).filter(Boolean))]
 );
 
-const activeQueueStatuses = ['scheduled', 'manual_ready', 'downloaded', 'publishing'];
+const activeQueueStatuses = ['scheduled', 'manual_ready', 'downloaded', 'publishing', 'paused'];
 
 const canAccessManualPost = async (post, user) => {
   if (!post || !user) return false;
@@ -217,22 +272,71 @@ const validateSchedulingAccess = async ({ campaignId, socialAccountIds, campaign
 // @desc    Get all scheduled and published posts
 // @route   GET /api/scheduler
 // @access  Private
+router.get('/dashboard-summary', protect, async (req, res) => {
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      const accountIds = new Set(String(req.query.accountIds || '').split(',').filter(Boolean));
+      const upcoming = mockStore.scheduledPosts
+        .filter((post) => dashboardUpcomingStatuses.includes(post.status))
+        .filter((post) => (
+          accountIds.size === 0
+          || (post.socialAccountIds || []).some((accountId) => accountIds.has(String(accountId?._id || accountId)))
+        ))
+        .sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt));
+      return res.status(200).json({
+        upcomingCount: upcoming.length,
+        upcomingPosts: upcoming.slice(0, 3),
+      });
+    }
+
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+    const accountIds = String(req.query.accountIds || '')
+      .split(',')
+      .map((id) => id.trim())
+      .filter(Boolean);
+    const query = {
+      campaignId,
+      status: { $in: dashboardUpcomingStatuses },
+    };
+    if (accountIds.length > 0) {
+      query.socialAccountIds = { $in: accountIds };
+    }
+
+    const [upcomingCount, upcomingPosts] = await Promise.all([
+      ScheduledPost.countDocuments(query),
+      populateSchedulerPostList(ScheduledPost.find(query).limit(3)),
+    ]);
+
+    res.status(200).json({ upcomingCount, upcomingPosts });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 router.get('/', protect, async (req, res) => {
   try {
     const isConnected = getDBStatus();
     if (!isConnected) {
       // Sort in-memory posts by date
-      const sorted = [...mockStore.scheduledPosts].sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt));
+      const rangeQuery = getScheduleRangeQuery(req.query);
+      const sorted = [...mockStore.scheduledPosts]
+        .filter((post) => {
+          const scheduledAt = new Date(post.scheduledAt);
+          if (rangeQuery.scheduledAt?.$gte && scheduledAt < rangeQuery.scheduledAt.$gte) return false;
+          if (rangeQuery.scheduledAt?.$lte && scheduledAt > rangeQuery.scheduledAt.$lte) return false;
+          return true;
+        })
+        .sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt));
       return res.status(200).json(sorted);
     }
 
     const campaignId = requireCampaignId(req, res);
     if (!campaignId) return;
-    const posts = await ScheduledPost.find({ campaignId })
-      .populate('socialAccountIds')
-      .populate('campaignChannelIds')
-      .populate('mediaIds')
-      .sort({ scheduledAt: 1 });
+    const posts = await populateSchedulerPostList(
+      ScheduledPost.find(getSchedulerPostListQuery(campaignId, req.query))
+    );
     
     res.status(200).json(posts);
   } catch (error) {

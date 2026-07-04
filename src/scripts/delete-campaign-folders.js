@@ -30,7 +30,6 @@ const r2Client = new S3Client({
 
 async function main() {
   await mongoose.connect(MONGODB_URI);
-  console.log("Connected to MongoDB.");
 
   const foldersToDelete = [
     { name: 'mintu', id: '6a3f5ff7c32abcb0cd69b6e3' },
@@ -39,13 +38,8 @@ async function main() {
   ];
 
   for (const folder of foldersToDelete) {
-    console.log(`\n--------------------------------------------------`);
-    console.log(`Processing folder: "${folder.name}" (ID: ${folder.id})`);
-    console.log(`--------------------------------------------------`);
-
     // 1. Find all media documents in the DB for this folder
     const medias = await Media.find({ folderId: new mongoose.Types.ObjectId(folder.id) });
-    console.log(`Found ${medias.length} media records in DB for this folder.`);
 
     if (medias.length > 0) {
       // Gather all keys (original & thumbnail keys if exists)
@@ -56,7 +50,6 @@ async function main() {
       });
 
       if (keysToDelete.length > 0) {
-        console.log(`Deleting ${keysToDelete.length} objects from Cloudflare R2...`);
         // Chunk R2 deletion in blocks of 1000 (S3 API limit)
         for (let i = 0; i < keysToDelete.length; i += 1000) {
           const chunk = keysToDelete.slice(i, i + 1000);
@@ -65,7 +58,6 @@ async function main() {
               Bucket: bucketName,
               Delete: { Objects: chunk }
             }));
-            console.log(`  Successfully deleted batch ${Math.floor(i / 1000) + 1} from R2.`);
           } catch (err) {
             console.error(`  Error deleting batch from R2:`, err.message);
           }
@@ -74,7 +66,6 @@ async function main() {
 
       // 2. Delete media records from DB
       const mediaDeleteResult = await Media.deleteMany({ folderId: new mongoose.Types.ObjectId(folder.id) });
-      console.log(`Deleted ${mediaDeleteResult.deletedCount} media records from DB.`);
     }
 
     // 3. Prefix search safety clean (matches "users/<userId>/folders/<folderId>/")
@@ -88,7 +79,6 @@ async function main() {
     
     if (userId) {
       const prefix = `users/${userId}/folders/${folder.id}/`;
-      console.log(`Scanning R2 prefix to clean up any orphaned objects: ${prefix}`);
       try {
         const listResult = await r2Client.send(new ListObjectsV2Command({
           Bucket: bucketName,
@@ -97,14 +87,10 @@ async function main() {
         
         if (listResult.Contents && listResult.Contents.length > 0) {
           const r2OrphanedKeys = listResult.Contents.map(obj => ({ Key: obj.Key }));
-          console.log(`Found ${r2OrphanedKeys.length} additional objects under prefix in R2. Deleting...`);
           await r2Client.send(new DeleteObjectsCommand({
             Bucket: bucketName,
             Delete: { Objects: r2OrphanedKeys }
           }));
-          console.log(`  Orphaned objects deleted.`);
-        } else {
-          console.log(`  No orphaned objects found under prefix.`);
         }
       } catch (err) {
         console.error(`  Failed to scan R2 prefix:`, err.message);
@@ -113,11 +99,9 @@ async function main() {
 
     // 4. Delete the folder document from DB
     const folderDeleteResult = await Folder.deleteOne({ _id: new mongoose.Types.ObjectId(folder.id) });
-    console.log(`Deleted folder document from DB (Count: ${folderDeleteResult.deletedCount}).`);
   }
 
   await mongoose.disconnect();
-  console.log("\nCleanup finished successfully!");
 }
 
 main().catch(console.error);

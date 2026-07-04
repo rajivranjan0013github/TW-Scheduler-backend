@@ -12,7 +12,7 @@ import PostInsight from '../models/PostInsight.js';
 import { sendBatchRequests } from '../services/metaBatchService.js';
 import { getDBStatus } from '../config/db.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
-import { fetchFacebookPostInsightValue, fetchFacebookPostViews } from '../services/facebookMetricsService.js';
+import { fetchFacebookPostCommentsCount, fetchFacebookPostInsightValue, fetchFacebookPostViews } from '../services/facebookMetricsService.js';
 
 /**
  * Extracts metric values from a Meta insights API response body.
@@ -105,15 +105,16 @@ export const runInsightSync = async () => {
         if (freshAccount.platform === 'facebook') {
           for (const post of accountPosts) {
             try {
-              const [viewResult, likes] = await Promise.all([
+              const [viewResult, likes, commentsCount] = await Promise.all([
                 fetchFacebookPostViews(freshAccount.accessToken, post),
                 fetchFacebookPostInsightValue(freshAccount.accessToken, post.metaPostId, 'post_reactions_like_total').catch(() => 0),
+                fetchFacebookPostCommentsCount(freshAccount.accessToken, post.metaPostId),
               ]);
 
               const metrics = {
                 views: Number(viewResult.views) || 0,
                 likes: Number(likes) || 0,
-                comments: 0,
+                comments: commentsCount ?? Number(post.latestComments || 0),
               };
 
               await PostInsight.findOneAndUpdate(
@@ -135,7 +136,7 @@ export const runInsightSync = async () => {
                 {
                   latestViews: metrics.views,
                   latestLikes: metrics.likes,
-                  latestComments: metrics.comments,
+                  ...(commentsCount !== null && { latestComments: metrics.comments }),
                   facebookVideoId: viewResult.videoId || post.facebookVideoId || '',
                   viewsSource: viewResult.source,
                 }

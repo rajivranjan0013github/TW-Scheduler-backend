@@ -47,6 +47,7 @@ const ScheduledPostSchema = new mongoose.Schema({
       'downloaded',
       'posted_manual',
       'publishing',
+      'paused',
       'published',
       'published_auto',
       'failed',
@@ -91,5 +92,8 @@ const ScheduledPostSchema = new mongoose.Schema({
 ScheduledPostSchema.index({ campaignId: 1, scheduledAt: 1 });
 ScheduledPostSchema.index({ socialAccountIds: 1, scheduledAt: 1 });
 ScheduledPostSchema.index({ status: 1, scheduleMode: 1, scheduledAt: 1 });
+ScheduledPostSchema.index({ campaignId: 1, status: 1, scheduledAt: 1 });
+ScheduledPostSchema.index({ campaignId: 1, socialAccountIds: 1, status: 1, scheduledAt: 1 });
+ScheduledPostSchema.index({ campaignId: 1, userId: 1, status: 1 });
 
 export default mongoose.models.ScheduledPost || mongoose.model('ScheduledPost', ScheduledPostSchema);

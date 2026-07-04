@@ -99,5 +99,6 @@ PublishedPostSchema.index({ userId: 1, metaPostId: 1 }, { unique: true });
 PublishedPostSchema.index({ accountId: 1, publishedAt: -1 });
 PublishedPostSchema.index({ campaignId: 1, publishedAt: -1 });
 PublishedPostSchema.index({ userId: 1, publishedAt: -1 });
+PublishedPostSchema.index({ campaignId: 1, userId: 1 });
 
 export default mongoose.models.PublishedPost || mongoose.model('PublishedPost', PublishedPostSchema);

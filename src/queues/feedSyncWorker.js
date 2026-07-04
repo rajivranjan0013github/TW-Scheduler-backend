@@ -12,7 +12,7 @@ import PublishedPost from '../models/PublishedPost.js';
 import { getDBStatus } from '../config/db.js';
 import { fetchYoutubeVideos } from '../services/youtubeService.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
-import { fetchFacebookPostViews } from '../services/facebookMetricsService.js';
+import { fetchFacebookPostCommentsCount, fetchFacebookPostViews } from '../services/facebookMetricsService.js';
 
 /**
  * Fetches the latest published posts from a Facebook Page via Meta Graph API.
@@ -29,7 +29,10 @@ const fetchFacebookPosts = async (account) => {
   }
 
   return Promise.all((data.data || []).map(async (post) => {
-    const viewResult = await fetchFacebookPostViews(account.accessToken, post);
+    const [viewResult, commentsCount] = await Promise.all([
+      fetchFacebookPostViews(account.accessToken, post),
+      fetchFacebookPostCommentsCount(account.accessToken, post.id),
+    ]);
     const facebookVideoId = viewResult.videoId || '';
 
     return {
@@ -44,6 +47,7 @@ const fetchFacebookPosts = async (account) => {
       permalink: post.permalink_url || `https://facebook.com/${post.id}`,
       publishedAt: new Date(post.created_time),
       latestViews: viewResult.views,
+      ...(commentsCount !== null && { latestComments: commentsCount }),
     };
   }));
 };

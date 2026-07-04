@@ -71,5 +71,6 @@ const SocialAccountSchema = new mongoose.Schema({
 
 // Same platform account can be connected by different users, but not duplicated for the same user
 SocialAccountSchema.index({ userId: 1, accountId: 1 }, { unique: true });
+SocialAccountSchema.index({ campaignId: 1, userId: 1, isConnected: 1 });
 
 export default mongoose.models.SocialAccount || mongoose.model('SocialAccount', SocialAccountSchema);

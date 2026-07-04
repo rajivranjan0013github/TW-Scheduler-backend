@@ -42,6 +42,15 @@ export const getUserAvatarStorageKey = ({ userId, extension = '.jpg' }) => (
   ].join('/')
 );
 
+export const getSocialAccountAvatarStorageKey = ({ platform, accountId, extension = '.jpg' }) => (
+  [
+    'social-accounts',
+    sanitizeSegment(platform),
+    sanitizeSegment(accountId),
+    `avatar${extension}`,
+  ].join('/')
+);
+
 export const isStructuredMediaKey = (storageKey) => (
   /^users\/[^/]+\/folders\/[^/]+\/media\/[^/]+\/original\.[^/]+$/i.test(String(storageKey || ''))
 );

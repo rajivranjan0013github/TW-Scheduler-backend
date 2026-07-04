@@ -70,15 +70,6 @@ const main = async () => {
     updated += 1;
   }
 
-  console.log(JSON.stringify({
-    dryRun,
-    oldBaseUrl,
-    nextBaseUrl,
-    matched: mediaItems.length,
-    updated,
-    samples,
-  }, null, 2));
-
   await mongoose.disconnect();
 };
 

@@ -66,16 +66,6 @@ const main = async () => {
     });
   }
 
-  console.log(JSON.stringify({
-    dryRun,
-    includeAllRemote,
-    scanned: users.length,
-    matched: results.length,
-    updated: results.filter((item) => item.status === 'updated').length,
-    unchanged: results.filter((item) => item.status === 'unchanged').length,
-    samples: results.slice(0, 10),
-  }, null, 2));
-
   await mongoose.disconnect();
 };
 

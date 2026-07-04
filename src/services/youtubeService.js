@@ -1,5 +1,6 @@
 import { OAuth2Client } from 'google-auth-library';
 import { ensureFreshAccountToken } from './tokenHealthService.js';
+import { storeRemoteSocialAccountAvatar } from './avatarStorageService.js';
 
 const YOUTUBE_UPLOAD_SCOPE = 'https://www.googleapis.com/auth/youtube.upload';
 const YOUTUBE_READONLY_SCOPE = 'https://www.googleapis.com/auth/youtube.readonly';
@@ -61,6 +62,11 @@ export const exchangeYoutubeCodeForAccount = async (code, userId) => {
     snippet.thumbnails?.medium?.url ||
     snippet.thumbnails?.high?.url ||
     '';
+  const avatarUrl = await storeRemoteSocialAccountAvatar({
+    platform: 'youtube',
+    accountId: channel.id,
+    avatarUrl: thumbnail,
+  });
 
   return {
     userId,
@@ -76,7 +82,7 @@ export const exchangeYoutubeCodeForAccount = async (code, userId) => {
     tokenRefreshError: '',
     tokenLastCheckedAt: new Date(),
     scopes: tokens.scope ? tokens.scope.split(' ') : [YOUTUBE_UPLOAD_SCOPE, YOUTUBE_READONLY_SCOPE],
-    avatarUrl: thumbnail,
+    avatarUrl,
     metadata: {
       channelId: channel.id,
       description: snippet.description || '',
