@@ -411,12 +411,14 @@ router.get('/', protect, async (req, res) => {
     });
 
     if (unmatchedPosts.length > 0) {
-      const accountIds = unmatchedPosts.flatMap(p => p.socialAccountIds || []).map(String);
-      const candidatePubs = await PublishedPost.find({
-        accountId: { $in: accountIds }
-      })
-      .select('accountId metaPostId latestViews latestLikes latestComments lastSyncedAt permalink viewsSource publishedAt content')
-      .lean();
+      const accountIds = getUniqueIds(unmatchedPosts.flatMap(p => p.socialAccountIds || []));
+      const candidatePubs = accountIds.length > 0
+        ? await PublishedPost.find({
+            accountId: { $in: accountIds }
+          })
+          .select('accountId metaPostId latestViews latestLikes latestComments lastSyncedAt permalink viewsSource publishedAt content')
+          .lean()
+        : [];
       
       const pubsByAccount = new Map();
       candidatePubs.forEach(pub => {
@@ -431,7 +433,7 @@ router.get('/', protect, async (req, res) => {
       };
       
       unmatchedPosts.forEach(post => {
-        const postAccounts = (post.socialAccountIds || []).map(String);
+        const postAccounts = idsToStrings(post.socialAccountIds || []);
         const postTime = new Date(post.manualPostedAt || post.scheduledAt).getTime();
         const ONE_DAY_MS = 24 * 60 * 60 * 1000;
         
