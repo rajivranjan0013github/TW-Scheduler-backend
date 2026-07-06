@@ -326,44 +326,60 @@ const getCampaignMetrics = async (campaign) => {
 
   const periodDelta = (post, sinceDate, field, latestField) => {
     const snapshots = insightMap.get(toKey(post._id)) || [];
+    const sinceKey = dateKey(sinceDate);
+    const publishedAt = post.publishedAt ? new Date(post.publishedAt) : null;
+    const current = Number((post[latestField] ?? snapshots[snapshots.length - 1]?.[field]) || 0);
+
     if (snapshots.length === 0) {
-      return post.publishedAt && new Date(post.publishedAt) >= sinceDate
-        ? Number(post[latestField] || 0)
+      return publishedAt && publishedAt >= sinceDate
+        ? current
         : 0;
     }
 
-    const current = snapshots[snapshots.length - 1]?.[field] ?? post[latestField] ?? 0;
-    const baseline = snapshots.find((snapshot) => snapshot.dateStr >= dateKey(sinceDate))?.[field] ?? 0;
-    const delta = Number(current || 0) - Number(baseline || 0);
+    const baselineSnapshot = snapshots
+      .slice()
+      .reverse()
+      .find((snapshot) => snapshot.dateStr < sinceKey);
+    const firstSnapshotInPeriod = snapshots.find((snapshot) => snapshot.dateStr >= sinceKey);
+    const baseline = Number((baselineSnapshot ?? firstSnapshotInPeriod)?.[field] || 0);
 
-    if (delta > 0) return delta;
+    if (!firstSnapshotInPeriod) {
+      return publishedAt && publishedAt >= sinceDate
+        ? current
+        : 0;
+    }
 
-    return post.publishedAt && new Date(post.publishedAt) >= sinceDate
-      ? Number(post[latestField] || 0)
-      : 0;
+    return Math.max(0, current - baseline);
   };
 
   const periodDeltaBetween = (post, startDate, endDate, field, latestField) => {
     const snapshots = insightMap.get(toKey(post._id)) || [];
+    const startKey = dateKey(startDate);
+    const endKey = dateKey(endDate);
+    const publishedAt = post.publishedAt ? new Date(post.publishedAt) : null;
+
     if (snapshots.length === 0) {
-      const publishedAt = post.publishedAt ? new Date(post.publishedAt) : null;
       return publishedAt && publishedAt >= startDate && publishedAt < endDate
         ? Number(post[latestField] || 0)
         : 0;
     }
 
-    const startSnapshot = snapshots.find((snapshot) => snapshot.dateStr >= dateKey(startDate));
-    const endSnapshot = snapshots.find((snapshot) => snapshot.dateStr >= dateKey(endDate));
-    const startValue = Number(startSnapshot?.[field] || 0);
-    const endValue = Number((endSnapshot?.[field] ?? post[latestField]) || 0);
-    const delta = endValue - startValue;
+    const currentSnapshot = snapshots.find((snapshot) => snapshot.dateStr >= endKey)
+      ?? snapshots.find((snapshot) => snapshot.dateStr >= startKey);
+    if (!currentSnapshot) {
+      return publishedAt && publishedAt >= startDate && publishedAt < endDate
+        ? Number(post[latestField] || 0)
+        : 0;
+    }
 
-    if (delta > 0) return delta;
+    const baselineSnapshot = snapshots
+      .slice()
+      .reverse()
+      .find((snapshot) => snapshot.dateStr < startKey);
+    const baseline = Number(baselineSnapshot?.[field] || 0);
+    const current = Number(currentSnapshot[field] || 0);
 
-    const publishedAt = post.publishedAt ? new Date(post.publishedAt) : null;
-    return publishedAt && publishedAt >= startDate && publishedAt < endDate
-      ? Number(post[latestField] || 0)
-      : 0;
+    return Math.max(0, current - baseline);
   };
 
   const isPublishedSince = (post, sinceDate) => (

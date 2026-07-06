@@ -1537,6 +1537,21 @@ router.get('/creator/campaigns', protect, async (req, res) => {
       return res.status(200).json([]);
     }
 
+    const linkedSocialAccountIds = [
+      ...new Set(
+        matchedChannelDocs
+          .map((channel) => channel.socialAccountId)
+          .filter(Boolean)
+          .map((accountId) => String(accountId))
+      ),
+    ];
+    const linkedSocialAccounts = linkedSocialAccountIds.length > 0
+      ? await SocialAccount.find({ _id: { $in: linkedSocialAccountIds } }).lean()
+      : [];
+    const linkedSocialAccountsById = new Map(
+      linkedSocialAccounts.map((account) => [String(account._id), account])
+    );
+
     const matchedCampaignIds = [...new Set(matchedChannelDocs.map((channel) => String(channel.campaignId)))];
     const matchedCampaigns = await Campaign.find({
       _id: { $in: matchedCampaignIds },
@@ -1560,8 +1575,11 @@ router.get('/creator/campaigns', protect, async (req, res) => {
           const linkedCreatorAccount = linkedAccountId
             ? creatorAccountsById.get(linkedAccountId)
             : null;
+          const linkedCampaignAccount = linkedAccountId
+            ? linkedSocialAccountsById.get(linkedAccountId)
+            : null;
           const normalizedHandle = channel.normalizedHandle || normalizeChannelHandle(channel.requestedHandle || channel.handle);
-          const matchedAcc = linkedCreatorAccount || creatorAccounts.find((account) => (
+          const matchedAcc = linkedCreatorAccount || linkedCampaignAccount || creatorAccounts.find((account) => (
             account.platform === channel.platform &&
             getAccountMatchHandles(account).includes(normalizedHandle)
           ));
@@ -1576,7 +1594,11 @@ router.get('/creator/campaigns', protect, async (req, res) => {
           );
           if (!isControlledByCreator) return null;
 
-          const isVerified = Boolean(matchedAcc && matchedAcc.isConnected !== false);
+          const isVerified = Boolean(
+            matchedAcc
+            && matchedAcc.isConnected !== false
+            && (channel.status === 'verified' || linkedCreatorAccount || linkedCampaignAccount)
+          );
           const status = isVerified
             ? 'verified'
             : isAssignedToCreator

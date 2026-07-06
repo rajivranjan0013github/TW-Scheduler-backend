@@ -2,6 +2,7 @@ import express from 'express';
 import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import ScheduledPost from '../models/ScheduledPost.js';
+import PublishedPost from '../models/PublishedPost.js';
 import Media from '../models/Media.js';
 import Folder from '../models/Folder.js';
 import SocialAccount from '../models/SocialAccount.js';
@@ -88,7 +89,7 @@ const getSchedulerPostListQuery = (campaignId, query = {}) => {
   return filters;
 };
 const populateSchedulerPostList = (query) => query
-  .select('campaignId socialAccountIds campaignChannelIds mediaIds caption scheduledAt scheduleMode status publishSource manualDownloadedAt manualPostedAt manualPostUrl publishError platformSpecifics createdAt updatedAt')
+  .select('campaignId socialAccountIds campaignChannelIds mediaIds caption scheduledAt scheduleMode status publishSource manualDownloadedAt manualPostedAt manualPostUrl publishError platformSpecifics publishResponseId createdAt updatedAt')
   .populate({ path: 'socialAccountIds', select: 'username name platform avatarUrl isConnected tokenStatus' })
   .populate({ path: 'campaignChannelIds', select: 'requestedHandle normalizedHandle displayName platform status socialAccountId assignedHandlerEmail assignedHandlerUserId' })
   .populate({ path: 'mediaIds', select: 'name type url folderId caption' })
@@ -108,6 +109,11 @@ const getUniqueIds = (items = []) => (
 );
 
 const activeQueueStatuses = ['scheduled', 'manual_ready', 'downloaded', 'publishing', 'paused'];
+
+const getDateBoundary = (value, fallback) => {
+  const date = value ? new Date(value) : fallback;
+  return date && !Number.isNaN(date.getTime()) ? date : fallback;
+};
 
 const canAccessManualPost = async (post, user) => {
   if (!post || !user) return false;
@@ -328,6 +334,21 @@ router.get('/', protect, async (req, res) => {
           if (rangeQuery.scheduledAt?.$lte && scheduledAt > rangeQuery.scheduledAt.$lte) return false;
           return true;
         })
+        .map(post => {
+          if (post.status === 'published' || post.status === 'published_auto') {
+            return {
+              ...post,
+              latestViews: 1250,
+              latestLikes: 84,
+              latestComments: 12,
+              lastSyncedAt: new Date(),
+              permalink: 'https://instagram.com',
+              viewsSource: 'instagram',
+              publishedAt: post.scheduledAt,
+            };
+          }
+          return post;
+        })
         .sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt));
       return res.status(200).json(sorted);
     }
@@ -338,7 +359,163 @@ router.get('/', protect, async (req, res) => {
       ScheduledPost.find(getSchedulerPostListQuery(campaignId, req.query))
     );
     
-    res.status(200).json(posts);
+    // Enrich with PublishedPost metrics
+    const allMetaIds = [];
+    const postMetaIdsMap = new Map(); // post._id -> array of metaPostIds
+    
+    posts.forEach(post => {
+      if (post.publishResponseId) {
+        let ids = [];
+        try {
+          const parsed = JSON.parse(post.publishResponseId);
+          if (Array.isArray(parsed)) {
+            ids = parsed.map(item => item.publishId || item.id || item).filter(Boolean).map(String);
+          } else if (parsed && typeof parsed === 'object') {
+            ids = [parsed.publishId || parsed.id || parsed].filter(Boolean).map(String);
+          } else {
+            ids = [String(post.publishResponseId)];
+          }
+        } catch (e) {
+          ids = [String(post.publishResponseId)];
+        }
+        if (ids.length > 0) {
+          postMetaIdsMap.set(String(post._id), ids);
+          allMetaIds.push(...ids);
+        }
+      }
+    });
+
+    const manualUrls = posts.map(p => p.manualPostUrl).filter(Boolean);
+    
+    const query = { $or: [] };
+    if (allMetaIds.length > 0) query.$or.push({ metaPostId: { $in: allMetaIds } });
+    if (manualUrls.length > 0) query.$or.push({ permalink: { $in: manualUrls } });
+    
+    const publishedPosts = (allMetaIds.length > 0 || manualUrls.length > 0)
+      ? await PublishedPost.find(query)
+          .select('metaPostId latestViews latestLikes latestComments lastSyncedAt permalink viewsSource publishedAt content accountId')
+          .lean()
+      : [];
+    
+    const metaIdToPubMap = new Map(publishedPosts.filter(p => p.metaPostId).map(p => [p.metaPostId, p]));
+    const permalinkToPubMap = new Map(publishedPosts.filter(p => p.permalink).map(p => [p.permalink, p]));
+
+    // Heuristic matching fallback for unmatched completed posts (e.g. manual posts with empty manualPostUrl)
+    const unmatchedPosts = posts.filter(p => {
+      const isCompleted = ['published', 'published_auto', 'posted_manual'].includes(p.status);
+      if (!isCompleted) return false;
+      const metaIds = postMetaIdsMap.get(String(p._id)) || [];
+      const hasIdMatch = metaIds.some(id => metaIdToPubMap.has(id));
+      const hasUrlMatch = p.manualPostUrl && permalinkToPubMap.has(p.manualPostUrl);
+      return !hasIdMatch && !hasUrlMatch;
+    });
+
+    if (unmatchedPosts.length > 0) {
+      const accountIds = unmatchedPosts.flatMap(p => p.socialAccountIds || []).map(String);
+      const candidatePubs = await PublishedPost.find({
+        accountId: { $in: accountIds }
+      })
+      .select('accountId metaPostId latestViews latestLikes latestComments lastSyncedAt permalink viewsSource publishedAt content')
+      .lean();
+      
+      const pubsByAccount = new Map();
+      candidatePubs.forEach(pub => {
+        const accId = String(pub.accountId);
+        if (!pubsByAccount.has(accId)) pubsByAccount.set(accId, []);
+        pubsByAccount.get(accId).push(pub);
+      });
+      
+      const normalizeString = (str) => {
+        if (!str) return '';
+        return str.toLowerCase().replace(/[^a-z0-9]/g, '');
+      };
+      
+      unmatchedPosts.forEach(post => {
+        const postAccounts = (post.socialAccountIds || []).map(String);
+        const postTime = new Date(post.manualPostedAt || post.scheduledAt).getTime();
+        const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+        
+        let bestMatch = null;
+        
+        for (const accId of postAccounts) {
+          const pubs = pubsByAccount.get(accId) || [];
+          
+          // Filter candidate posts published within 24 hours of scheduled/manual time
+          const timeCandidates = pubs.filter(pub => {
+            const pubTime = new Date(pub.publishedAt).getTime();
+            return Math.abs(pubTime - postTime) <= ONE_DAY_MS;
+          });
+          
+          if (timeCandidates.length === 0) continue;
+          
+          if (timeCandidates.length === 1) {
+            bestMatch = timeCandidates[0];
+            break;
+          }
+          
+          // Match by caption similarity (using alphanumeric normalized string check)
+          const postNorm = normalizeString(post.caption).substring(0, 20);
+          if (postNorm) {
+            const captionMatch = timeCandidates.find(pub => {
+              const pubNorm = normalizeString(pub.content);
+              return pubNorm.includes(postNorm) || postNorm.includes(pubNorm.substring(0, 20));
+            });
+            if (captionMatch) {
+              bestMatch = captionMatch;
+              break;
+            }
+          }
+          
+          // Take closest time match
+          bestMatch = timeCandidates.sort((a, b) => {
+            const aDiff = Math.abs(new Date(a.publishedAt).getTime() - postTime);
+            const bDiff = Math.abs(new Date(b.publishedAt).getTime() - postTime);
+            return aDiff - bDiff;
+          })[0];
+        }
+        
+        if (bestMatch) {
+          postMetaIdsMap.set(String(post._id), [bestMatch.metaPostId]);
+          metaIdToPubMap.set(bestMatch.metaPostId, bestMatch);
+        }
+      });
+    }
+
+    const enrichedPosts = posts.map(post => {
+      const matchingPubs = [];
+      
+      const metaIds = postMetaIdsMap.get(String(post._id)) || [];
+      metaIds.forEach(metaId => {
+        if (metaIdToPubMap.has(metaId)) {
+          matchingPubs.push(metaIdToPubMap.get(metaId));
+        }
+      });
+      
+      if (post.manualPostUrl && permalinkToPubMap.has(post.manualPostUrl)) {
+        matchingPubs.push(permalinkToPubMap.get(post.manualPostUrl));
+      }
+      
+      if (matchingPubs.length > 0) {
+        const totalViews = matchingPubs.reduce((sum, p) => sum + (p.latestViews || 0), 0);
+        const totalLikes = matchingPubs.reduce((sum, p) => sum + (p.latestLikes || 0), 0);
+        const totalComments = matchingPubs.reduce((sum, p) => sum + (p.latestComments || 0), 0);
+        const primaryPub = matchingPubs[0];
+        
+        return {
+          ...post,
+          latestViews: totalViews,
+          latestLikes: totalLikes,
+          latestComments: totalComments,
+          lastSyncedAt: primaryPub.lastSyncedAt,
+          permalink: primaryPub.permalink,
+          viewsSource: primaryPub.viewsSource,
+          publishedAt: primaryPub.publishedAt,
+        };
+      }
+      return post;
+    });
+
+    res.status(200).json(enrichedPosts);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -1044,6 +1221,98 @@ router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req
     await removePostFromQueue(post._id);
     await ScheduledPost.deleteOne({ _id: id, campaignId });
     res.status(200).json({ message: 'Scheduled post removed successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Get today's live-post tracking for verified creator accounts
+router.get('/creator/today-tracking', protect, async (req, res) => {
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      return res.status(200).json({ accounts: {} });
+    }
+
+    const now = new Date();
+    const defaultStart = new Date(now);
+    defaultStart.setHours(0, 0, 0, 0);
+    const defaultEnd = new Date(now);
+    defaultEnd.setHours(23, 59, 59, 999);
+    const from = getDateBoundary(req.query.from, defaultStart);
+    const to = getDateBoundary(req.query.to, defaultEnd);
+
+    const handlerEmail = (req.user.email || '').trim().toLowerCase();
+    const creatorAccounts = await SocialAccount.find({
+      userId: req.user._id,
+      isConnected: true,
+    }).select('_id platform username name accountId').lean();
+    const accountLookupPairs = creatorAccounts.flatMap((account) => (
+      getAccountMatchHandles(account).map((handle) => ({
+        platform: account.platform,
+        handle,
+      }))
+    ));
+    const creatorAccountIds = creatorAccounts.map((account) => account._id);
+    const assignedChannels = await CampaignChannel.find({
+      $or: [
+        { assignedHandlerUserId: req.user._id },
+        ...(handlerEmail ? [{ assignedHandlerEmail: handlerEmail }] : []),
+        { socialAccountId: { $in: creatorAccountIds } },
+        ...accountLookupPairs.map(({ platform, handle }) => ({
+          platform,
+          normalizedHandle: handle,
+        })),
+      ],
+    }).select('socialAccountId status').lean();
+    const accountIds = [
+      ...new Set([
+        ...creatorAccountIds.map((accountId) => String(accountId)),
+        ...assignedChannels
+          .map((channel) => channel.socialAccountId)
+          .filter(Boolean)
+          .map((accountId) => String(accountId)),
+      ]),
+    ];
+
+    if (accountIds.length === 0) {
+      return res.status(200).json({ accounts: {} });
+    }
+
+    const posts = await PublishedPost.find({
+      accountId: { $in: accountIds },
+      publishedAt: { $gte: from, $lte: to },
+    })
+      .select('accountId metaPostId platform content permalink publishedAt lastSyncedAt')
+      .sort({ publishedAt: -1 })
+      .lean();
+
+    const accounts = posts.reduce((summary, post) => {
+      const accountId = String(post.accountId);
+      if (!summary[accountId]) {
+        summary[accountId] = {
+          count: 0,
+          lastPublishedAt: null,
+          posts: [],
+        };
+      }
+
+      summary[accountId].count += 1;
+      if (!summary[accountId].lastPublishedAt) {
+        summary[accountId].lastPublishedAt = post.publishedAt;
+      }
+      summary[accountId].posts.push({
+        id: post.metaPostId,
+        platform: post.platform,
+        content: post.content || '',
+        permalink: post.permalink || '',
+        publishedAt: post.publishedAt,
+        lastSyncedAt: post.lastSyncedAt,
+      });
+      return summary;
+    }, {});
+
+    res.status(200).json({ accounts });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
