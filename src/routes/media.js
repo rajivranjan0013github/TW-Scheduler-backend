@@ -335,10 +335,7 @@ router.delete('/folders/:id', protect, authorize('owner', 'admin'), async (req, 
         return res.status(404).json({ message: 'Folder not found' });
       }
       mockStore.folders.splice(index, 1);
-      // Re-assign media in this folder to root
-      mockStore.media.forEach(m => {
-        if (m.folderId === id) m.folderId = null;
-      });
+      mockStore.media = mockStore.media.filter(m => m.folderId !== id);
       return res.status(200).json({ message: 'Folder deleted successfully' });
     }
 
@@ -349,9 +346,16 @@ router.delete('/folders/:id', protect, authorize('owner', 'admin'), async (req, 
       return res.status(404).json({ message: 'Folder not found' });
     }
 
+    const mediaItems = await Media.find({ campaignId, folderId: id }).select('storageKey thumbnailStorageKey');
+    for (const mediaItem of mediaItems) {
+      await deleteFile(mediaItem.storageKey);
+      if (mediaItem.thumbnailStorageKey) {
+        await deleteFile(mediaItem.thumbnailStorageKey);
+      }
+    }
+
     await Folder.deleteOne({ _id: id, campaignId });
-    // Update media referencing this folder to null
-    await Media.updateMany({ campaignId, folderId: id }, { folderId: null });
+    await Media.deleteMany({ campaignId, folderId: id });
     res.status(200).json({ message: 'Folder deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });

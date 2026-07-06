@@ -36,7 +36,39 @@ const serializeCommentsPreview = (comments = []) => (
 );
 const INSIGHT_SKIP_MS = 15 * 60 * 1000;
 const ADMIN_ROLES = ['owner', 'admin'];
+const MAX_FEED_SYNC_PAGES = 20;
 const hasAdminAccess = (user) => ADMIN_ROLES.includes(user?.role) && user?.userType !== 'account_handler';
+
+const fetchMetaPagedData = async (initialUrl, { maxPages = MAX_FEED_SYNC_PAGES } = {}) => {
+  const items = [];
+  let url = initialUrl;
+  let page = 0;
+
+  while (url && page < maxPages) {
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        data,
+        items,
+      };
+    }
+
+    items.push(...(data.data || []));
+    url = data.paging?.next || '';
+    page += 1;
+  }
+
+  return {
+    ok: true,
+    status: 200,
+    data: { data: items },
+    items,
+  };
+};
 
 const getAccountMatchHandles = (account = {}) => (
   [
@@ -1175,8 +1207,7 @@ router.get('/:id/posts', protect, async (req, res) => {
 
     if (!forceRefresh) {
       cachedPosts = await PublishedPost.find({ accountId: account._id })
-        .sort({ publishedAt: -1 })
-        .limit(25);
+        .sort({ publishedAt: -1 });
 
       if (cachedPosts.length > 0) {
         const syncTimes = cachedPosts
@@ -1271,11 +1302,11 @@ router.get('/:id/posts', protect, async (req, res) => {
     // Call actual Meta APIs
     let posts = [];
     if (liveAccount.platform === 'facebook') {
-      const url = `https://graph.facebook.com/v20.0/${liveAccount.accountId}/published_posts?fields=id,message,created_time,full_picture,permalink_url&limit=25&access_token=${liveAccount.accessToken}`;
-      const apiRes = await fetch(url);
-      const apiData = await apiRes.json();
+      const url = `https://graph.facebook.com/v20.0/${liveAccount.accountId}/published_posts?fields=id,message,created_time,full_picture,permalink_url&limit=100&access_token=${liveAccount.accessToken}`;
+      const apiResult = await fetchMetaPagedData(url);
+      const apiData = apiResult.data;
       
-      if (apiRes.ok) {
+      if (apiResult.ok) {
         posts = await Promise.all((apiData.data || []).map(async (post) => {
           const existingPost = existingPostMap.get(post.id);
           const [viewResult, likes, commentsCount, commentsPreview] = await Promise.all([
@@ -1314,7 +1345,7 @@ router.get('/:id/posts', protect, async (req, res) => {
         await handleProviderAuthFailure(liveAccount, apiData, message);
         const isPermissionError = apiData.error?.code === 10;
         console.warn(`Meta Facebook feed access failed for ${liveAccount.name}: ${message}`);
-        return res.status(apiRes.status || 400).json({ 
+        return res.status(apiResult.status || 400).json({ 
           message: isPermissionError
             ? 'Meta denied feed access. Make sure the user manages this Page and the Meta app has the required Page read permission or App Review access.'
             : message
@@ -1322,11 +1353,11 @@ router.get('/:id/posts', protect, async (req, res) => {
       }
     } else if (liveAccount.platform === 'instagram') {
       const graphHost = liveAccount.authProvider === 'instagram' ? 'graph.instagram.com' : 'graph.facebook.com';
-      const url = `https://${graphHost}/v20.0/${liveAccount.accountId}/media?fields=id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count&access_token=${liveAccount.accessToken}`;
-      const apiRes = await fetch(url);
-      const apiData = await apiRes.json();
+      const url = `https://${graphHost}/v20.0/${liveAccount.accountId}/media?fields=id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count&limit=100&access_token=${liveAccount.accessToken}`;
+      const apiResult = await fetchMetaPagedData(url);
+      const apiData = apiResult.data;
 
-      if (apiRes.ok) {
+      if (apiResult.ok) {
         posts = await Promise.all((apiData.data || []).map(async (post) => {
           const existingPost = existingPostMap.get(post.id);
           const [views, insightLikes, insightComments, commentsPreview] = await Promise.all([
@@ -1359,7 +1390,7 @@ router.get('/:id/posts', protect, async (req, res) => {
       } else {
         console.error('Meta Instagram Media API error:', apiData);
         await handleProviderAuthFailure(liveAccount, apiData, apiData.error?.message || 'Meta API returned an error fetching posts');
-        return res.status(apiRes.status || 400).json({ 
+        return res.status(apiResult.status || 400).json({ 
           message: apiData.error?.message || 'Meta API returned an error fetching posts' 
         });
       }

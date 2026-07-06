@@ -12,6 +12,7 @@ import PostInsight from '../models/PostInsight.js';
 import Campaign from '../models/Campaign.js';
 import CampaignChannel from '../models/CampaignChannel.js';
 import { resolveCampaignPublishingChannels, syncCampaignChannelList } from '../utils/campaignChannels.js';
+import { deleteFile } from '../services/r2Service.js';
 
 const router = express.Router();
 const VALID_ROLES = ['owner', 'admin', 'editor', 'viewer'];
@@ -81,7 +82,13 @@ const startOfDay = (date) => {
   return d;
 };
 
-const dateKey = (date) => startOfDay(date).toISOString().split('T')[0];
+const dateKey = (date) => {
+  const d = startOfDay(date);
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
 const getLast7DayActivity = (now = new Date()) => {
   const dayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   return Array.from({ length: 7 }, (_, index) => {
@@ -172,6 +179,7 @@ const getCampaignMetrics = async (campaign) => {
       last7DaysComments: 0,
       thisMonthLikes: 0,
       thisMonthComments: 0,
+      last30DaysPostedViews: [],
       accountRows: [],
     };
   }
@@ -183,7 +191,21 @@ const getCampaignMetrics = async (campaign) => {
   const last7DayActivityTemplate = getLast7DayActivity(now);
   const sevenDaysAgo = startOfDay(now);
   sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
+  const thirtyDaysAgo = startOfDay(now);
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 29);
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const last30DaysPostedViewsMap = new Map(
+    Array.from({ length: 30 }, (_, index) => {
+      const date = startOfDay(thirtyDaysAgo);
+      date.setDate(date.getDate() + index);
+      const key = dateKey(date);
+      return [key, {
+        dateStr: key,
+        views: 0,
+        posts: 0,
+      }];
+    })
+  );
 
   const posts = await PublishedPost.find({ accountId: { $in: accountIds } })
     .select('_id accountId publishedAt latestViews latestLikes latestComments')
@@ -301,6 +323,7 @@ const getCampaignMetrics = async (campaign) => {
       last7DaysComments: 0,
       thisMonthLikes: 0,
       thisMonthComments: 0,
+      last30DaysPostedViews: Array.from(last30DaysPostedViewsMap.values()),
       accountRows: Array.from(accountRowsMap.values()),
     };
   }
@@ -395,25 +418,26 @@ const getCampaignMetrics = async (campaign) => {
     const accountId = toKey(post.accountId);
     const row = accountRowsMap.get(accountId);
     const lifetimeViews = Number(post.latestViews || 0);
-    const todayViews = periodDelta(post, todayStart, 'views', 'latestViews');
-    const yesterdayViews = periodDeltaBetween(post, yesterdayStart, todayStart, 'views', 'latestViews');
-    const last7DaysViews = periodDelta(post, sevenDaysAgo, 'views', 'latestViews');
-    const thisMonthViews = periodDelta(post, monthStart, 'views', 'latestViews');
     const latestLikes = Number(post.latestLikes || 0);
     const latestComments = Number(post.latestComments || 0);
-    const todayLikes = periodDelta(post, todayStart, 'likes', 'latestLikes');
-    const todayComments = periodDelta(post, todayStart, 'comments', 'latestComments');
-    const yesterdayLikes = periodDeltaBetween(post, yesterdayStart, todayStart, 'likes', 'latestLikes');
-    const yesterdayComments = periodDeltaBetween(post, yesterdayStart, todayStart, 'comments', 'latestComments');
-    const last7DaysLikes = periodDelta(post, sevenDaysAgo, 'likes', 'latestLikes');
-    const last7DaysComments = periodDelta(post, sevenDaysAgo, 'comments', 'latestComments');
-    const thisMonthLikes = periodDelta(post, monthStart, 'likes', 'latestLikes');
-    const thisMonthComments = periodDelta(post, monthStart, 'comments', 'latestComments');
     const publishedDateStr = post.publishedAt ? dateKey(post.publishedAt) : '';
     const todayPosts = isPublishedSince(post, todayStart) ? 1 : 0;
     const yesterdayPosts = isPublishedBetween(post, yesterdayStart, todayStart) ? 1 : 0;
     const last7DaysPosts = isPublishedSince(post, sevenDaysAgo) ? 1 : 0;
     const thisMonthPosts = isPublishedSince(post, monthStart) ? 1 : 0;
+    const last30DaysPublished = post.publishedAt && new Date(post.publishedAt) >= thirtyDaysAgo;
+    const todayViews = todayPosts ? lifetimeViews : 0;
+    const yesterdayViews = yesterdayPosts ? lifetimeViews : 0;
+    const last7DaysViews = last7DaysPosts ? lifetimeViews : 0;
+    const thisMonthViews = thisMonthPosts ? lifetimeViews : 0;
+    const todayLikes = todayPosts ? latestLikes : 0;
+    const todayComments = todayPosts ? latestComments : 0;
+    const yesterdayLikes = yesterdayPosts ? latestLikes : 0;
+    const yesterdayComments = yesterdayPosts ? latestComments : 0;
+    const last7DaysLikes = last7DaysPosts ? latestLikes : 0;
+    const last7DaysComments = last7DaysPosts ? latestComments : 0;
+    const thisMonthLikes = thisMonthPosts ? latestLikes : 0;
+    const thisMonthComments = thisMonthPosts ? latestComments : 0;
 
     metrics.todayPosts += todayPosts;
     metrics.yesterdayPosts += yesterdayPosts;
@@ -434,6 +458,14 @@ const getCampaignMetrics = async (campaign) => {
     metrics.last7DaysComments += last7DaysComments;
     metrics.thisMonthLikes += thisMonthLikes;
     metrics.thisMonthComments += thisMonthComments;
+
+    if (last30DaysPublished) {
+      const chartDay = last30DaysPostedViewsMap.get(publishedDateStr);
+      if (chartDay) {
+        chartDay.views += lifetimeViews;
+        chartDay.posts += 1;
+      }
+    }
 
     if (row) {
       row.posts += 1;
@@ -498,6 +530,7 @@ const getCampaignMetrics = async (campaign) => {
 
   return {
     ...totals,
+    last30DaysPostedViews: Array.from(last30DaysPostedViewsMap.values()),
     accountRows: Array.from(accountRowsMap.values()),
   };
 };
@@ -938,11 +971,18 @@ router.delete('/folders/:id', protect, authorize('owner', 'admin'), async (req, 
       return res.status(404).json({ message: 'Folder not found.' });
     }
 
-    await Folder.deleteOne(folderQuery);
-    // Update all media referencing this folder to null
     const mediaQuery = { folderId: req.params.id };
     if (req.query.campaignId) mediaQuery.campaignId = req.query.campaignId;
-    await Media.updateMany(mediaQuery, { folderId: null });
+    const mediaItems = await Media.find(mediaQuery).select('storageKey thumbnailStorageKey');
+    for (const mediaItem of mediaItems) {
+      await deleteFile(mediaItem.storageKey);
+      if (mediaItem.thumbnailStorageKey) {
+        await deleteFile(mediaItem.thumbnailStorageKey);
+      }
+    }
+
+    await Folder.deleteOne(folderQuery);
+    await Media.deleteMany(mediaQuery);
 
     res.status(200).json({ message: 'Folder deleted successfully.' });
   } catch (error) {

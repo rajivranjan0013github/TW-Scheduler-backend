@@ -14,6 +14,13 @@ import { getDBStatus } from '../config/db.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
 import { fetchFacebookPostCommentsCount, fetchFacebookPostInsightValue, fetchFacebookPostViews } from '../services/facebookMetricsService.js';
 
+const dateKey = (date = new Date()) => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
 /**
  * Extracts metric values from a Meta insights API response body.
  * 
@@ -62,7 +69,7 @@ export const runInsightSync = async () => {
   }
 
   const startTime = Date.now();
-  const todayStr = new Date().toISOString().split('T')[0];
+  const todayStr = dateKey();
 
   // Only sync posts from the last 30 days
   const thirtyDaysAgo = new Date();

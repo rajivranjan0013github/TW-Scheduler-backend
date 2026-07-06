@@ -14,21 +14,39 @@ import { fetchYoutubeVideos } from '../services/youtubeService.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
 import { fetchFacebookPostCommentsCount, fetchFacebookPostViews } from '../services/facebookMetricsService.js';
 
+const MAX_FEED_SYNC_PAGES = 20;
+
+const fetchMetaPagedData = async (initialUrl, { maxPages = MAX_FEED_SYNC_PAGES } = {}) => {
+  const items = [];
+  let url = initialUrl;
+  let page = 0;
+
+  while (url && page < maxPages) {
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error?.message || `Meta feed fetch failed (status ${response.status})`);
+    }
+
+    items.push(...(data.data || []));
+    url = data.paging?.next || '';
+    page += 1;
+  }
+
+  return items;
+};
+
 /**
  * Fetches the latest published posts from a Facebook Page via Meta Graph API.
  * @param {Object} account - SocialAccount document
  * @returns {Promise<Array>} - Array of normalized post objects
  */
 const fetchFacebookPosts = async (account) => {
-  const url = `https://graph.facebook.com/v20.0/${account.accountId}/published_posts?fields=id,message,created_time,full_picture,permalink_url&limit=25&access_token=${account.accessToken}`;
-  const response = await fetch(url);
-  const data = await response.json();
+  const url = `https://graph.facebook.com/v20.0/${account.accountId}/published_posts?fields=id,message,created_time,full_picture,permalink_url&limit=100&access_token=${account.accessToken}`;
+  const data = await fetchMetaPagedData(url);
 
-  if (!response.ok) {
-    throw new Error(data.error?.message || `Facebook feed fetch failed (status ${response.status})`);
-  }
-
-  return Promise.all((data.data || []).map(async (post) => {
+  return Promise.all(data.map(async (post) => {
     const [viewResult, commentsCount] = await Promise.all([
       fetchFacebookPostViews(account.accessToken, post),
       fetchFacebookPostCommentsCount(account.accessToken, post.id),
@@ -59,15 +77,10 @@ const fetchFacebookPosts = async (account) => {
  */
 const fetchInstagramPosts = async (account) => {
   const graphHost = account.authProvider === 'instagram' ? 'graph.instagram.com' : 'graph.facebook.com';
-  const url = `https://${graphHost}/v20.0/${account.accountId}/media?fields=id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count&limit=25&access_token=${account.accessToken}`;
-  const response = await fetch(url);
-  const data = await response.json();
+  const url = `https://${graphHost}/v20.0/${account.accountId}/media?fields=id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count&limit=100&access_token=${account.accessToken}`;
+  const data = await fetchMetaPagedData(url);
 
-  if (!response.ok) {
-    throw new Error(data.error?.message || `Instagram media fetch failed (status ${response.status})`);
-  }
-
-  return (data.data || []).map(post => ({
+  return data.map(post => ({
     metaPostId: post.id,
     platform: 'instagram',
     content: post.caption || '',
