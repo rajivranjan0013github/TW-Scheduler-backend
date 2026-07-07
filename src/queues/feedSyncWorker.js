@@ -16,7 +16,7 @@ import { fetchFacebookPostCommentsCount, fetchFacebookPostViews } from '../servi
 
 const MAX_FEED_SYNC_PAGES = 20;
 
-const fetchMetaPagedData = async (initialUrl, { maxPages = MAX_FEED_SYNC_PAGES } = {}) => {
+export const fetchMetaPagedData = async (initialUrl, { maxPages = MAX_FEED_SYNC_PAGES } = {}) => {
   const items = [];
   let url = initialUrl;
   let page = 0;
@@ -42,9 +42,9 @@ const fetchMetaPagedData = async (initialUrl, { maxPages = MAX_FEED_SYNC_PAGES }
  * @param {Object} account - SocialAccount document
  * @returns {Promise<Array>} - Array of normalized post objects
  */
-const fetchFacebookPosts = async (account) => {
-  const url = `https://graph.facebook.com/v20.0/${account.accountId}/published_posts?fields=id,message,created_time,full_picture,permalink_url&limit=100&access_token=${account.accessToken}`;
-  const data = await fetchMetaPagedData(url);
+export const fetchFacebookPosts = async (account, { maxPages = MAX_FEED_SYNC_PAGES, limit = 100 } = {}) => {
+  const url = `https://graph.facebook.com/v20.0/${account.accountId}/published_posts?fields=id,message,created_time,full_picture,permalink_url&limit=${limit}&access_token=${account.accessToken}`;
+  const data = await fetchMetaPagedData(url, { maxPages });
 
   return Promise.all(data.map(async (post) => {
     const [viewResult, commentsCount] = await Promise.all([
@@ -75,10 +75,10 @@ const fetchFacebookPosts = async (account) => {
  * @param {Object} account - SocialAccount document
  * @returns {Promise<Array>} - Array of normalized post objects
  */
-const fetchInstagramPosts = async (account) => {
+export const fetchInstagramPosts = async (account, { maxPages = MAX_FEED_SYNC_PAGES, limit = 100 } = {}) => {
   const graphHost = account.authProvider === 'instagram' ? 'graph.instagram.com' : 'graph.facebook.com';
-  const url = `https://${graphHost}/v20.0/${account.accountId}/media?fields=id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count&limit=100&access_token=${account.accessToken}`;
-  const data = await fetchMetaPagedData(url);
+  const url = `https://${graphHost}/v20.0/${account.accountId}/media?fields=id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count&limit=${limit}&access_token=${account.accessToken}`;
+  const data = await fetchMetaPagedData(url, { maxPages });
 
   return data.map(post => ({
     metaPostId: post.id,

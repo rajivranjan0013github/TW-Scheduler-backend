@@ -9,6 +9,8 @@ import SocialAccount from '../models/SocialAccount.js';
 import CampaignChannel from '../models/CampaignChannel.js';
 import { protect, authorize } from '../middleware/auth.js';
 import { addPostToQueue, removePostFromQueue } from '../queues/publisherQueue.js';
+import { fetchFacebookPosts, fetchInstagramPosts } from '../queues/feedSyncWorker.js';
+import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
 import { normalizeChannelHandle } from '../utils/campaignChannels.js';
 
 const router = express.Router();
@@ -37,6 +39,8 @@ const idsToStrings = (items = []) => items.map((item) => String(item?._id || ite
 const validScheduleModes = new Set(['auto', 'manual', 'hybrid']);
 const terminalManualStatuses = new Set(['posted_manual', 'published', 'published_auto', 'cancelled']);
 const dashboardUpcomingStatuses = ['scheduled', 'publishing'];
+const MANUAL_POST_FEED_SYNC_MAX_PAGES = 1;
+const MANUAL_POST_FEED_SYNC_LIMIT = 10;
 
 const normalizeScheduleMode = (mode) => (
   validScheduleModes.has(mode) ? mode : 'auto'
@@ -113,6 +117,146 @@ const activeQueueStatuses = ['scheduled', 'manual_ready', 'downloaded', 'publish
 const getDateBoundary = (value, fallback) => {
   const date = value ? new Date(value) : fallback;
   return date && !Number.isNaN(date.getTime()) ? date : fallback;
+};
+
+const toDebugDate = (date) => ({
+  local: date?.toString?.() || null,
+  iso: date?.toISOString?.() || null,
+  timestamp: date?.getTime?.() || null,
+});
+
+const summarizeTodayTrackingPost = (post) => ({
+  _id: String(post._id || ''),
+  accountId: String(post.accountId || ''),
+  metaPostId: post.metaPostId || '',
+  platform: post.platform || '',
+  mediaType: post.mediaType || '',
+  facebookVideoId: post.facebookVideoId || '',
+  publishedAt: toDebugDate(post.publishedAt),
+  lastSyncedAt: toDebugDate(post.lastSyncedAt),
+  mediaUrl: post.mediaUrl || '',
+  videoUrl: post.videoUrl || '',
+  permalink: post.permalink || '',
+  contentPreview: (post.content || '').slice(0, 120),
+});
+
+const isVideoPublishedPost = (post = {}) => {
+  const mediaType = String(post.mediaType || '').toUpperCase();
+  return mediaType.includes('VIDEO') || Boolean(post.videoUrl || post.facebookVideoId);
+};
+
+const getManualPostVerificationStart = (post) => {
+  const downloadedAt = post.manualDownloadedAt ? new Date(post.manualDownloadedAt) : new Date();
+  const downloadedAtMs = downloadedAt.getTime();
+  const baseMs = Number.isFinite(downloadedAtMs) ? downloadedAtMs : Date.now();
+  return new Date(baseMs);
+};
+
+const getPostConnectedAccountIds = (post) => ([
+  ...idsToStrings(post.socialAccountIds),
+  ...idsToStrings((post.campaignChannelIds || [])
+    .map((channel) => channel?.socialAccountId)
+    .filter(Boolean)),
+]);
+
+const syncRecentMetaFeedForManualPost = async (post, { verificationStart } = {}) => {
+  const accountIds = getUniqueIds(getPostConnectedAccountIds(post));
+  if (accountIds.length === 0) {
+    return { accountsChecked: [], syncedPosts: [], matchingPosts: [], errors: [] };
+  }
+
+  const accounts = await SocialAccount.find({
+    _id: { $in: accountIds },
+    isConnected: true,
+    platform: { $in: ['facebook', 'instagram'] },
+  });
+  const syncedPosts = [];
+  const matchingPosts = [];
+  const errors = [];
+
+  for (const account of accounts) {
+    try {
+      const freshAccount = await ensureFreshAccountToken(account);
+      const fetchedPosts = freshAccount.platform === 'facebook'
+        ? await fetchFacebookPosts(freshAccount, {
+          maxPages: MANUAL_POST_FEED_SYNC_MAX_PAGES,
+          limit: MANUAL_POST_FEED_SYNC_LIMIT,
+        })
+        : await fetchInstagramPosts(freshAccount, {
+          maxPages: MANUAL_POST_FEED_SYNC_MAX_PAGES,
+          limit: MANUAL_POST_FEED_SYNC_LIMIT,
+        });
+
+      console.log('[manual-posted] live feed fetched', {
+        scheduledPostId: String(post._id || ''),
+        accountId: String(freshAccount._id || ''),
+        platform: freshAccount.platform,
+        username: freshAccount.username || '',
+        providerAccountId: freshAccount.accountId || '',
+        limit: MANUAL_POST_FEED_SYNC_LIMIT,
+        fetchedCount: fetchedPosts.length,
+        verificationStart: toDebugDate(verificationStart),
+        fetchedVideos: fetchedPosts
+          .filter(isVideoPublishedPost)
+          .map((postData) => summarizeTodayTrackingPost({
+            ...postData,
+            accountId: freshAccount._id,
+          })),
+        allFetchedPosts: fetchedPosts.map((postData) => summarizeTodayTrackingPost({
+          ...postData,
+          accountId: freshAccount._id,
+        })),
+      });
+
+      for (const postData of fetchedPosts) {
+        const cachedPost = await PublishedPost.findOneAndUpdate(
+          { userId: freshAccount.userId, metaPostId: postData.metaPostId },
+          {
+            userId: freshAccount.userId,
+            campaignId: freshAccount.campaignId,
+            accountId: freshAccount._id,
+            ...postData,
+            lastSyncedAt: new Date(),
+            ...(postData.latestViews !== undefined && { latestViews: postData.latestViews }),
+            ...(postData.latestLikes !== undefined && { latestLikes: postData.latestLikes }),
+            ...(postData.latestComments !== undefined && { latestComments: postData.latestComments }),
+          },
+          { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true },
+        ).lean();
+
+        syncedPosts.push(cachedPost);
+        const publishedAt = cachedPost?.publishedAt ? new Date(cachedPost.publishedAt).getTime() : NaN;
+        if (isVideoPublishedPost(cachedPost) && Number.isFinite(publishedAt) && publishedAt >= verificationStart.getTime()) {
+          matchingPosts.push(cachedPost);
+        }
+      }
+    } catch (error) {
+      errors.push({
+        accountId: String(account._id || ''),
+        platform: account.platform || '',
+        message: error.message,
+      });
+      await handleProviderAuthFailure(account, error, error.message);
+      console.error('[manual-posted] live feed fetch failed', {
+        scheduledPostId: String(post._id || ''),
+        accountId: String(account._id || ''),
+        platform: account.platform || '',
+        message: error.message,
+      });
+    }
+  }
+
+  return {
+    accountsChecked: accounts.map((account) => ({
+      _id: String(account._id || ''),
+      platform: account.platform || '',
+      username: account.username || '',
+      providerAccountId: account.accountId || '',
+    })),
+    syncedPosts,
+    matchingPosts,
+    errors,
+  };
 };
 
 const canAccessManualPost = async (post, user) => {
@@ -1003,6 +1147,38 @@ router.post('/:id/manual-posted', protect, async (req, res) => {
       return res.status(200).json(post);
     }
 
+    if (!post.manualDownloadedAt) {
+      post.manualDownloadedAt = new Date();
+      if (post.status === 'manual_ready') post.status = 'downloaded';
+      await post.save();
+    }
+
+    const verificationStart = getManualPostVerificationStart(post);
+    const verification = await syncRecentMetaFeedForManualPost(post, { verificationStart });
+    console.log('[manual-posted] verification result', {
+      scheduledPostId: String(post._id || ''),
+      manualDownloadedAt: toDebugDate(post.manualDownloadedAt),
+      verificationStart: toDebugDate(verificationStart),
+      accountsChecked: verification.accountsChecked,
+      syncedCount: verification.syncedPosts.length,
+      matchingCount: verification.matchingPosts.length,
+      errors: verification.errors,
+      matchingPosts: verification.matchingPosts.map(summarizeTodayTrackingPost),
+    });
+
+    if (verification.accountsChecked.length > 0 && verification.matchingPosts.length === 0) {
+      return res.status(409).json({
+        message: 'No live Meta/Instagram post was detected after this video was downloaded. Post it first, then tap Mark Posted again.',
+        verification: {
+          manualDownloadedAt: post.manualDownloadedAt,
+          checkedFrom: verificationStart,
+          accountsChecked: verification.accountsChecked,
+          syncedCount: verification.syncedPosts.length,
+          errors: verification.errors,
+        },
+      });
+    }
+
     await removePostFromQueue(post._id);
     post.status = 'posted_manual';
     post.publishSource = 'creator';
@@ -1245,6 +1421,18 @@ router.get('/creator/today-tracking', protect, async (req, res) => {
     const to = getDateBoundary(req.query.to, defaultEnd);
 
     const handlerEmail = (req.user.email || '').trim().toLowerCase();
+    console.log('[today-tracking] request date window', {
+      userId: String(req.user._id || ''),
+      email: handlerEmail,
+      query: req.query,
+      serverTimezoneOffsetMinutes: now.getTimezoneOffset(),
+      serverNow: toDebugDate(now),
+      defaultStart: toDebugDate(defaultStart),
+      defaultEnd: toDebugDate(defaultEnd),
+      from: toDebugDate(from),
+      to: toDebugDate(to),
+    });
+
     const creatorAccounts = await SocialAccount.find({
       userId: req.user._id,
       isConnected: true,
@@ -1267,6 +1455,22 @@ router.get('/creator/today-tracking', protect, async (req, res) => {
         })),
       ],
     }).select('socialAccountId status').lean();
+    console.log('[today-tracking] matched creator accounts/channels', {
+      creatorAccounts: creatorAccounts.map((account) => ({
+        _id: String(account._id || ''),
+        platform: account.platform || '',
+        username: account.username || '',
+        name: account.name || '',
+        accountId: account.accountId || '',
+      })),
+      accountLookupPairs,
+      assignedChannels: assignedChannels.map((channel) => ({
+        _id: String(channel._id || ''),
+        socialAccountId: String(channel.socialAccountId || ''),
+        status: channel.status || '',
+      })),
+    });
+
     const accountIds = [
       ...new Set([
         ...creatorAccountIds.map((accountId) => String(accountId)),
@@ -1278,16 +1482,53 @@ router.get('/creator/today-tracking', protect, async (req, res) => {
     ];
 
     if (accountIds.length === 0) {
+      console.log('[today-tracking] no account ids resolved', {
+        userId: String(req.user._id || ''),
+        email: handlerEmail,
+      });
       return res.status(200).json({ accounts: {} });
     }
+
+    const publishedPostQuery = {
+      accountId: { $in: accountIds },
+      publishedAt: { $gte: from, $lte: to },
+    };
+    console.log('[today-tracking] PublishedPost query', {
+      accountIds,
+      publishedAt: {
+        $gte: toDebugDate(from),
+        $lte: toDebugDate(to),
+      },
+    });
 
     const posts = await PublishedPost.find({
       accountId: { $in: accountIds },
       publishedAt: { $gte: from, $lte: to },
     })
-      .select('accountId metaPostId platform content permalink publishedAt lastSyncedAt')
+      .select('accountId metaPostId platform content mediaUrl videoUrl mediaType facebookVideoId permalink publishedAt lastSyncedAt')
       .sort({ publishedAt: -1 })
       .lean();
+
+    const postsByPlatform = posts.reduce((summary, post) => {
+      const platform = post.platform || 'unknown';
+      if (!summary[platform]) summary[platform] = [];
+      summary[platform].push(summarizeTodayTrackingPost(post));
+      return summary;
+    }, {});
+    console.log('[today-tracking] PublishedPost results', {
+      query: publishedPostQuery,
+      total: posts.length,
+      byPlatformCounts: Object.fromEntries(
+        Object.entries(postsByPlatform).map(([platform, platformPosts]) => [platform, platformPosts.length]),
+      ),
+      instagramVideos: posts
+        .filter((post) => post.platform === 'instagram')
+        .map(summarizeTodayTrackingPost),
+      metaVideos: posts
+        .filter((post) => ['facebook', 'instagram'].includes(post.platform))
+        .map(summarizeTodayTrackingPost),
+      allPosts: posts.map(summarizeTodayTrackingPost),
+    });
 
     const accounts = posts.reduce((summary, post) => {
       const accountId = String(post.accountId);
