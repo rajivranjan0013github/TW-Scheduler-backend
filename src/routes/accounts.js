@@ -34,12 +34,31 @@ const serializeCommentsPreview = (comments = []) => (
     timestamp: comment.timestamp || comment.created_time || null,
   })).filter(comment => comment.text).slice(0, 3)
 );
+
+const serializeCachedPublishedPost = (post) => ({
+  id: post.metaPostId,
+  content: post.content,
+  createdAt: post.publishedAt,
+  permalink: post.permalink,
+  mediaUrl: post.mediaUrl,
+  videoUrl: post.videoUrl,
+  mediaType: post.mediaType,
+  facebookVideoId: post.facebookVideoId || '',
+  viewsSource: post.viewsSource || '',
+  views: post.latestViews || 0,
+  likes: post.latestLikes || 0,
+  comments: post.latestComments || 0,
+  commentsPreview: serializeCommentsPreview(post.commentsPreview || []),
+  lastSyncedAt: post.lastSyncedAt,
+});
+
 const INSIGHT_SKIP_MS = 15 * 60 * 1000;
 const ADMIN_ROLES = ['owner', 'admin'];
 const MAX_FEED_SYNC_PAGES = 20;
+const PUBLISHED_FEED_WINDOW_DAYS = 30;
 const hasAdminAccess = (user) => ADMIN_ROLES.includes(user?.role) && user?.userType !== 'account_handler';
 
-const fetchMetaPagedData = async (initialUrl, { maxPages = MAX_FEED_SYNC_PAGES } = {}) => {
+const fetchMetaPagedData = async (initialUrl, { maxPages = MAX_FEED_SYNC_PAGES, shouldStop = null } = {}) => {
   const items = [];
   let url = initialUrl;
   let page = 0;
@@ -57,7 +76,11 @@ const fetchMetaPagedData = async (initialUrl, { maxPages = MAX_FEED_SYNC_PAGES }
       };
     }
 
-    items.push(...(data.data || []));
+    const pageItems = data.data || [];
+    items.push(...pageItems);
+    if (typeof shouldStop === 'function' && shouldStop(pageItems)) {
+      break;
+    }
     url = data.paging?.next || '';
     page += 1;
   }
@@ -1176,7 +1199,7 @@ router.get('/posts/recent', protect, async (req, res) => {
   }
 });
 
-// @desc    Get published posts for a specific account (cached-first, 2h staleness)
+// @desc    Get published posts for a specific account (cache-first; refresh only when requested)
 // @route   GET /api/accounts/:id/posts
 // @access  Private
 router.get('/:id/posts', protect, async (req, res) => {
@@ -1200,46 +1223,26 @@ router.get('/:id/posts', protect, async (req, res) => {
     }
 
     let liveAccount = account;
+    const feedWindowStart = new Date(Date.now() - PUBLISHED_FEED_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+    const isInFeedWindow = (dateValue) => {
+      const time = new Date(dateValue).getTime();
+      return Number.isFinite(time) && time >= feedWindowStart.getTime();
+    };
 
-    // Check for cached posts and their freshness (2 hour threshold)
-    const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
     let cachedPosts = [];
 
     if (!forceRefresh) {
-      cachedPosts = await PublishedPost.find({ accountId: account._id })
-        .sort({ publishedAt: -1 });
+      cachedPosts = await PublishedPost.find({
+        accountId: account._id,
+        publishedAt: { $gte: feedWindowStart },
+      })
+        .sort({ publishedAt: -1 })
+        .lean();
 
-      if (cachedPosts.length > 0) {
-        const syncTimes = cachedPosts
-          .map((post) => post.lastSyncedAt ? new Date(post.lastSyncedAt).getTime() : null)
-          .filter((time) => Number.isFinite(time));
-        const oldestReturnedSync = syncTimes.length > 0 ? Math.min(...syncTimes) : null;
-        const isFresh = oldestReturnedSync && (Date.now() - oldestReturnedSync) < TWO_HOURS_MS;
-
-        if (isFresh) {
-          // Return cached data directly
-          const result = cachedPosts.map(post => ({
-            id: post.metaPostId,
-            content: post.content,
-            createdAt: post.publishedAt,
-            permalink: post.permalink,
-            mediaUrl: post.mediaUrl,
-            videoUrl: post.videoUrl,
-            mediaType: post.mediaType,
-            facebookVideoId: post.facebookVideoId || '',
-            viewsSource: post.viewsSource || '',
-            views: post.latestViews || 0,
-            likes: post.latestLikes || 0,
-            comments: post.latestComments || 0,
-            commentsPreview: serializeCommentsPreview(post.commentsPreview || []),
-            lastSyncedAt: post.lastSyncedAt,
-          }));
-          return res.status(200).json(result);
-        }
-      }
+      return res.status(200).json(cachedPosts.map(serializeCachedPublishedPost));
     }
 
-    // Cache is stale or empty or force refresh — fetch from Meta
+    // Explicit refresh — fetch from Meta and rewrite the cache.
     try {
       liveAccount = await ensureFreshAccountToken(liveAccount);
     } catch (authErr) {
@@ -1303,11 +1306,14 @@ router.get('/:id/posts', protect, async (req, res) => {
     let posts = [];
     if (liveAccount.platform === 'facebook') {
       const url = `https://graph.facebook.com/v20.0/${liveAccount.accountId}/published_posts?fields=id,message,created_time,full_picture,permalink_url&limit=100&access_token=${liveAccount.accessToken}`;
-      const apiResult = await fetchMetaPagedData(url);
+      const apiResult = await fetchMetaPagedData(url, {
+        shouldStop: (pageItems) => pageItems.some((post) => !isInFeedWindow(post.created_time)),
+      });
       const apiData = apiResult.data;
       
       if (apiResult.ok) {
-        posts = await Promise.all((apiData.data || []).map(async (post) => {
+        const recentPosts = (apiData.data || []).filter((post) => isInFeedWindow(post.created_time));
+        posts = await Promise.all(recentPosts.map(async (post) => {
           const existingPost = existingPostMap.get(post.id);
           const [viewResult, likes, commentsCount, commentsPreview] = await Promise.all([
             fetchFacebookPostViews(liveAccount.accessToken, post),
@@ -1354,11 +1360,14 @@ router.get('/:id/posts', protect, async (req, res) => {
     } else if (liveAccount.platform === 'instagram') {
       const graphHost = liveAccount.authProvider === 'instagram' ? 'graph.instagram.com' : 'graph.facebook.com';
       const url = `https://${graphHost}/v20.0/${liveAccount.accountId}/media?fields=id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count&limit=100&access_token=${liveAccount.accessToken}`;
-      const apiResult = await fetchMetaPagedData(url);
+      const apiResult = await fetchMetaPagedData(url, {
+        shouldStop: (pageItems) => pageItems.some((post) => !isInFeedWindow(post.timestamp)),
+      });
       const apiData = apiResult.data;
 
       if (apiResult.ok) {
-        posts = await Promise.all((apiData.data || []).map(async (post) => {
+        const recentPosts = (apiData.data || []).filter((post) => isInFeedWindow(post.timestamp));
+        posts = await Promise.all(recentPosts.map(async (post) => {
           const existingPost = existingPostMap.get(post.id);
           const [views, insightLikes, insightComments, commentsPreview] = await Promise.all([
             getInsightValue(post.id, 'views'),
@@ -1395,7 +1404,8 @@ router.get('/:id/posts', protect, async (req, res) => {
         });
       }
     } else if (liveAccount.platform === 'youtube') {
-      posts = await fetchYoutubeVideos(liveAccount);
+      posts = (await fetchYoutubeVideos(liveAccount))
+        .filter((post) => isInFeedWindow(post.createdAt));
     }
 
     // Upsert fetched posts into PublishedPost cache

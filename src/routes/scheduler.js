@@ -999,8 +999,8 @@ router.post('/:id/manual-posted', protect, async (req, res) => {
     if (!(await canAccessManualPost(post, req.user))) {
       return res.status(403).json({ message: 'Access denied for this scheduled post.' });
     }
-    if (terminalManualStatuses.has(post.status)) {
-      return res.status(400).json({ message: 'This post is already complete or cancelled.' });
+    if (['posted_manual', 'published', 'published_auto'].includes(post.status)) {
+      return res.status(200).json(post);
     }
 
     await removePostFromQueue(post._id);

@@ -136,15 +136,15 @@ router.post('/generate-caption', protect, async (req, res) => {
     const prompt = `You are a mobile app marketing copywriter. We need a short, relatable, Gen Z couple/relationship caption for a video representing our couples app: "Penguin".
 
 App Name: Penguin
-Penguin is a couples app where partners can answer 3000+ questions, play games, complete rituals, update moods, send doodles, see relationship countdowns, track distance, and use lock screen/home screen widgets.
+Penguin is a couples app where partners can answer 3000+ questions, play games, complete rituals, update moods, send drawings to each other's home screens, draw live together in real-time, see relationship countdowns, track distance, and use lock screen/home screen widgets.
 
 Video File Name/Context: "${videoName || 'couple video'}"
 
-Generate a short, viral, Gen Z couple caption.
+Generate a short, viral, Gen Z couple caption. The total output MUST be strictly less than 100 characters.
 Requirements:
-1. One short relatable line (e.g. "she always be clutching me out tbh", "i'm actually addicted to this", "my bf downloads the weirdest apps").
+1. One short relatable line (e.g. "she always be clutching me out tbh").
 2. Followed by exactly five dots (each dot on a new line).
-3. Followed by exactly 10 relevant hashtags starting with relationship/couple topics like #couple #ldr #relationship #longdistance #bfgf #longdistancerelationships #game #widget #relationshipadvice and 1 related to the video context.
+3. Followed by exactly 4 relevant hashtags starting with relationship/couple topics.
 
 Formatting style example:
 she always be clutching me out tbh
@@ -153,7 +153,7 @@ she always be clutching me out tbh
 .
 .
 .
-#couple #ldr #relationship #longdistance #bfgf #longdistancerelationships #game #widget #relationshipadvice #clutch
+#couple #ldr #relationship #widget
 
 Output ONLY the final caption text. Do not include markdown codeblocks or explanations. Just output the raw caption.`;
 
