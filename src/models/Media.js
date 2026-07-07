@@ -54,12 +54,24 @@ const MediaSchema = new mongoose.Schema({
     type: String,
     default: '',
   },
+  uploadBatchId: {
+    type: String,
+    default: '',
+    index: true,
+  },
+  uploadBatchCreatedAt: {
+    type: Date,
+  },
+  uploadOrder: {
+    type: Number,
+  },
   tags: [String],
   size: {
     type: Number,
   },
 }, { timestamps: true });
 
+MediaSchema.index({ campaignId: 1, folderId: 1, uploadBatchCreatedAt: -1, uploadOrder: 1, createdAt: -1 });
 MediaSchema.index({ campaignId: 1, folderId: 1, createdAt: -1 });
 MediaSchema.index({ campaignId: 1, socialAccountIds: 1, createdAt: -1 });
 MediaSchema.index({ campaignId: 1, userId: 1 });

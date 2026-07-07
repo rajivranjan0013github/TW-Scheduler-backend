@@ -66,6 +66,17 @@ const parseTagList = (value) => {
   return String(value).split(',').map(t => t.trim().toLowerCase()).filter(Boolean);
 };
 
+const parseUploadOrder = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+};
+
+const parseUploadBatchCreatedAt = (value) => {
+  if (!value) return undefined;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+};
+
 const getMediaTypeFromMime = (mimeType = '') => {
   if (mimeType.startsWith('video/')) return 'video';
   if (mimeType.startsWith('image/')) return 'image';
@@ -396,8 +407,15 @@ router.get('/', protect, async (req, res) => {
         });
       }
       
-      // Sort newest first
-      filtered.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      filtered.sort((a, b) => {
+        const batchA = new Date(a.uploadBatchCreatedAt || a.createdAt).getTime();
+        const batchB = new Date(b.uploadBatchCreatedAt || b.createdAt).getTime();
+        if (batchA !== batchB) return batchB - batchA;
+        const orderA = Number.isFinite(Number(a.uploadOrder)) ? Number(a.uploadOrder) : Number.MAX_SAFE_INTEGER;
+        const orderB = Number.isFinite(Number(b.uploadOrder)) ? Number(b.uploadOrder) : Number.MAX_SAFE_INTEGER;
+        if (orderA !== orderB) return orderA - orderB;
+        return new Date(b.createdAt) - new Date(a.createdAt);
+      });
       
       if (querySkip !== undefined && queryLimit !== undefined) {
         filtered = filtered.slice(querySkip, querySkip + queryLimit);
@@ -431,7 +449,7 @@ router.get('/', protect, async (req, res) => {
 
     let dbQuery = Media.find(query)
       .populate('socialAccountIds', 'name username platform avatarUrl isConnected')
-      .sort({ createdAt: -1 });
+      .sort({ uploadBatchCreatedAt: -1, uploadOrder: 1, createdAt: -1 });
 
     if (querySkip !== undefined && queryLimit !== undefined) {
       dbQuery = dbQuery.skip(querySkip).limit(queryLimit);
@@ -514,6 +532,9 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
     caption = '',
     tags,
     size,
+    uploadBatchId = '',
+    uploadBatchCreatedAt,
+    uploadOrder,
   } = req.body || {};
 
   if (!mediaId || !name || !storageKey) {
@@ -561,6 +582,9 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
       url: getStorageUrl(storageKey),
       storageKey,
       caption: caption || '',
+      uploadBatchId: String(uploadBatchId || ''),
+      uploadBatchCreatedAt: parseUploadBatchCreatedAt(uploadBatchCreatedAt),
+      uploadOrder: parseUploadOrder(uploadOrder),
       tags: parseTagList(tags),
       size: Number(size) || undefined,
     });
@@ -583,7 +607,7 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
     return res.status(400).json({ message: 'No file uploaded' });
   }
 
-  const { folderId, tags, caption } = req.body;
+  const { folderId, tags, caption, uploadBatchId = '', uploadBatchCreatedAt, uploadOrder } = req.body;
   const campaignId = requireCampaignId(req, res);
   if (!campaignId) return;
   const requestedAccountIds = parseIdList(req.body.socialAccountIds);
@@ -621,6 +645,9 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
         url,
         storageKey,
         caption: caption || '',
+        uploadBatchId: String(uploadBatchId || ''),
+        uploadBatchCreatedAt: parseUploadBatchCreatedAt(uploadBatchCreatedAt),
+        uploadOrder: parseUploadOrder(uploadOrder),
         socialAccountIds,
         tags: tagList,
         size: req.file.size,
@@ -652,6 +679,9 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
       url,
       storageKey,
       caption: caption || '',
+      uploadBatchId: String(uploadBatchId || ''),
+      uploadBatchCreatedAt: parseUploadBatchCreatedAt(uploadBatchCreatedAt),
+      uploadOrder: parseUploadOrder(uploadOrder),
       tags: tagList,
       size: req.file.size,
     });
