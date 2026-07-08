@@ -240,7 +240,10 @@ const getCampaignMetrics = async (campaign) => {
       last7DaysComments: 0,
       thisMonthLikes: 0,
       thisMonthComments: 0,
-      last7DaysActivity: last7DayActivityTemplate.map((day) => ({ ...day })),
+      last7DaysActivity: last7DayActivityTemplate.map((day) => ({
+        ...day,
+        posts: [],
+      })),
     },
   ]));
 
