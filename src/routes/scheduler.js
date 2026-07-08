@@ -187,26 +187,7 @@ const syncRecentMetaFeedForManualPost = async (post, { verificationStart } = {})
           limit: MANUAL_POST_FEED_SYNC_LIMIT,
         });
 
-      console.log('[manual-posted] live feed fetched', {
-        scheduledPostId: String(post._id || ''),
-        accountId: String(freshAccount._id || ''),
-        platform: freshAccount.platform,
-        username: freshAccount.username || '',
-        providerAccountId: freshAccount.accountId || '',
-        limit: MANUAL_POST_FEED_SYNC_LIMIT,
-        fetchedCount: fetchedPosts.length,
-        verificationStart: toDebugDate(verificationStart),
-        fetchedVideos: fetchedPosts
-          .filter(isVideoPublishedPost)
-          .map((postData) => summarizeTodayTrackingPost({
-            ...postData,
-            accountId: freshAccount._id,
-          })),
-        allFetchedPosts: fetchedPosts.map((postData) => summarizeTodayTrackingPost({
-          ...postData,
-          accountId: freshAccount._id,
-        })),
-      });
+     
 
       for (const postData of fetchedPosts) {
         const cachedPost = await PublishedPost.findOneAndUpdate(
@@ -1111,6 +1092,59 @@ router.post('/:id/downloaded', protect, async (req, res) => {
   }
 });
 
+// @desc    Return a downloaded manual/hybrid post to share-ready state
+// @route   POST /api/scheduler/:id/not-posted
+// @access  Private
+router.post('/:id/not-posted', protect, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      const post = mockStore.scheduledPosts.find(p => p._id === id);
+      if (!post) return res.status(404).json({ message: 'Post not found' });
+      if (!['manual', 'hybrid'].includes(post.scheduleMode || 'auto')) {
+        return res.status(400).json({ message: 'Only manual or hybrid posts can be marked as not posted.' });
+      }
+      post.manualDownloadedAt = null;
+      post.manualPostedAt = null;
+      post.manualPostUrl = '';
+      post.postedByUserId = null;
+      post.publishSource = null;
+      post.status = getInitialStatusForMode(post.scheduleMode || 'auto');
+      post.updatedAt = new Date();
+      return res.status(200).json(post);
+    }
+
+    const post = await ScheduledPost.findById(id)
+      .populate('socialAccountIds')
+      .populate('campaignChannelIds')
+      .populate('mediaIds');
+    if (!post) return res.status(404).json({ message: 'Post not found' });
+    if (!['manual', 'hybrid'].includes(post.scheduleMode || 'auto')) {
+      return res.status(400).json({ message: 'Only manual or hybrid posts can be marked as not posted.' });
+    }
+    if (!(await canAccessManualPost(post, req.user))) {
+      return res.status(403).json({ message: 'Access denied for this scheduled post.' });
+    }
+    if (terminalManualStatuses.has(post.status)) {
+      return res.status(400).json({ message: 'This post is already complete or cancelled.' });
+    }
+
+    post.manualDownloadedAt = null;
+    post.manualPostedAt = null;
+    post.manualPostUrl = '';
+    post.postedByUserId = null;
+    post.publishSource = null;
+    post.status = getInitialStatusForMode(post.scheduleMode || 'auto');
+    await post.save();
+
+    res.status(200).json(post);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // @desc    Mark a manual/hybrid post as posted by the creator
 // @route   POST /api/scheduler/:id/manual-posted
 // @access  Private
@@ -1155,16 +1189,7 @@ router.post('/:id/manual-posted', protect, async (req, res) => {
 
     const verificationStart = getManualPostVerificationStart(post);
     const verification = await syncRecentMetaFeedForManualPost(post, { verificationStart });
-    console.log('[manual-posted] verification result', {
-      scheduledPostId: String(post._id || ''),
-      manualDownloadedAt: toDebugDate(post.manualDownloadedAt),
-      verificationStart: toDebugDate(verificationStart),
-      accountsChecked: verification.accountsChecked,
-      syncedCount: verification.syncedPosts.length,
-      matchingCount: verification.matchingPosts.length,
-      errors: verification.errors,
-      matchingPosts: verification.matchingPosts.map(summarizeTodayTrackingPost),
-    });
+  
 
     if (verification.accountsChecked.length > 0 && verification.matchingPosts.length === 0) {
       return res.status(409).json({
@@ -1421,17 +1446,7 @@ router.get('/creator/today-tracking', protect, async (req, res) => {
     const to = getDateBoundary(req.query.to, defaultEnd);
 
     const handlerEmail = (req.user.email || '').trim().toLowerCase();
-    console.log('[today-tracking] request date window', {
-      userId: String(req.user._id || ''),
-      email: handlerEmail,
-      query: req.query,
-      serverTimezoneOffsetMinutes: now.getTimezoneOffset(),
-      serverNow: toDebugDate(now),
-      defaultStart: toDebugDate(defaultStart),
-      defaultEnd: toDebugDate(defaultEnd),
-      from: toDebugDate(from),
-      to: toDebugDate(to),
-    });
+  
 
     const creatorAccounts = await SocialAccount.find({
       userId: req.user._id,
@@ -1455,21 +1470,7 @@ router.get('/creator/today-tracking', protect, async (req, res) => {
         })),
       ],
     }).select('socialAccountId status').lean();
-    console.log('[today-tracking] matched creator accounts/channels', {
-      creatorAccounts: creatorAccounts.map((account) => ({
-        _id: String(account._id || ''),
-        platform: account.platform || '',
-        username: account.username || '',
-        name: account.name || '',
-        accountId: account.accountId || '',
-      })),
-      accountLookupPairs,
-      assignedChannels: assignedChannels.map((channel) => ({
-        _id: String(channel._id || ''),
-        socialAccountId: String(channel.socialAccountId || ''),
-        status: channel.status || '',
-      })),
-    });
+  
 
     const accountIds = [
       ...new Set([
@@ -1482,10 +1483,7 @@ router.get('/creator/today-tracking', protect, async (req, res) => {
     ];
 
     if (accountIds.length === 0) {
-      console.log('[today-tracking] no account ids resolved', {
-        userId: String(req.user._id || ''),
-        email: handlerEmail,
-      });
+    
       return res.status(200).json({ accounts: {} });
     }
 
@@ -1493,13 +1491,7 @@ router.get('/creator/today-tracking', protect, async (req, res) => {
       accountId: { $in: accountIds },
       publishedAt: { $gte: from, $lte: to },
     };
-    console.log('[today-tracking] PublishedPost query', {
-      accountIds,
-      publishedAt: {
-        $gte: toDebugDate(from),
-        $lte: toDebugDate(to),
-      },
-    });
+  
 
     const posts = await PublishedPost.find({
       accountId: { $in: accountIds },
@@ -1515,20 +1507,7 @@ router.get('/creator/today-tracking', protect, async (req, res) => {
       summary[platform].push(summarizeTodayTrackingPost(post));
       return summary;
     }, {});
-    console.log('[today-tracking] PublishedPost results', {
-      query: publishedPostQuery,
-      total: posts.length,
-      byPlatformCounts: Object.fromEntries(
-        Object.entries(postsByPlatform).map(([platform, platformPosts]) => [platform, platformPosts.length]),
-      ),
-      instagramVideos: posts
-        .filter((post) => post.platform === 'instagram')
-        .map(summarizeTodayTrackingPost),
-      metaVideos: posts
-        .filter((post) => ['facebook', 'instagram'].includes(post.platform))
-        .map(summarizeTodayTrackingPost),
-      allPosts: posts.map(summarizeTodayTrackingPost),
-    });
+ 
 
     const accounts = posts.reduce((summary, post) => {
       const accountId = String(post.accountId);
