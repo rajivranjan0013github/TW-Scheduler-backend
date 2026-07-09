@@ -14,7 +14,7 @@ import { initWorker, publishPostJob } from './src/queues/publisherWorker.js';
 import authRoutes from './src/routes/auth.js';
 import accountRoutes from './src/routes/accounts.js';
 import mediaRoutes from './src/routes/media.js';
-import schedulerRoutes from './src/routes/scheduler.js';
+import schedulerRoutes, { startCreatorAutoCheckInterval } from './src/routes/scheduler.js';
 import adminRoutes from './src/routes/admin.js';
 import aiRoutes from './src/routes/ai.js';
 import { protect } from './src/middleware/auth.js';
@@ -105,6 +105,7 @@ const startServer = async () => {
   // 3. Initialize background worker & queue engines
   await initQueue();
   initWorker();
+  startCreatorAutoCheckInterval();
 
   // 4. Listen on PORT
   app.listen(PORT, () => {

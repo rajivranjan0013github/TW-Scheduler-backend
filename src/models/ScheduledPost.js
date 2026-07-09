@@ -72,6 +72,18 @@ const ScheduledPostSchema = new mongoose.Schema({
     type: String,
     default: '',
   },
+  manualAutoCheckedAt: {
+    type: Date,
+    default: null,
+  },
+  manualAutoCheckCount: {
+    type: Number,
+    default: 0,
+  },
+  manualAutoCheckError: {
+    type: String,
+    default: '',
+  },
   postedByUserId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',

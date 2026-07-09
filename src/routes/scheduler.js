@@ -11,6 +11,7 @@ import { protect, authorize } from '../middleware/auth.js';
 import { addPostToQueue, removePostFromQueue } from '../queues/publisherQueue.js';
 import { fetchFacebookPosts, fetchInstagramPosts } from '../queues/feedSyncWorker.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
+import { fetchYoutubeVideos } from '../services/youtubeService.js';
 import { normalizeChannelHandle } from '../utils/campaignChannels.js';
 
 const router = express.Router();
@@ -41,6 +42,9 @@ const terminalManualStatuses = new Set(['posted_manual', 'published', 'published
 const dashboardUpcomingStatuses = ['scheduled', 'publishing'];
 const MANUAL_POST_FEED_SYNC_MAX_PAGES = 1;
 const MANUAL_POST_FEED_SYNC_LIMIT = 10;
+const MANUAL_POST_AUTO_CHECK_FIRST_DELAY_MS = 10 * 60 * 1000;
+const MANUAL_POST_AUTO_CHECK_SECOND_DELAY_MS = 30 * 60 * 1000;
+const MANUAL_POST_AUTO_CHECK_INTERVAL_MS = 60 * 1000;
 
 const normalizeScheduleMode = (mode) => (
   validScheduleModes.has(mode) ? mode : 'auto'
@@ -113,6 +117,8 @@ const getUniqueIds = (items = []) => (
 );
 
 const activeQueueStatuses = ['scheduled', 'manual_ready', 'downloaded', 'publishing', 'paused'];
+const MANUAL_POST_COOLDOWN_MS = 4 * 60 * 60 * 1000;
+let creatorAutoCheckIntervalId = null;
 
 const getDateBoundary = (value, fallback) => {
   const date = value ? new Date(value) : fallback;
@@ -159,7 +165,44 @@ const getPostConnectedAccountIds = (post) => ([
     .filter(Boolean)),
 ]);
 
-const syncRecentMetaFeedForManualPost = async (post, { verificationStart } = {}) => {
+const markManualPostAsPosted = async (post, user, { manualPostUrl = '' } = {}) => {
+  await removePostFromQueue(post._id);
+  post.status = 'posted_manual';
+  post.publishSource = 'creator';
+  post.manualPostedAt = new Date();
+  post.manualPostUrl = manualPostUrl;
+  post.manualAutoCheckError = '';
+  post.postedByUserId = user?._id || user || post.userId;
+  await post.save();
+  return post;
+};
+
+const getManualPostCooldown = async (post) => {
+  const accountIds = getUniqueIds(getPostConnectedAccountIds(post));
+  if (accountIds.length === 0) return null;
+
+  const cooldownStart = new Date(Date.now() - MANUAL_POST_COOLDOWN_MS);
+  const latestPost = await PublishedPost.findOne({
+    accountId: { $in: accountIds },
+    publishedAt: { $gte: cooldownStart },
+  })
+    .select('accountId publishedAt platform metaPostId')
+    .sort({ publishedAt: -1 })
+    .lean();
+
+  if (!latestPost?.publishedAt) return null;
+  const unlocksAt = new Date(new Date(latestPost.publishedAt).getTime() + MANUAL_POST_COOLDOWN_MS);
+  return {
+    accountId: String(latestPost.accountId || ''),
+    platform: latestPost.platform || '',
+    metaPostId: latestPost.metaPostId || '',
+    lastPublishedAt: latestPost.publishedAt,
+    unlocksAt,
+    remainingMs: Math.max(0, unlocksAt.getTime() - Date.now()),
+  };
+};
+
+const syncRecentFeedForManualPost = async (post, { verificationStart } = {}) => {
   const accountIds = getUniqueIds(getPostConnectedAccountIds(post));
   if (accountIds.length === 0) {
     return { accountsChecked: [], syncedPosts: [], matchingPosts: [], errors: [] };
@@ -168,7 +211,7 @@ const syncRecentMetaFeedForManualPost = async (post, { verificationStart } = {})
   const accounts = await SocialAccount.find({
     _id: { $in: accountIds },
     isConnected: true,
-    platform: { $in: ['facebook', 'instagram'] },
+    platform: { $in: ['facebook', 'instagram', 'youtube'] },
   });
   const syncedPosts = [];
   const matchingPosts = [];
@@ -177,15 +220,21 @@ const syncRecentMetaFeedForManualPost = async (post, { verificationStart } = {})
   for (const account of accounts) {
     try {
       const freshAccount = await ensureFreshAccountToken(account);
-      const fetchedPosts = freshAccount.platform === 'facebook'
-        ? await fetchFacebookPosts(freshAccount, {
-          maxPages: MANUAL_POST_FEED_SYNC_MAX_PAGES,
-          limit: MANUAL_POST_FEED_SYNC_LIMIT,
-        })
-        : await fetchInstagramPosts(freshAccount, {
+      let fetchedPosts = [];
+
+      if (freshAccount.platform === 'facebook') {
+        fetchedPosts = await fetchFacebookPosts(freshAccount, {
           maxPages: MANUAL_POST_FEED_SYNC_MAX_PAGES,
           limit: MANUAL_POST_FEED_SYNC_LIMIT,
         });
+      } else if (freshAccount.platform === 'instagram') {
+        fetchedPosts = await fetchInstagramPosts(freshAccount, {
+          maxPages: MANUAL_POST_FEED_SYNC_MAX_PAGES,
+          limit: MANUAL_POST_FEED_SYNC_LIMIT,
+        });
+      } else if (freshAccount.platform === 'youtube') {
+        fetchedPosts = await fetchYoutubeVideos(freshAccount);
+      }
 
      
 
@@ -238,6 +287,108 @@ const syncRecentMetaFeedForManualPost = async (post, { verificationStart } = {})
     matchingPosts,
     errors,
   };
+};
+
+const getManualPostActorId = (post) => {
+  const assignedChannel = (post.campaignChannelIds || []).find((channel) => channel?.assignedHandlerUserId);
+  if (assignedChannel?.assignedHandlerUserId) return assignedChannel.assignedHandlerUserId;
+  const account = (post.socialAccountIds || []).find((item) => item?.userId);
+  return account?.userId || post.userId;
+};
+
+export const runCreatorAutoPostedCheck = async ({ limit = 20 } = {}) => {
+  const isConnected = getDBStatus();
+  if (!isConnected) {
+    return { checked: 0, marked: 0, posts: [], skipped: [] };
+  }
+
+  const nowMs = Date.now();
+  const cutoff = new Date(nowMs - MANUAL_POST_AUTO_CHECK_FIRST_DELAY_MS);
+  const candidates = await ScheduledPost.find({
+    scheduleMode: { $in: ['manual', 'hybrid'] },
+    status: { $nin: ['posted_manual', 'published', 'published_auto', 'failed', 'cancelled'] },
+    manualDownloadedAt: { $exists: true, $ne: null, $lte: cutoff },
+    $or: [
+      { manualPostedAt: { $exists: false } },
+      { manualPostedAt: null },
+    ],
+    $and: [{
+      $or: [
+        { manualAutoCheckCount: { $exists: false } },
+        { manualAutoCheckCount: { $lt: 2 } },
+      ],
+    }],
+  })
+    .populate('socialAccountIds')
+    .populate('campaignChannelIds')
+    .populate('mediaIds')
+    .sort({ manualDownloadedAt: 1 })
+    .limit(limit);
+
+  const markedPosts = [];
+  const skipped = [];
+
+  for (const post of candidates) {
+    const autoCheckCount = Number(post.manualAutoCheckCount || (post.manualAutoCheckedAt ? 1 : 0));
+    const downloadedAtMs = post.manualDownloadedAt ? new Date(post.manualDownloadedAt).getTime() : NaN;
+    const elapsedMs = Number.isFinite(downloadedAtMs) ? nowMs - downloadedAtMs : 0;
+    const nextDelayMs = autoCheckCount <= 0
+      ? MANUAL_POST_AUTO_CHECK_FIRST_DELAY_MS
+      : MANUAL_POST_AUTO_CHECK_SECOND_DELAY_MS;
+
+    if (autoCheckCount >= 2 || elapsedMs < nextDelayMs) {
+      continue;
+    }
+
+    const verificationStart = getManualPostVerificationStart(post);
+    const verification = await syncRecentFeedForManualPost(post, { verificationStart });
+    post.manualAutoCheckedAt = new Date();
+    post.manualAutoCheckCount = autoCheckCount + 1;
+    if (verification.accountsChecked.length === 0) {
+      post.manualAutoCheckError = 'No connected accounts available for auto-check.';
+      await post.save();
+      skipped.push({ postId: String(post._id), reason: 'no_connected_accounts' });
+      continue;
+    }
+
+    if (verification.matchingPosts.length === 0) {
+      post.manualAutoCheckError = 'No live post detected during auto-check.';
+      await post.save();
+      skipped.push({
+        postId: String(post._id),
+        reason: 'not_detected',
+        accountsChecked: verification.accountsChecked.length,
+        syncedCount: verification.syncedPosts.length,
+        errors: verification.errors,
+      });
+      continue;
+    }
+
+    post.manualAutoCheckError = '';
+    const updatedPost = await markManualPostAsPosted(post, getManualPostActorId(post));
+    markedPosts.push(updatedPost);
+  }
+
+  return {
+    checked: candidates.length,
+    marked: markedPosts.length,
+    posts: markedPosts,
+    skipped,
+  };
+};
+
+export const startCreatorAutoCheckInterval = () => {
+  if (creatorAutoCheckIntervalId) {
+    clearInterval(creatorAutoCheckIntervalId);
+  }
+
+  creatorAutoCheckIntervalId = setInterval(async () => {
+    try {
+      await runCreatorAutoPostedCheck();
+    } catch (error) {
+      console.error('[creator-auto-check] failed:', error.message);
+    }
+  }, MANUAL_POST_AUTO_CHECK_INTERVAL_MS);
 };
 
 const canAccessManualPost = async (post, user) => {
@@ -1062,6 +1213,9 @@ router.post('/:id/downloaded', protect, async (req, res) => {
       const post = mockStore.scheduledPosts.find(p => p._id === id);
       if (!post) return res.status(404).json({ message: 'Post not found' });
       post.manualDownloadedAt = new Date();
+      post.manualAutoCheckedAt = null;
+      post.manualAutoCheckCount = 0;
+      post.manualAutoCheckError = '';
       if (post.status === 'manual_ready') post.status = 'downloaded';
       post.updatedAt = new Date();
       return res.status(200).json(post);
@@ -1081,8 +1235,18 @@ router.post('/:id/downloaded', protect, async (req, res) => {
     if (terminalManualStatuses.has(post.status)) {
       return res.status(400).json({ message: 'This post is already complete or cancelled.' });
     }
+    const cooldown = await getManualPostCooldown(post);
+    if (cooldown) {
+      return res.status(429).json({
+        message: 'Please wait 4 hours between posts on this account.',
+        cooldown,
+      });
+    }
 
     post.manualDownloadedAt = new Date();
+    post.manualAutoCheckedAt = null;
+    post.manualAutoCheckCount = 0;
+    post.manualAutoCheckError = '';
     if (post.status === 'manual_ready') post.status = 'downloaded';
     await post.save();
 
@@ -1109,6 +1273,9 @@ router.post('/:id/not-posted', protect, async (req, res) => {
       post.manualDownloadedAt = null;
       post.manualPostedAt = null;
       post.manualPostUrl = '';
+      post.manualAutoCheckedAt = null;
+      post.manualAutoCheckCount = 0;
+      post.manualAutoCheckError = '';
       post.postedByUserId = null;
       post.publishSource = null;
       post.status = getInitialStatusForMode(post.scheduleMode || 'auto');
@@ -1134,6 +1301,9 @@ router.post('/:id/not-posted', protect, async (req, res) => {
     post.manualDownloadedAt = null;
     post.manualPostedAt = null;
     post.manualPostUrl = '';
+    post.manualAutoCheckedAt = null;
+    post.manualAutoCheckCount = 0;
+    post.manualAutoCheckError = '';
     post.postedByUserId = null;
     post.publishSource = null;
     post.status = getInitialStatusForMode(post.scheduleMode || 'auto');
@@ -1183,17 +1353,20 @@ router.post('/:id/manual-posted', protect, async (req, res) => {
 
     if (!post.manualDownloadedAt) {
       post.manualDownloadedAt = new Date();
+      post.manualAutoCheckedAt = null;
+      post.manualAutoCheckCount = 0;
+      post.manualAutoCheckError = '';
       if (post.status === 'manual_ready') post.status = 'downloaded';
       await post.save();
     }
 
     const verificationStart = getManualPostVerificationStart(post);
-    const verification = await syncRecentMetaFeedForManualPost(post, { verificationStart });
+    const verification = await syncRecentFeedForManualPost(post, { verificationStart });
   
 
     if (verification.accountsChecked.length > 0 && verification.matchingPosts.length === 0) {
       return res.status(409).json({
-        message: 'No live Meta/Instagram post was detected after this video was downloaded. Post it first, then tap Mark Posted again.',
+        message: 'No live post was detected after this video was downloaded. Post it first, then tap Mark Posted again.',
         verification: {
           manualDownloadedAt: post.manualDownloadedAt,
           checkedFrom: verificationStart,
@@ -1204,13 +1377,7 @@ router.post('/:id/manual-posted', protect, async (req, res) => {
       });
     }
 
-    await removePostFromQueue(post._id);
-    post.status = 'posted_manual';
-    post.publishSource = 'creator';
-    post.manualPostedAt = new Date();
-    post.manualPostUrl = manualPostUrl;
-    post.postedByUserId = req.user._id;
-    await post.save();
+    await markManualPostAsPosted(post, req.user, { manualPostUrl });
 
     res.status(200).json(post);
   } catch (error) {
@@ -1347,6 +1514,8 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
 // @access  Private (Owner, Admin, Editor)
 router.delete('/queue/account/:accountId', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
   const { accountId } = req.params;
+  const accountIds = splitQueryList(accountId);
+  const accountIdSet = new Set(accountIds.map(String));
 
   try {
     const isConnected = getDBStatus();
@@ -1357,7 +1526,10 @@ router.delete('/queue/account/:accountId', protect, authorize('owner', 'admin', 
       const beforeCount = mockStore.scheduledPosts.length;
       const shouldDelete = (post) => (
         activeQueueStatuses.includes(post.status)
-        && idsToStrings(post.socialAccountIds).includes(String(accountId))
+        && (
+          idsToStrings(post.socialAccountIds).some((id) => accountIdSet.has(id))
+          || idsToStrings(post.campaignChannelIds).some((id) => accountIdSet.has(id))
+        )
       );
       mockStore.scheduledPosts = mockStore.scheduledPosts.filter((post) => !shouldDelete(post));
       return res.status(200).json({
@@ -1369,16 +1541,21 @@ router.delete('/queue/account/:accountId', protect, authorize('owner', 'admin', 
     const query = {
       campaignId,
       status: { $in: activeQueueStatuses },
-      socialAccountIds: accountId,
+      $or: [
+        { socialAccountIds: { $in: accountIds } },
+        { campaignChannelIds: { $in: accountIds } },
+      ],
     };
 
-    const posts = await ScheduledPost.find(query).select('_id socialAccountIds');
+    const posts = await ScheduledPost.find(query).select('_id socialAccountIds campaignChannelIds');
     let deletedCount = 0;
 
     for (const post of posts) {
-      const accountIds = idsToStrings(post.socialAccountIds);
-      if (accountIds.length > 1) {
-        post.socialAccountIds = post.socialAccountIds.filter((id) => String(id) !== String(accountId));
+      const remainingSocialAccountIds = (post.socialAccountIds || []).filter((id) => !accountIdSet.has(String(id)));
+      const remainingCampaignChannelIds = (post.campaignChannelIds || []).filter((id) => !accountIdSet.has(String(id)));
+      if (remainingSocialAccountIds.length > 0 || remainingCampaignChannelIds.length > 0) {
+        post.socialAccountIds = remainingSocialAccountIds;
+        post.campaignChannelIds = remainingCampaignChannelIds;
         await post.save();
       } else {
         await removePostFromQueue(post._id);
@@ -1500,6 +1677,14 @@ router.get('/creator/today-tracking', protect, async (req, res) => {
       .select('accountId metaPostId platform content mediaUrl videoUrl mediaType facebookVideoId permalink publishedAt lastSyncedAt')
       .sort({ publishedAt: -1 })
       .lean();
+    const cooldownStart = new Date(Date.now() - MANUAL_POST_COOLDOWN_MS);
+    const recentPosts = await PublishedPost.find({
+      accountId: { $in: accountIds },
+      publishedAt: { $gte: cooldownStart, $lte: to },
+    })
+      .select('accountId platform publishedAt')
+      .sort({ publishedAt: -1 })
+      .lean();
 
     const postsByPlatform = posts.reduce((summary, post) => {
       const platform = post.platform || 'unknown';
@@ -1533,6 +1718,26 @@ router.get('/creator/today-tracking', protect, async (req, res) => {
       });
       return summary;
     }, {});
+
+    recentPosts.forEach((post) => {
+      const accountId = String(post.accountId);
+      if (!accounts[accountId]) {
+        accounts[accountId] = {
+          count: 0,
+          lastPublishedAt: post.publishedAt,
+          posts: [],
+        };
+        return;
+      }
+
+      const currentLast = accounts[accountId].lastPublishedAt
+        ? new Date(accounts[accountId].lastPublishedAt).getTime()
+        : 0;
+      const nextLast = post.publishedAt ? new Date(post.publishedAt).getTime() : 0;
+      if (nextLast > currentLast) {
+        accounts[accountId].lastPublishedAt = post.publishedAt;
+      }
+    });
 
     res.status(200).json({ accounts });
   } catch (error) {
