@@ -154,9 +154,11 @@ export const syncCampaignChannelList = async (campaignId, channels = [], { userI
         displayName: channel.displayName,
         socialAccountId: existingChannel?.socialAccountId || channel.socialAccountId || null,
         assignedHandlerEmail: channel.assignedHandlerEmail,
-        assignedHandlerUserId: existingChannel?.status === 'verified'
-          ? existingChannel?.assignedHandlerUserId || null
-          : assignedUser?._id || channel.assignedHandlerUserId || null,
+        assignedHandlerUserId: channel.assignedHandlerEmail
+          ? (assignedUser?._id || null)
+          : (existingChannel?.status === 'verified'
+            ? existingChannel?.assignedHandlerUserId || null
+            : null),
         addedByUserId: existingChannel?.addedByUserId || userId || undefined,
       },
       { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
@@ -236,13 +238,17 @@ export const resolveCampaignPublishingChannels = async (
       status,
       userId: matched?.userId || null,
       matchedAccountId: matched?._id || null,
-      assignedHandlerEmail: isConnected
+      assignedHandlerEmail: channel.assignedHandlerEmail || (isConnected
         ? (matchedOwner?.email || '')
-        : (channel.assignedHandlerEmail || ''),
-      assignedHandlerName: isConnected
+        : ''),
+      assignedHandlerName: channel.assignedHandlerEmail && matchedOwner?.email === channel.assignedHandlerEmail
         ? (matchedOwner?.name || matched?.name || matched?.username || '')
-        : '',
-      assignedHandlerUserId: matched?.userId || channel.assignedHandlerUserId || null,
+        : (isConnected && !channel.assignedHandlerEmail
+          ? (matchedOwner?.name || matched?.name || matched?.username || '')
+          : ''),
+      assignedHandlerUserId: channel.assignedHandlerEmail
+        ? (channel.assignedHandlerUserId || null)
+        : (matched?.userId || channel.assignedHandlerUserId || null),
       campaignId,
       tokenExpiresAt: matched?.tokenExpiresAt || null,
       verifiedAt: isConnected ? (channel.verifiedAt || new Date()) : null,

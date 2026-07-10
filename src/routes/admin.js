@@ -16,6 +16,7 @@ import { deleteFile } from '../services/r2Service.js';
 
 const router = express.Router();
 const VALID_ROLES = ['owner', 'admin', 'editor', 'viewer'];
+const DASHBOARD_UPCOMING_STATUSES = ['scheduled', 'manual_ready', 'downloaded', 'publishing', 'paused'];
 
 const toKey = (value) => value?.toString();
 const normalizeEmail = (email = '') => email.trim().toLowerCase();
@@ -179,6 +180,7 @@ const getCampaignMetrics = async (campaign) => {
       last7DaysComments: 0,
       thisMonthLikes: 0,
       thisMonthComments: 0,
+      upcomingPosts: 0,
       last30DaysPostedViews: [],
       accountRows: [],
     };
@@ -240,12 +242,22 @@ const getCampaignMetrics = async (campaign) => {
       last7DaysComments: 0,
       thisMonthLikes: 0,
       thisMonthComments: 0,
+      upcomingPosts: 0,
       last7DaysActivity: last7DayActivityTemplate.map((day) => ({
         ...day,
         posts: [],
       })),
     },
   ]));
+  const accountHandleMap = new Map();
+  accountDetails.forEach((account) => {
+    const handles = [account.username, account.name]
+      .map((value) => String(value || '').replace(/^@/, '').toLowerCase())
+      .filter(Boolean);
+    handles.forEach((handle) => {
+      accountHandleMap.set(`${account.platform}:${handle}`, toKey(account._id));
+    });
+  });
 
   const accountInsights = await Insight.find({ accountId: { $in: accountIds } }).lean();
   const accountInsightTotals = accountInsights.reduce((map, insight) => {
@@ -282,6 +294,58 @@ const getCampaignMetrics = async (campaign) => {
     row.yesterdayAccountInsight = totals.yesterdayAccountInsight;
     row.last7DaysAccountInsight = totals.last7DaysAccountInsight;
     row.thisMonthAccountInsight = totals.thisMonthAccountInsight;
+  });
+
+  const upcomingQuery = {
+    campaignId: campaign._id,
+    status: { $in: DASHBOARD_UPCOMING_STATUSES },
+  };
+
+  const [upcomingPostsList, campaignChannels] = await Promise.all([
+    ScheduledPost.find(upcomingQuery)
+      .select('_id socialAccountIds campaignChannelIds')
+      .lean(),
+    CampaignChannel.find({
+      campaignId: campaign._id,
+    })
+      .select('_id socialAccountId platform normalizedHandle requestedHandle displayName')
+      .lean(),
+  ]);
+
+  const accountIdSet = new Set(accountIds.map(toKey));
+  const channelAccountMap = new Map(
+    campaignChannels.map((channel) => {
+      const linkedAccountId = toKey(channel.socialAccountId);
+      if (linkedAccountId && accountIdSet.has(linkedAccountId)) {
+        return [toKey(channel._id), linkedAccountId];
+      }
+
+      const handles = [channel.normalizedHandle, channel.requestedHandle, channel.displayName]
+        .map((value) => String(value || '').replace(/^@/, '').toLowerCase())
+        .filter(Boolean);
+      const matchedAccountId = handles
+        .map((handle) => accountHandleMap.get(`${channel.platform}:${handle}`))
+        .find(Boolean);
+
+      return [toKey(channel._id), matchedAccountId || ''];
+    })
+  );
+
+  const upcomingPosts = upcomingPostsList.length;
+  upcomingPostsList.forEach((post) => {
+    const targetAccountIds = new Set();
+    (post.socialAccountIds || []).forEach((accountId) => {
+      const key = toKey(accountId);
+      if (accountIdSet.has(key)) targetAccountIds.add(key);
+    });
+    (post.campaignChannelIds || []).forEach((channelId) => {
+      const accountId = channelAccountMap.get(toKey(channelId));
+      if (accountId && accountIdSet.has(accountId)) targetAccountIds.add(accountId);
+    });
+    targetAccountIds.forEach((accountId) => {
+      const row = accountRowsMap.get(accountId);
+      if (row) row.upcomingPosts += 1;
+    });
   });
 
   const accountInsightSummary = Array.from(accountInsightTotals.values()).reduce((sum, item) => ({
@@ -326,6 +390,7 @@ const getCampaignMetrics = async (campaign) => {
       last7DaysComments: 0,
       thisMonthLikes: 0,
       thisMonthComments: 0,
+      upcomingPosts,
       last30DaysPostedViews: Array.from(last30DaysPostedViewsMap.values()),
       accountRows: Array.from(accountRowsMap.values()),
     };
@@ -529,6 +594,7 @@ const getCampaignMetrics = async (campaign) => {
     last7DaysComments: 0,
     thisMonthLikes: 0,
     thisMonthComments: 0,
+    upcomingPosts,
   });
 
   return {
@@ -556,8 +622,8 @@ const enrichChannels = async (channels = []) => {
 
   const matchedAccounts = orConditions.length > 0
     ? await SocialAccount.find({ $or: orConditions })
-        .select('_id platform username name isConnected avatarUrl')
-        .lean()
+      .select('_id platform username name isConnected avatarUrl')
+      .lean()
     : [];
 
   return channels.map((ch) => {
@@ -565,7 +631,7 @@ const enrichChannels = async (channels = []) => {
     const matched = matchedAccounts.find((acc) =>
       acc.platform === ch.platform &&
       (((acc.username || '').replace(/^@/, '').toLowerCase() === normalizedHandle) ||
-       ((acc.name || '').replace(/^@/, '').toLowerCase() === normalizedHandle))
+        ((acc.name || '').replace(/^@/, '').toLowerCase() === normalizedHandle))
     );
 
     return {
