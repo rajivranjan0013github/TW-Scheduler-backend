@@ -117,7 +117,7 @@ const getUniqueIds = (items = []) => (
 );
 
 const activeQueueStatuses = ['scheduled', 'manual_ready', 'downloaded', 'publishing', 'paused'];
-const MANUAL_POST_COOLDOWN_MS = 4 * 60 * 60 * 1000;
+const MANUAL_POST_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 let creatorAutoCheckIntervalId = null;
 
 const getDateBoundary = (value, fallback) => {
@@ -179,24 +179,65 @@ const markManualPostAsPosted = async (post, user, { manualPostUrl = '' } = {}) =
 
 const getManualPostCooldown = async (post) => {
   const accountIds = getUniqueIds(getPostConnectedAccountIds(post));
-  if (accountIds.length === 0) return null;
+  const campaignChannelIds = getUniqueIds(idsToStrings(post.campaignChannelIds));
+  if (accountIds.length === 0 && campaignChannelIds.length === 0) return null;
 
   const cooldownStart = new Date(Date.now() - MANUAL_POST_COOLDOWN_MS);
-  const latestPost = await PublishedPost.findOne({
-    accountId: { $in: accountIds },
-    publishedAt: { $gte: cooldownStart },
-  })
-    .select('accountId publishedAt platform metaPostId')
-    .sort({ publishedAt: -1 })
-    .lean();
+  const [latestProviderPost, latestManualPost] = await Promise.all([
+    accountIds.length > 0
+      ? PublishedPost.findOne({
+        accountId: { $in: accountIds },
+        publishedAt: { $gte: cooldownStart },
+      })
+        .select('accountId publishedAt platform metaPostId')
+        .sort({ publishedAt: -1 })
+        .lean()
+      : null,
+    ScheduledPost.findOne({
+      _id: { $ne: post._id },
+      status: 'posted_manual',
+      manualPostedAt: { $gte: cooldownStart },
+      $or: [
+        ...(accountIds.length > 0 ? [{ socialAccountIds: { $in: accountIds } }] : []),
+        ...(campaignChannelIds.length > 0 ? [{ campaignChannelIds: { $in: campaignChannelIds } }] : []),
+      ],
+    })
+      .select('socialAccountIds campaignChannelIds manualPostedAt scheduleMode')
+      .sort({ manualPostedAt: -1 })
+      .lean(),
+  ]);
 
-  if (!latestPost?.publishedAt) return null;
-  const unlocksAt = new Date(new Date(latestPost.publishedAt).getTime() + MANUAL_POST_COOLDOWN_MS);
+  const providerPublishedAt = latestProviderPost?.publishedAt ? new Date(latestProviderPost.publishedAt) : null;
+  const manualPublishedAt = latestManualPost?.manualPostedAt ? new Date(latestManualPost.manualPostedAt) : null;
+  const latestPost = manualPublishedAt && (!providerPublishedAt || manualPublishedAt > providerPublishedAt)
+    ? {
+      accountId: latestManualPost.socialAccountIds?.[0] || '',
+      campaignChannelId: latestManualPost.campaignChannelIds?.[0] || '',
+      platform: '',
+      metaPostId: '',
+      lastPublishedAt: latestManualPost.manualPostedAt,
+      source: 'manual',
+    }
+    : latestProviderPost
+      ? {
+        accountId: latestProviderPost.accountId,
+        campaignChannelId: '',
+        platform: latestProviderPost.platform || '',
+        metaPostId: latestProviderPost.metaPostId || '',
+        lastPublishedAt: latestProviderPost.publishedAt,
+        source: 'provider',
+      }
+      : null;
+
+  if (!latestPost?.lastPublishedAt) return null;
+  const unlocksAt = new Date(new Date(latestPost.lastPublishedAt).getTime() + MANUAL_POST_COOLDOWN_MS);
   return {
     accountId: String(latestPost.accountId || ''),
-    platform: latestPost.platform || '',
-    metaPostId: latestPost.metaPostId || '',
-    lastPublishedAt: latestPost.publishedAt,
+    campaignChannelId: String(latestPost.campaignChannelId || ''),
+    platform: latestPost.platform,
+    metaPostId: latestPost.metaPostId,
+    source: latestPost.source,
+    lastPublishedAt: latestPost.lastPublishedAt,
     unlocksAt,
     remainingMs: Math.max(0, unlocksAt.getTime() - Date.now()),
   };
@@ -1238,7 +1279,7 @@ router.post('/:id/downloaded', protect, async (req, res) => {
     const cooldown = await getManualPostCooldown(post);
     if (cooldown) {
       return res.status(429).json({
-        message: 'Please wait 4 hours between posts on this account.',
+        message: 'Please wait 6 hours between posts on this account.',
         cooldown,
       });
     }
