@@ -12,6 +12,12 @@ const FolderSchema = new mongoose.Schema({
     ref: 'Campaign',
     index: true,
   },
+  scope: {
+    type: String,
+    enum: ['campaign', 'global'],
+    default: 'campaign',
+    index: true,
+  },
   name: {
     type: String,
     required: true,
@@ -40,5 +46,6 @@ const FolderSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 FolderSchema.index({ campaignId: 1, tags: 1 });
+FolderSchema.index({ scope: 1, parentFolderId: 1, name: 1 });
 
 export default mongoose.models.Folder || mongoose.model('Folder', FolderSchema);

@@ -22,13 +22,6 @@ const isTrustedMediaUrl = (url) => {
   }
 };
 
-const getScopedUserId = (req) => {
-  if (ADMIN_ROLES.includes(req.user?.role) && req.query.userId) {
-    return req.query.userId;
-  }
-  return req.user._id;
-};
-
 const getActiveCampaignId = (req) => req.query.campaignId || req.body?.campaignId || null;
 
 const requireCampaignId = (req, res) => {
@@ -40,13 +33,99 @@ const requireCampaignId = (req, res) => {
   return campaignId;
 };
 
-const getCampaignQuery = (req, extra = {}) => {
-  const campaignId = getActiveCampaignId(req);
-  if (campaignId) {
-    return { campaignId, ...extra };
+const normalizeScope = (value) => (value === 'global' ? 'global' : 'campaign');
+const getRequestedScope = (req) => normalizeScope(req.query.scope || req.body?.scope);
+const isAdminRole = (req) => ADMIN_ROLES.includes(req.user?.role);
+
+const requireGlobalPermission = (req, res) => {
+  if (!isAdminRole(req)) {
+    res.status(403).json({ message: 'Only owners and admins can manage global media.' });
+    return false;
+  }
+  return true;
+};
+
+const getReadableScopeQuery = (campaignId, requestedScope = 'campaign') => {
+  if (requestedScope === 'global') {
+    return { scope: 'global' };
   }
 
-  return { userId: getScopedUserId(req), ...extra };
+  return {
+    $or: [
+      { campaignId },
+      { scope: 'global' },
+    ],
+  };
+};
+
+const getWritableScope = (req, res) => {
+  const requestedScope = getRequestedScope(req);
+  if (requestedScope === 'global' && !requireGlobalPermission(req, res)) {
+    return null;
+  }
+  return requestedScope;
+};
+
+const findReadableFolder = async (req, res, folderId, campaignId) => {
+  const folder = await Folder.findOne({
+    _id: folderId,
+    ...getReadableScopeQuery(campaignId),
+  });
+
+  if (!folder) {
+    res.status(404).json({ message: 'Folder not found' });
+    return null;
+  }
+
+  return folder;
+};
+
+const getDescendantFolderIds = async (rootFolderId, scope, campaignId) => {
+  const folderIds = [rootFolderId];
+  const queue = [rootFolderId];
+
+  while (queue.length > 0) {
+    const parentFolderId = queue.shift();
+    const children = await Folder.find({
+      parentFolderId,
+      ...(scope === 'global' ? { scope: 'global' } : { campaignId }),
+    }).select('_id');
+    children.forEach((child) => {
+      const childId = child._id;
+      folderIds.push(childId);
+      queue.push(childId);
+    });
+  }
+
+  return folderIds;
+};
+
+const getUploadScopeContext = async (req, res, folderId) => {
+  const requestedScope = getWritableScope(req, res);
+  if (!requestedScope) return null;
+
+  const campaignId = requestedScope === 'global' ? null : requireCampaignId(req, res);
+  if (requestedScope === 'campaign' && !campaignId) return null;
+
+  const resolvedFolderId = folderId && folderId !== 'null' ? folderId : null;
+  if (!resolvedFolderId) {
+    return { scope: requestedScope, campaignId, folderId: null };
+  }
+
+  const lookupCampaignId = campaignId || getActiveCampaignId(req);
+  const folder = await findReadableFolder(req, res, resolvedFolderId, lookupCampaignId);
+  if (!folder) return null;
+
+  const folderScope = normalizeScope(folder.scope);
+  if (folderScope === 'global' && !requireGlobalPermission(req, res)) {
+    return null;
+  }
+
+  return {
+    scope: folderScope,
+    campaignId: folderScope === 'global' ? null : folder.campaignId,
+    folderId: resolvedFolderId,
+  };
 };
 
 const parseIdList = (value) => {
@@ -180,7 +259,7 @@ router.get('/folders', protect, async (req, res) => {
     }
     const campaignId = requireCampaignId(req, res);
     if (!campaignId) return;
-    const folders = await Folder.find(getCampaignQuery(req));
+    const folders = await Folder.find(getReadableScopeQuery(campaignId, getRequestedScope(req)));
     res.status(200).json(folders);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -192,6 +271,8 @@ router.get('/folders', protect, async (req, res) => {
 // @access  Private (Owner, Admin, Editor)
 router.post('/folders', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
   const { name, parentFolderId, kind, carouselCaption, carouselOrder, tags } = req.body;
+  const requestedScope = getWritableScope(req, res);
+  if (!requestedScope) return;
 
   try {
     const isConnected = getDBStatus();
@@ -199,6 +280,7 @@ router.post('/folders', protect, authorize('owner', 'admin', 'editor'), async (r
       const newFolder = {
         _id: `f_${Date.now()}`,
         name,
+        scope: requestedScope,
         parentFolderId: parentFolderId || null,
         kind: kind === 'carousel_set' ? 'carousel_set' : 'folder',
         carouselCaption: carouselCaption || '',
@@ -210,11 +292,21 @@ router.post('/folders', protect, authorize('owner', 'admin', 'editor'), async (r
       return res.status(201).json(newFolder);
     }
 
-    const campaignId = requireCampaignId(req, res);
-    if (!campaignId) return;
+    const campaignId = requestedScope === 'global' ? null : requireCampaignId(req, res);
+    if (requestedScope === 'campaign' && !campaignId) return;
+
+    let parentFolder = null;
+    if (parentFolderId) {
+      parentFolder = await findReadableFolder(req, res, parentFolderId, campaignId || getActiveCampaignId(req));
+      if (!parentFolder) return;
+      if (normalizeScope(parentFolder.scope) === 'global' && !requireGlobalPermission(req, res)) return;
+    }
+
+    const folderScope = parentFolder ? normalizeScope(parentFolder.scope) : requestedScope;
     const folder = await Folder.create({
       userId: req.user._id,
-      campaignId,
+      campaignId: folderScope === 'global' ? null : campaignId,
+      scope: folderScope,
       name,
       parentFolderId: parentFolderId || null,
       kind: kind === 'carousel_set' ? 'carousel_set' : 'folder',
@@ -253,15 +345,24 @@ router.put('/folders/:id/carousel', protect, authorize('owner', 'admin', 'editor
     const campaignId = requireCampaignId(req, res);
     if (!campaignId) return;
 
+    const existingFolder = await findReadableFolder(req, res, id, campaignId);
+    if (!existingFolder) return;
+    const folderScope = normalizeScope(existingFolder.scope);
+    if (folderScope === 'global' && !requireGlobalPermission(req, res)) return;
+
     if (carouselOrder.length > 0) {
-      const mediaCount = await Media.countDocuments({ _id: { $in: carouselOrder }, campaignId, folderId: id });
+      const mediaCount = await Media.countDocuments({
+        _id: { $in: carouselOrder },
+        folderId: id,
+        ...(folderScope === 'global' ? { scope: 'global' } : { campaignId }),
+      });
       if (mediaCount !== carouselOrder.length) {
         return res.status(400).json({ message: 'Carousel order contains media outside this folder.' });
       }
     }
 
     const folder = await Folder.findOneAndUpdate(
-      { _id: id, campaignId },
+      { _id: id, ...(folderScope === 'global' ? { scope: 'global' } : { campaignId }) },
       {
         kind: 'carousel_set',
         carouselCaption,
@@ -287,9 +388,11 @@ router.put('/folders/:id', protect, authorize('owner', 'admin', 'editor'), async
   const { id } = req.params;
   const hasName = Object.prototype.hasOwnProperty.call(req.body || {}, 'name');
   const hasTags = Object.prototype.hasOwnProperty.call(req.body || {}, 'tags');
+  const hasScope = Object.prototype.hasOwnProperty.call(req.body || {}, 'scope');
   const nextName = hasName ? String(req.body?.name || '').trim() : '';
+  const nextScope = normalizeScope(req.body?.scope);
 
-  if (!hasName && !hasTags) {
+  if (!hasName && !hasTags && !hasScope) {
     return res.status(400).json({ message: 'No folder updates were provided.' });
   }
 
@@ -306,24 +409,68 @@ router.put('/folders/:id', protect, authorize('owner', 'admin', 'editor'), async
       }
       if (hasName) folder.name = nextName;
       if (hasTags) folder.tags = parseTagList(req.body.tags);
+      if (hasScope) {
+        if (nextScope === 'global' && !requireGlobalPermission(req, res)) return;
+        folder.scope = nextScope;
+        folder.campaignId = nextScope === 'global' ? null : folder.campaignId;
+        mockStore.media = mockStore.media.map((mediaItem) => (
+          mediaItem.folderId === id
+            ? { ...mediaItem, scope: nextScope, campaignId: nextScope === 'global' ? null : mediaItem.campaignId }
+            : mediaItem
+        ));
+      }
       folder.updatedAt = new Date();
       return res.status(200).json(folder);
     }
 
     const campaignId = requireCampaignId(req, res);
     if (!campaignId) return;
+    const existingFolder = await findReadableFolder(req, res, id, campaignId);
+    if (!existingFolder) return;
+    const folderScope = normalizeScope(existingFolder.scope);
+    if (folderScope === 'global' && !requireGlobalPermission(req, res)) return;
+    if (hasScope && nextScope === 'global' && !requireGlobalPermission(req, res)) return;
+
     const updates = {};
     if (hasName) updates.name = nextName;
     if (hasTags) updates.tags = parseTagList(req.body.tags);
+    if (hasScope) {
+      updates.scope = nextScope;
+      if (nextScope === 'global') {
+        updates.campaignId = null;
+      } else {
+        updates.campaignId = campaignId;
+      }
+    }
 
     const folder = await Folder.findOneAndUpdate(
-      { _id: id, campaignId },
+      { _id: id, ...(folderScope === 'global' ? { scope: 'global' } : { campaignId }) },
       updates,
       { new: true }
     );
 
     if (!folder) {
       return res.status(404).json({ message: 'Folder not found' });
+    }
+
+    if (hasScope) {
+      const folderIds = await getDescendantFolderIds(id, folderScope, campaignId);
+      const previousScopeQuery = folderScope === 'global' ? { scope: 'global' } : { campaignId };
+      const nextCampaignId = nextScope === 'global' ? null : campaignId;
+      await Folder.updateMany(
+        { _id: { $in: folderIds }, ...previousScopeQuery },
+        { scope: nextScope, campaignId: nextCampaignId }
+      );
+      await Media.updateMany(
+        { folderId: { $in: folderIds }, ...previousScopeQuery },
+        {
+          scope: nextScope,
+          campaignId: nextCampaignId,
+          ...(nextScope === 'global' ? { socialAccountIds: [] } : {}),
+        }
+      );
+      const updatedFolder = await Folder.findById(id);
+      return res.status(200).json(updatedFolder);
     }
 
     res.status(200).json(folder);
@@ -352,12 +499,18 @@ router.delete('/folders/:id', protect, authorize('owner', 'admin'), async (req, 
 
     const campaignId = requireCampaignId(req, res);
     if (!campaignId) return;
-    const folder = await Folder.findOne({ _id: id, campaignId });
+    const folder = await findReadableFolder(req, res, id, campaignId);
     if (!folder) {
-      return res.status(404).json({ message: 'Folder not found' });
+      return;
     }
+    const folderScope = normalizeScope(folder.scope);
+    if (folderScope === 'global' && !requireGlobalPermission(req, res)) return;
 
-    const mediaItems = await Media.find({ campaignId, folderId: id }).select('storageKey thumbnailStorageKey');
+    const mediaQuery = {
+      folderId: id,
+      ...(folderScope === 'global' ? { scope: 'global' } : { campaignId }),
+    };
+    const mediaItems = await Media.find(mediaQuery).select('storageKey thumbnailStorageKey');
     for (const mediaItem of mediaItems) {
       await deleteFile(mediaItem.storageKey);
       if (mediaItem.thumbnailStorageKey) {
@@ -365,8 +518,8 @@ router.delete('/folders/:id', protect, authorize('owner', 'admin'), async (req, 
       }
     }
 
-    await Folder.deleteOne({ _id: id, campaignId });
-    await Media.deleteMany({ campaignId, folderId: id });
+    await Folder.deleteOne({ _id: id, ...(folderScope === 'global' ? { scope: 'global' } : { campaignId }) });
+    await Media.deleteMany(mediaQuery);
     res.status(200).json({ message: 'Folder deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -432,7 +585,7 @@ router.get('/', protect, async (req, res) => {
     } else {
       const campaignId = requireCampaignId(req, res);
       if (!campaignId) return;
-      Object.assign(query, getCampaignQuery(req));
+      Object.assign(query, getReadableScopeQuery(campaignId, getRequestedScope(req)));
       if (folderId) {
         query.folderId = folderId === 'root' ? null : folderId;
       }
@@ -441,9 +594,16 @@ router.get('/', protect, async (req, res) => {
       query.tags = tag.toLowerCase();
     }
     if (accountId) {
-      query.$or = [
-        { socialAccountIds: accountId },
-        { socialAccountIds: { $size: 0 } },
+      const scopeOr = query.$or;
+      delete query.$or;
+      query.$and = [
+        ...(scopeOr ? [{ $or: scopeOr }] : []),
+        {
+          $or: [
+            { socialAccountIds: accountId },
+            { socialAccountIds: { $size: 0 } },
+          ],
+        },
       ];
     }
 
@@ -466,9 +626,6 @@ router.get('/', protect, async (req, res) => {
 // @route   POST /api/media/direct-upload/init
 // @access  Private (Owner, Admin, Editor)
 router.post('/direct-upload/init', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
-  const campaignId = requireCampaignId(req, res);
-  if (!campaignId) return;
-
   if (!getDBStatus()) {
     return res.status(409).json({ message: 'Direct upload requires a database connection.' });
   }
@@ -482,12 +639,12 @@ router.post('/direct-upload/init', protect, authorize('owner', 'admin', 'editor'
   }
 
   try {
+    const scopeContext = await getUploadScopeContext(req, res, folderId);
+    if (!scopeContext) return;
     const mediaId = new Media()._id;
-    const resolvedFolderId = folderId && folderId !== 'null' ? folderId : null;
     const storageKey = getOriginalStorageKey({
       userId: req.user._id,
-      campaignId,
-      folderId: resolvedFolderId,
+      folderId: scopeContext.folderId,
       mediaId,
       originalName: name,
     });
@@ -513,9 +670,6 @@ router.post('/direct-upload/init', protect, authorize('owner', 'admin', 'editor'
 // @route   POST /api/media/direct-upload/complete
 // @access  Private (Owner, Admin, Editor)
 router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
-  const campaignId = requireCampaignId(req, res);
-  if (!campaignId) return;
-
   if (!getDBStatus()) {
     return res.status(409).json({ message: 'Direct upload requires a database connection.' });
   }
@@ -542,17 +696,24 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
   }
 
   try {
+    const scopeContext = await getUploadScopeContext(req, res, folderId);
+    if (!scopeContext) return;
     const requestedAccountIds = parseIdList(req.body.socialAccountIds);
-    const socialAccountIds = await getValidSocialAccountIds(requestedAccountIds, campaignId);
-    if (requestedAccountIds.length > 0 && socialAccountIds.length !== requestedAccountIds.length) {
-      return res.status(400).json({ message: 'One or more selected publishing channels are not connected.' });
+    let socialAccountIds = [];
+    if (scopeContext.scope === 'global') {
+      if (requestedAccountIds.length > 0) {
+        return res.status(400).json({ message: 'Global media cannot be restricted to campaign channels.' });
+      }
+    } else {
+      socialAccountIds = await getValidSocialAccountIds(requestedAccountIds, scopeContext.campaignId);
+      if (requestedAccountIds.length > 0 && socialAccountIds.length !== requestedAccountIds.length) {
+        return res.status(400).json({ message: 'One or more selected publishing channels are not connected.' });
+      }
     }
 
-    const resolvedFolderId = folderId && folderId !== 'null' ? folderId : null;
     const expectedStorageKey = getOriginalStorageKey({
       userId: req.user._id,
-      campaignId,
-      folderId: resolvedFolderId,
+      folderId: scopeContext.folderId,
       mediaId,
       originalName: name,
     });
@@ -560,7 +721,10 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
       return res.status(400).json({ message: 'Upload storage key does not match this media asset.' });
     }
 
-    const existing = await Media.findOne({ _id: mediaId, campaignId })
+    const existing = await Media.findOne({
+      _id: mediaId,
+      ...(scopeContext.scope === 'global' ? { scope: 'global' } : { campaignId: scopeContext.campaignId }),
+    })
       .populate('socialAccountIds', 'name username platform avatarUrl isConnected');
     if (existing) {
       return res.status(200).json(existing);
@@ -574,8 +738,9 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
     const media = await Media.create({
       _id: mediaId,
       userId: req.user._id,
-      campaignId,
-      folderId: resolvedFolderId,
+      campaignId: scopeContext.campaignId,
+      scope: scopeContext.scope,
+      folderId: scopeContext.folderId,
       socialAccountIds,
       name,
       type: getMediaTypeFromMime(contentType),
@@ -608,8 +773,6 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
   }
 
   const { folderId, tags, caption, uploadBatchId = '', uploadBatchCreatedAt, uploadOrder } = req.body;
-  const campaignId = requireCampaignId(req, res);
-  if (!campaignId) return;
   const requestedAccountIds = parseIdList(req.body.socialAccountIds);
   const mimeType = req.file.mimetype;
   const mediaType = getMediaTypeFromMime(mimeType);
@@ -617,29 +780,44 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
   try {
     const tagList = parseTagList(tags);
     const isConnected = getDBStatus();
+    const scopeContext = isConnected
+      ? await getUploadScopeContext(req, res, folderId)
+      : {
+          scope: getRequestedScope(req),
+          campaignId: getRequestedScope(req) === 'global' ? null : getActiveCampaignId(req),
+          folderId: folderId && folderId !== 'null' ? folderId : null,
+        };
+    if (!scopeContext) return;
     let socialAccountIds = requestedAccountIds;
 
     if (isConnected) {
-      socialAccountIds = await getValidSocialAccountIds(requestedAccountIds, campaignId);
-      if (requestedAccountIds.length > 0 && socialAccountIds.length !== requestedAccountIds.length) {
-        return res.status(400).json({ message: 'One or more selected publishing channels are not connected.' });
+      if (scopeContext.scope === 'global') {
+        if (requestedAccountIds.length > 0) {
+          return res.status(400).json({ message: 'Global media cannot be restricted to campaign channels.' });
+        }
+        socialAccountIds = [];
+      } else {
+        socialAccountIds = await getValidSocialAccountIds(requestedAccountIds, scopeContext.campaignId);
+        if (requestedAccountIds.length > 0 && socialAccountIds.length !== requestedAccountIds.length) {
+          return res.status(400).json({ message: 'One or more selected publishing channels are not connected.' });
+        }
       }
     }
 
     if (!isConnected) {
       const mediaId = `m_${Date.now()}`;
-      const resolvedFolderId = folderId && folderId !== 'null' ? folderId : null;
       const storageKey = getOriginalStorageKey({
         userId: req.user?._id || 'mock-user',
-        campaignId,
-        folderId: resolvedFolderId,
+        folderId: scopeContext.folderId,
         mediaId,
         originalName: req.file.originalname,
       });
       const { url } = await uploadFile({ ...req.file, storageKey });
       const newMedia = {
         _id: mediaId,
-        folderId: resolvedFolderId,
+        campaignId: scopeContext.campaignId,
+        scope: scopeContext.scope,
+        folderId: scopeContext.folderId,
         name: req.file.originalname,
         type: mediaType,
         url,
@@ -658,11 +836,9 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
     }
 
     const mediaId = new Media()._id;
-    const resolvedFolderId = folderId && folderId !== 'null' ? folderId : null;
     const storageKey = getOriginalStorageKey({
       userId: req.user._id,
-      campaignId,
-      folderId: resolvedFolderId,
+      folderId: scopeContext.folderId,
       mediaId,
       originalName: req.file.originalname,
     });
@@ -671,8 +847,9 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
     const media = await Media.create({
       _id: mediaId,
       userId: req.user._id,
-      campaignId,
-      folderId: resolvedFolderId,
+      campaignId: scopeContext.campaignId,
+      scope: scopeContext.scope,
+      folderId: scopeContext.folderId,
       socialAccountIds,
       name: req.file.originalname,
       type: mediaType,
@@ -783,8 +960,18 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
 
     const campaignId = requireCampaignId(req, res);
     if (!campaignId) return;
+    const existingMedia = await Media.findOne({
+      _id: id,
+      ...getReadableScopeQuery(campaignId),
+    });
+    if (!existingMedia) {
+      return res.status(404).json({ message: 'Media not found' });
+    }
+    const mediaScope = normalizeScope(existingMedia.scope);
+    if (mediaScope === 'global' && !requireGlobalPermission(req, res)) return;
+
     const media = await Media.findOneAndUpdate(
-      { _id: id, campaignId },
+      { _id: id, ...(mediaScope === 'global' ? { scope: 'global' } : { campaignId }) },
       updates,
       { new: true }
     ).populate('socialAccountIds', 'name username platform avatarUrl isConnected');
@@ -824,16 +1011,21 @@ router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => 
 
     const campaignId = requireCampaignId(req, res);
     if (!campaignId) return;
-    const media = await Media.findOne({ _id: id, campaignId });
+    const media = await Media.findOne({
+      _id: id,
+      ...getReadableScopeQuery(campaignId),
+    });
     if (!media) {
       return res.status(404).json({ message: 'Media not found' });
     }
+    const mediaScope = normalizeScope(media.scope);
+    if (mediaScope === 'global' && !requireGlobalPermission(req, res)) return;
 
     await deleteFile(media.storageKey);
     if (media.thumbnailStorageKey) {
       await deleteFile(media.thumbnailStorageKey);
     }
-    await Media.deleteOne({ _id: id, campaignId });
+    await Media.deleteOne({ _id: id, ...(mediaScope === 'global' ? { scope: 'global' } : { campaignId }) });
     res.status(200).json({ message: 'Media asset deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });

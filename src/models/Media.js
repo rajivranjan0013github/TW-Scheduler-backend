@@ -12,6 +12,12 @@ const MediaSchema = new mongoose.Schema({
     ref: 'Campaign',
     index: true,
   },
+  scope: {
+    type: String,
+    enum: ['campaign', 'global'],
+    default: 'campaign',
+    index: true,
+  },
   folderId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Folder',
@@ -75,5 +81,6 @@ MediaSchema.index({ campaignId: 1, folderId: 1, uploadBatchCreatedAt: -1, upload
 MediaSchema.index({ campaignId: 1, folderId: 1, createdAt: -1 });
 MediaSchema.index({ campaignId: 1, socialAccountIds: 1, createdAt: -1 });
 MediaSchema.index({ campaignId: 1, userId: 1 });
+MediaSchema.index({ scope: 1, folderId: 1, createdAt: -1 });
 
 export default mongoose.models.Media || mongoose.model('Media', MediaSchema);

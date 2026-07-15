@@ -45,6 +45,7 @@ const MANUAL_POST_FEED_SYNC_LIMIT = 10;
 const MANUAL_POST_AUTO_CHECK_FIRST_DELAY_MS = 10 * 60 * 1000;
 const MANUAL_POST_AUTO_CHECK_SECOND_DELAY_MS = 30 * 60 * 1000;
 const MANUAL_POST_AUTO_CHECK_INTERVAL_MS = 60 * 1000;
+const MANUAL_POST_DOWNLOAD_VERIFICATION_LOOKBACK_MS = 15 * 60 * 1000;
 
 const normalizeScheduleMode = (mode) => (
   validScheduleModes.has(mode) ? mode : 'auto'
@@ -155,7 +156,7 @@ const getManualPostVerificationStart = (post) => {
   const downloadedAt = post.manualDownloadedAt ? new Date(post.manualDownloadedAt) : new Date();
   const downloadedAtMs = downloadedAt.getTime();
   const baseMs = Number.isFinite(downloadedAtMs) ? downloadedAtMs : Date.now();
-  return new Date(baseMs);
+  return new Date(baseMs - MANUAL_POST_DOWNLOAD_VERIFICATION_LOOKBACK_MS);
 };
 
 const getPostConnectedAccountIds = (post) => ([

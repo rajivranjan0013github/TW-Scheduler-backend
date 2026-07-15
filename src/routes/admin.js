@@ -17,6 +17,9 @@ import { deleteFile } from '../services/r2Service.js';
 const router = express.Router();
 const VALID_ROLES = ['owner', 'admin', 'editor', 'viewer'];
 const DASHBOARD_UPCOMING_STATUSES = ['scheduled', 'manual_ready', 'downloaded', 'publishing', 'paused'];
+const DAY_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_DASHBOARD_TIMEZONE = 'UTC';
+const dateTimeFormatters = new Map();
 
 const toKey = (value) => value?.toString();
 const normalizeEmail = (email = '') => email.trim().toLowerCase();
@@ -77,34 +80,93 @@ const buildStatusMap = (rows) => {
   return map;
 };
 
-const startOfDay = (date) => {
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  return d;
+const getDateTimeFormatter = (timeZone) => {
+  const safeTimeZone = timeZone || DEFAULT_DASHBOARD_TIMEZONE;
+  if (!dateTimeFormatters.has(safeTimeZone)) {
+    dateTimeFormatters.set(safeTimeZone, new Intl.DateTimeFormat('en-CA', {
+      timeZone: safeTimeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      weekday: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    }));
+  }
+  return dateTimeFormatters.get(safeTimeZone);
 };
 
-const dateKey = (date) => {
-  const d = startOfDay(date);
-  const year = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
+const normalizeDashboardTimeZone = (value) => {
+  const timeZone = String(value || '').trim();
+  if (!timeZone) return DEFAULT_DASHBOARD_TIMEZONE;
+  try {
+    getDateTimeFormatter(timeZone);
+    return timeZone;
+  } catch {
+    return DEFAULT_DASHBOARD_TIMEZONE;
+  }
+};
+
+const getZonedParts = (date, timeZone) => {
+  const parts = getDateTimeFormatter(timeZone).formatToParts(new Date(date));
+  return parts.reduce((acc, part) => {
+    if (part.type !== 'literal') {
+      acc[part.type] = part.value;
+    }
+    return acc;
+  }, {});
+};
+
+const getTimezoneOffsetMs = (date, timeZone) => {
+  const parts = getZonedParts(date, timeZone);
+  const asUtc = Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day),
+    Number(parts.hour),
+    Number(parts.minute),
+    Number(parts.second)
+  );
+  return asUtc - new Date(date).getTime();
+};
+
+const startOfDay = (date, timeZone = DEFAULT_DASHBOARD_TIMEZONE) => {
+  const parts = getZonedParts(date, timeZone);
+  const utcGuess = new Date(Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day)));
+  const offsetMs = getTimezoneOffsetMs(utcGuess, timeZone);
+  return new Date(utcGuess.getTime() - offsetMs);
+};
+
+const dateKey = (date, timeZone = DEFAULT_DASHBOARD_TIMEZONE) => {
+  const { year, month, day } = getZonedParts(date, timeZone);
   return `${year}-${month}-${day}`;
 };
-const getLast7DayActivity = (now = new Date()) => {
-  const dayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+const addDays = (date, days) => new Date(date.getTime() + days * DAY_MS);
+
+const startOfMonth = (date, timeZone = DEFAULT_DASHBOARD_TIMEZONE) => {
+  const parts = getZonedParts(date, timeZone);
+  const utcGuess = new Date(Date.UTC(Number(parts.year), Number(parts.month) - 1, 1));
+  const offsetMs = getTimezoneOffsetMs(utcGuess, timeZone);
+  return new Date(utcGuess.getTime() - offsetMs);
+};
+
+const getLast7DayActivity = (now = new Date(), timeZone = DEFAULT_DASHBOARD_TIMEZONE) => {
   return Array.from({ length: 7 }, (_, index) => {
-    const date = startOfDay(now);
-    date.setDate(date.getDate() - index);
+    const date = addDays(startOfDay(now, timeZone), -index);
+    const parts = getZonedParts(date, timeZone);
     return {
-      dateStr: dateKey(date),
-      label: dayLabels[date.getDay()],
+      dateStr: dateKey(date, timeZone),
+      label: parts.weekday,
       count: 0,
       posts: [],
     };
   });
 };
 
-const getCampaignMetrics = async (campaign) => {
+const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZONE } = {}) => {
   const channels = campaign.channels || [];
   const lookups = channels.map((ch) => ({
     platform: ch.platform,
@@ -187,20 +249,16 @@ const getCampaignMetrics = async (campaign) => {
   }
 
   const now = new Date();
-  const todayStart = startOfDay(now);
-  const yesterdayStart = startOfDay(now);
-  yesterdayStart.setDate(yesterdayStart.getDate() - 1);
-  const last7DayActivityTemplate = getLast7DayActivity(now);
-  const sevenDaysAgo = startOfDay(now);
-  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
-  const thirtyDaysAgo = startOfDay(now);
-  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 29);
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const todayStart = startOfDay(now, timeZone);
+  const yesterdayStart = addDays(todayStart, -1);
+  const last7DayActivityTemplate = getLast7DayActivity(now, timeZone);
+  const last7DaysStart = addDays(todayStart, -6);
+  const last30DaysStart = addDays(todayStart, -29);
+  const monthStart = startOfMonth(now, timeZone);
   const last30DaysPostedViewsMap = new Map(
     Array.from({ length: 30 }, (_, index) => {
-      const date = startOfDay(thirtyDaysAgo);
-      date.setDate(date.getDate() + index);
-      const key = dateKey(date);
+      const date = addDays(last30DaysStart, index);
+      const key = dateKey(date, timeZone);
       return [key, {
         dateStr: key,
         views: 0,
@@ -277,9 +335,9 @@ const getCampaignMetrics = async (campaign) => {
     const insightDate = insight.dateStr ? new Date(`${insight.dateStr}T00:00:00.000Z`) : null;
 
     totals.lifetimeAccountInsight += value;
-    if (insight.dateStr === dateKey(todayStart)) totals.todayAccountInsight += value;
-    if (insight.dateStr === dateKey(yesterdayStart)) totals.yesterdayAccountInsight += value;
-    if (insightDate && insightDate >= sevenDaysAgo) totals.last7DaysAccountInsight += value;
+    if (insight.dateStr === dateKey(todayStart, timeZone)) totals.todayAccountInsight += value;
+    if (insight.dateStr === dateKey(yesterdayStart, timeZone)) totals.yesterdayAccountInsight += value;
+    if (insightDate && insightDate >= last7DaysStart) totals.last7DaysAccountInsight += value;
     if (insightDate && insightDate >= monthStart) totals.thisMonthAccountInsight += value;
 
     return map;
@@ -397,7 +455,7 @@ const getCampaignMetrics = async (campaign) => {
   }
 
   const postIds = posts.map((post) => post._id);
-  const minDateStr = dateKey(monthStart < sevenDaysAgo ? monthStart : sevenDaysAgo);
+  const minDateStr = dateKey(monthStart < last7DaysStart ? monthStart : last7DaysStart, timeZone);
 
   const insights = await PostInsight.find({
     postId: { $in: postIds },
@@ -417,7 +475,7 @@ const getCampaignMetrics = async (campaign) => {
 
   const periodDelta = (post, sinceDate, field, latestField) => {
     const snapshots = insightMap.get(toKey(post._id)) || [];
-    const sinceKey = dateKey(sinceDate);
+    const sinceKey = dateKey(sinceDate, timeZone);
     const publishedAt = post.publishedAt ? new Date(post.publishedAt) : null;
     const current = Number((post[latestField] ?? snapshots[snapshots.length - 1]?.[field]) || 0);
 
@@ -445,8 +503,8 @@ const getCampaignMetrics = async (campaign) => {
 
   const periodDeltaBetween = (post, startDate, endDate, field, latestField) => {
     const snapshots = insightMap.get(toKey(post._id)) || [];
-    const startKey = dateKey(startDate);
-    const endKey = dateKey(endDate);
+    const startKey = dateKey(startDate, timeZone);
+    const endKey = dateKey(endDate, timeZone);
     const publishedAt = post.publishedAt ? new Date(post.publishedAt) : null;
 
     if (snapshots.length === 0) {
@@ -488,12 +546,12 @@ const getCampaignMetrics = async (campaign) => {
     const lifetimeViews = Number(post.latestViews || 0);
     const latestLikes = Number(post.latestLikes || 0);
     const latestComments = Number(post.latestComments || 0);
-    const publishedDateStr = post.publishedAt ? dateKey(post.publishedAt) : '';
+    const publishedDateStr = post.publishedAt ? dateKey(post.publishedAt, timeZone) : '';
     const todayPosts = isPublishedSince(post, todayStart) ? 1 : 0;
     const yesterdayPosts = isPublishedBetween(post, yesterdayStart, todayStart) ? 1 : 0;
-    const last7DaysPosts = isPublishedSince(post, sevenDaysAgo) ? 1 : 0;
+    const last7DaysPosts = isPublishedSince(post, last7DaysStart) ? 1 : 0;
     const thisMonthPosts = isPublishedSince(post, monthStart) ? 1 : 0;
-    const last30DaysPublished = post.publishedAt && new Date(post.publishedAt) >= thirtyDaysAgo;
+    const last30DaysPublished = post.publishedAt && new Date(post.publishedAt) >= last30DaysStart;
     const todayViews = todayPosts ? lifetimeViews : 0;
     const yesterdayViews = yesterdayPosts ? lifetimeViews : 0;
     const last7DaysViews = last7DaysPosts ? lifetimeViews : 0;
@@ -1127,7 +1185,9 @@ router.get('/campaigns/:id/metrics', protect, authorize('owner', 'admin'), async
     }
 
     const campaignObject = campaign.toObject ? campaign.toObject() : campaign;
-    const metrics = await getCampaignMetrics(campaignObject);
+    const metrics = await getCampaignMetrics(campaignObject, {
+      timeZone: normalizeDashboardTimeZone(req.query.timeZone),
+    });
 
     res.status(200).json({
       _id: campaignObject._id,
