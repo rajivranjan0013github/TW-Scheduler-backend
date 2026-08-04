@@ -7,14 +7,17 @@ import SocialAccount from '../models/SocialAccount.js';
 import Media from '../models/Media.js';
 import { publishCarouselToInstagram, publishToInstagram, publishToFacebook } from '../services/metaService.js';
 import { runFeedSync } from './feedSyncWorker.js';
-import { runInsightSync } from './insightSyncWorker.js';
+import { runManualAccountSync, runMetricSync } from './metricSyncWorker.js';
 import { publishToYoutube } from '../services/youtubeService.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure, runTokenHealthCheck } from '../services/tokenHealthService.js';
+import MetricSyncStatus from '../models/MetricSyncStatus.js';
 
 // Setup BullMQ workers if Redis is connected
 let worker = null;
 let feedSyncWorker = null;
 let insightSyncWorker = null;
+let metricSyncWorker = null;
+let accountSyncWorker = null;
 let tokenHealthWorker = null;
 
 export const initWorker = () => {
@@ -36,6 +39,9 @@ export const initWorker = () => {
     // Feed Sync Worker — processes feed-sync jobs every 2 hours
     feedSyncWorker = new Worker('feed-sync-queue', async (job) => {
       await runFeedSync();
+      if (job.data?.startupFullSync) {
+        await runMetricSync('daily');
+      }
     }, { connection });
 
     feedSyncWorker.on('completed', (job) => {
@@ -45,9 +51,47 @@ export const initWorker = () => {
       console.error(`❌ Feed sync job ${job.id} failed: ${err.message}`);
     });
 
-    // Insight Sync Worker — processes insight-sync jobs daily
+    metricSyncWorker = new Worker('metric-sync-queue', async (job) => {
+      await runMetricSync(job.data?.tier || 'warm');
+    }, { connection, concurrency: 2 });
+
+    metricSyncWorker.on('failed', (job, err) => {
+      console.error(`Metric sync job ${job.id} failed: ${err.message}`);
+    });
+
+    accountSyncWorker = new Worker('account-sync-queue', async (job) => {
+      const { accountId } = job.data;
+      return runManualAccountSync(accountId);
+    }, {
+      connection,
+      concurrency: Math.max(1, Number(process.env.MANUAL_SYNC_CONCURRENCY) || 2),
+    });
+
+    accountSyncWorker.on('failed', async (job, err) => {
+      console.error('[Manual Sync] job_attempt_failed', {
+        jobId: job?.id,
+        accountId: job?.data?.accountId,
+        attempt: job?.attemptsMade,
+        maxAttempts: Number(job?.opts?.attempts || 1),
+        error: String(err.message || err).slice(0, 500),
+        timestamp: new Date().toISOString(),
+      });
+      if (job && job.attemptsMade >= Number(job.opts.attempts || 1)) {
+        const isRateLimited = Number(err?.status || err?.error?.code || 0) === 429;
+        await MetricSyncStatus.findOneAndUpdate(
+          { accountId: job.data.accountId, tier: 'manual' },
+          { $set: {
+            status: isRateLimited ? 'rate_limited' : 'failed',
+            lastError: String(err.message || err).slice(0, 500),
+          } },
+          { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
+        ).catch((statusError) => console.error('Failed to record manual sync status:', statusError.message));
+      }
+    });
+
+    // Full 30-day sync worker — processes the daily insight queue.
     insightSyncWorker = new Worker('insight-sync-queue', async (job) => {
-      await runInsightSync();
+      await runMetricSync(job.data?.tier || 'daily');
     }, { connection });
 
     insightSyncWorker.on('completed', (job) => {
@@ -90,6 +134,14 @@ export const publishPostJob = async (postId) => {
 
     const mode = post.scheduleMode || 'auto';
     if (!['auto', 'hybrid'].includes(mode) || !['scheduled', 'publishing'].includes(post.status)) {
+      return;
+    }
+
+    // MongoDB is the scheduling source of truth. If an older BullMQ job fires
+    // after a reschedule, do not publish early; the queue reconciler will add
+    // the job again for the updated time after this stale job completes.
+    const scheduledAtMs = new Date(post.scheduledAt).getTime();
+    if (post.status === 'scheduled' && Number.isFinite(scheduledAtMs) && scheduledAtMs > Date.now() + 1000) {
       return;
     }
 

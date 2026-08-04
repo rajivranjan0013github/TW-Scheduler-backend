@@ -6,11 +6,12 @@ import Campaign from '../models/Campaign.js';
 import Insight from '../models/Insight.js';
 import PublishedPost from '../models/PublishedPost.js';
 import PostInsight from '../models/PostInsight.js';
+import { recordStoredMetricSnapshots } from '../queues/metricSyncWorker.js';
 import { protect, authorize } from '../middleware/auth.js';
 import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount, fetchYoutubeVideos } from '../services/youtubeService.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
 import {
-  fetchFacebookPostCommentsCount,
+  fetchFacebookPostEngagement,
   fetchFacebookPostInsightValue,
   fetchFacebookPostViews,
 } from '../services/facebookMetricsService.js';
@@ -22,6 +23,8 @@ import {
   resolveCampaignPublishingChannels,
 } from '../utils/campaignChannels.js';
 import CampaignChannel from '../models/CampaignChannel.js';
+import MetricSyncStatus from '../models/MetricSyncStatus.js';
+import { requestAccountSync } from '../queues/publisherQueue.js';
 
 const router = express.Router();
 const insightSkipCache = new Map();
@@ -45,18 +48,35 @@ const serializeCachedPublishedPost = (post) => ({
   mediaType: post.mediaType,
   facebookVideoId: post.facebookVideoId || '',
   viewsSource: post.viewsSource || '',
-  views: post.latestViews || 0,
+  views: post.viewsSource === 'unavailable' ? null : (post.latestViews || 0),
   likes: post.latestLikes || 0,
   comments: post.latestComments || 0,
   commentsPreview: serializeCommentsPreview(post.commentsPreview || []),
   lastSyncedAt: post.lastSyncedAt,
+  hasFreshViews: post.viewsSource !== 'unavailable',
 });
 
 const INSIGHT_SKIP_MS = 15 * 60 * 1000;
 const ADMIN_ROLES = ['owner', 'admin'];
 const MAX_FEED_SYNC_PAGES = 20;
-const PUBLISHED_FEED_WINDOW_DAYS = 30;
+const PUBLISHED_FEED_WINDOW_DAYS = 14;
+const LIVE_METRIC_POST_LIMIT = 14;
+const LIVE_METRIC_CONCURRENCY = 3;
 const hasAdminAccess = (user) => ADMIN_ROLES.includes(user?.role) && user?.userType !== 'account_handler';
+
+const mapWithConcurrency = async (items, limit, mapper) => {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+};
 
 const fetchMetaPagedData = async (initialUrl, { maxPages = MAX_FEED_SYNC_PAGES, shouldStop = null } = {}) => {
   const items = [];
@@ -106,6 +126,67 @@ const getAccountAccessFilter = (req, id) => {
     return { _id: id };
   }
   return { _id: id, userId: req.user._id };
+};
+
+const getReauthorizationAccount = async (req, accountId, platform, campaignId) => {
+  if (!accountId) return null;
+
+  const account = await SocialAccount.findById(accountId);
+  if (!account || account.platform !== platform) {
+    const error = new Error('The channel selected for reauthorization was not found.');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const isOwner = String(account.userId) === String(req.user._id);
+  let isAssignedHandler = false;
+  if (!isOwner && !hasAdminAccess(req.user) && campaignId) {
+    const userEmail = String(req.user.email || '').trim().toLowerCase();
+    isAssignedHandler = Boolean(await CampaignChannel.exists({
+      campaignId,
+      platform,
+      $or: [
+        { socialAccountId: account._id },
+        { assignedHandlerUserId: req.user._id },
+        ...(userEmail ? [{ assignedHandlerEmail: userEmail }] : []),
+      ],
+    }));
+  }
+
+  if (!isOwner && !hasAdminAccess(req.user) && !isAssignedHandler) {
+    const error = new Error('You cannot reauthorize this channel.');
+    error.statusCode = 403;
+    throw error;
+  }
+
+  return account;
+};
+
+const providerAccountMatches = (existingAccount, accountPayload) => {
+  if (!existingAccount || existingAccount.platform !== accountPayload?.platform) return false;
+  if (String(existingAccount.accountId) === String(accountPayload.accountId)) return true;
+
+  const existingHandles = new Set(getAccountMatchHandles(existingAccount));
+  return getAccountMatchHandles(accountPayload).some((handle) => existingHandles.has(handle));
+};
+
+const saveConnectedAccount = async ({ reauthorizationAccount, filter, payload }) => {
+  if (reauthorizationAccount) {
+    return SocialAccount.findByIdAndUpdate(
+      reauthorizationAccount._id,
+      {
+        ...payload,
+        userId: reauthorizationAccount.userId,
+      },
+      { returnDocument: 'after', runValidators: true }
+    );
+  }
+
+  return SocialAccount.findOneAndUpdate(
+    filter,
+    payload,
+    { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true, runValidators: true }
+  );
 };
 
 const getScopedUserId = (req) => {
@@ -323,7 +404,9 @@ router.get('/publishing-channels', protect, async (req, res) => {
             requestedHandle: channel.requestedHandle,
             displayName: channel.displayName || '',
             addedAt: channel.createdAt,
-            socialAccountId: isVerified ? matchedAcc._id : null,
+            // Keep the expired account id available so the OAuth callback can
+            // refresh this exact record instead of creating another one.
+            socialAccountId: matchedAcc?._id || channel.socialAccountId || null,
             accountId: matchedAcc?.accountId || '',
             name: matchedAcc?.name || channel.displayName || channel.requestedHandle,
             username: matchedAcc?.username || normalizedHandle,
@@ -337,6 +420,9 @@ router.get('/publishing-channels', protect, async (req, res) => {
             assignedHandlerUserId: channel.assignedHandlerUserId || null,
             campaignId,
             tokenExpiresAt: matchedAcc?.tokenExpiresAt || null,
+            tokenStatus: matchedAcc?.tokenStatus || 'unknown',
+            analyticsStatus: matchedAcc?.analyticsStatus || 'unknown',
+            analyticsError: matchedAcc?.analyticsError || '',
             verifiedAt: isVerified ? (matchedAcc.updatedAt || matchedAcc.createdAt || null) : null,
             verifiedByUserId: isVerified ? matchedAcc.userId : null,
           };
@@ -740,7 +826,7 @@ router.get('/youtube/auth-url', protect, async (req, res) => {
 // @route   POST /api/accounts/youtube-callback
 // @access  Private (Owner, Admin)
 router.post('/youtube-callback', protect, async (req, res) => {
-  const { code, campaignId } = req.body;
+  const { code, campaignId, reauthorizeAccountId } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
   }
@@ -751,24 +837,35 @@ router.post('/youtube-callback', protect, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected. YouTube channel connection requires MongoDB.' });
     }
 
+    const reauthorizationAccount = await getReauthorizationAccount(
+      req,
+      reauthorizeAccountId,
+      'youtube',
+      campaignId
+    );
     const accountPayload = await exchangeYoutubeCodeForAccount(code, req.user._id);
+    if (reauthorizationAccount && !providerAccountMatches(reauthorizationAccount, accountPayload)) {
+      return res.status(409).json({
+        message: `Please authorize the original YouTube channel "${reauthorizationAccount.name}".`,
+      });
+    }
     const linkableCampaignId = await getLinkableCampaignId(req, campaignId, accountPayload);
     if (campaignId && !linkableCampaignId && !hasAdminAccess(req.user)) {
       return res.status(403).json({ message: 'This YouTube channel does not match the campaign handle.' });
     }
 
-    const account = await SocialAccount.findOneAndUpdate(
-      {
+    const account = await saveConnectedAccount({
+      reauthorizationAccount,
+      filter: {
         userId: req.user._id,
         platform: 'youtube',
         accountId: accountPayload.accountId,
       },
-      {
+      payload: {
         ...accountPayload,
-        campaignId: linkableCampaignId || undefined,
+        campaignId: linkableCampaignId || reauthorizationAccount?.campaignId || undefined,
       },
-      { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
-    );
+    });
 
     if (linkableCampaignId) {
       await linkAccountToCampaign(linkableCampaignId, account._id, 'youtube', account.username, account.name, account.accountId, req.user._id, req.user.email || '');
@@ -780,7 +877,7 @@ router.post('/youtube-callback', protect, async (req, res) => {
     });
   } catch (error) {
     console.error('❌ YouTube callback handler error:', error.message);
-    res.status(500).json({ message: error.message });
+    res.status(error.statusCode || 500).json({ message: error.message });
   }
 });
 
@@ -812,7 +909,7 @@ router.delete('/:id', protect, async (req, res) => {
 // @route   POST /api/accounts/facebook-callback
 // @access  Private (Owner, Admin)
 router.post('/facebook-callback', protect, async (req, res) => {
-  const { code, campaignId } = req.body;
+  const { code, campaignId, reauthorizeAccountId } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
   }
@@ -826,6 +923,23 @@ router.post('/facebook-callback', protect, async (req, res) => {
   }
 
   try {
+    const reauthorizationAccount = reauthorizeAccountId
+      ? await SocialAccount.findById(reauthorizeAccountId)
+      : null;
+    if (reauthorizeAccountId && !reauthorizationAccount) {
+      return res.status(404).json({ message: 'The channel selected for reauthorization was not found.' });
+    }
+    if (reauthorizationAccount && !['facebook', 'instagram'].includes(reauthorizationAccount.platform)) {
+      return res.status(400).json({ message: 'This channel cannot be reauthorized with Meta.' });
+    }
+    if (reauthorizationAccount) {
+      await getReauthorizationAccount(
+        req,
+        reauthorizeAccountId,
+        reauthorizationAccount.platform,
+        campaignId
+      );
+    }
     
     // 1. Exchange authorization code for short-lived user token
     const tokenExchangeUrl = `https://graph.facebook.com/v20.0/oauth/access_token` +
@@ -863,14 +977,22 @@ router.post('/facebook-callback', protect, async (req, res) => {
 
     // Debug the token permissions and gather target page IDs
     let targetPageIds = new Set();
+    let grantedMetaScopes = [];
+    let metaScopeInspectionAvailable = false;
+    const pageTargetsByScope = new Map();
     try {
       const debugUrl = `https://graph.facebook.com/debug_token?input_token=${longLivedUserToken}&access_token=${appId}|${appSecret}`;
       const debugRes = await fetch(debugUrl);
       const debugData = await debugRes.json();
       
+      grantedMetaScopes = Array.isArray(debugData?.data?.scopes)
+        ? debugData.data.scopes
+        : [];
+      metaScopeInspectionAvailable = Array.isArray(debugData?.data?.scopes);
       if (debugData?.data?.granular_scopes) {
         for (const gs of debugData.data.granular_scopes) {
           if (gs.scope?.startsWith('pages_') && gs.target_ids) {
+            pageTargetsByScope.set(gs.scope, new Set(gs.target_ids.map(String)));
             for (const tid of gs.target_ids) {
               targetPageIds.add(tid);
             }
@@ -917,6 +1039,16 @@ router.post('/facebook-callback', protect, async (req, res) => {
     }
 
     const connectedAccounts = [];
+    let reauthorizationMatched = false;
+
+    if (reauthorizationAccount?.platform === 'facebook') {
+      pagesList = pagesList.filter((page) => providerAccountMatches(reauthorizationAccount, {
+        platform: 'facebook',
+        accountId: page.id,
+        name: page.name,
+        username: page.username,
+      }));
+    }
 
     // 4. Process each page and linked Instagram account
     for (const page of pagesList) {
@@ -924,45 +1056,74 @@ router.post('/facebook-callback', protect, async (req, res) => {
       const pageId = page.id;
       const pageName = page.name;
       const pageUsername = page.username || pageName.toLowerCase().replace(/\s+/g, '');
-
-      // Get page avatar from metadata or fallback
-      const pagePicUrl = `https://graph.facebook.com/v20.0/${pageId}/picture?type=normal&access_token=${pageAccessToken}`;
-      const pageAvatarUrl = await storeRemoteSocialAccountAvatar({
-        platform: 'facebook',
-        accountId: pageId,
-        avatarUrl: pagePicUrl,
+      const requiredFacebookAnalyticsScopes = [
+        'pages_read_engagement',
+        'pages_read_user_content',
+      ];
+      const missingFacebookAnalyticsScopes = requiredFacebookAnalyticsScopes.filter((scope) => {
+        if (!grantedMetaScopes.includes(scope)) return true;
+        const targetIds = pageTargetsByScope.get(scope);
+        return targetIds ? !targetIds.has(String(pageId)) : false;
+      });
+      const pageGrantedScopes = grantedMetaScopes.filter((scope) => {
+        const targetIds = pageTargetsByScope.get(scope);
+        return targetIds ? targetIds.has(String(pageId)) : true;
       });
 
-      
-      const linkableCampaignId = await getLinkableCampaignId(req, campaignId, {
-        platform: 'facebook',
-        accountId: pageId,
-        name: pageName,
-        username: pageUsername,
-      });
-
-      // Upsert Facebook Page in database
-      let fbAccount = await SocialAccount.findOneAndUpdate(
-        { userId: req.user._id, accountId: pageId },
-        {
-          userId: req.user._id,
-          campaignId: linkableCampaignId || undefined,
+      if (!reauthorizationAccount || reauthorizationAccount.platform === 'facebook') {
+        // Get page avatar from metadata or fallback
+        const pagePicUrl = `https://graph.facebook.com/v20.0/${pageId}/picture?type=normal&access_token=${pageAccessToken}`;
+        const pageAvatarUrl = await storeRemoteSocialAccountAvatar({
           platform: 'facebook',
+          accountId: pageId,
+          avatarUrl: pagePicUrl,
+        });
+
+        const linkableCampaignId = await getLinkableCampaignId(req, campaignId, {
+          platform: 'facebook',
+          accountId: pageId,
           name: pageName,
           username: pageUsername,
-          accessToken: pageAccessToken,
-          authProvider: 'facebook',
-          avatarUrl: pageAvatarUrl,
-          isConnected: true,
-          tokenStatus: 'healthy',
-          tokenRefreshError: '',
-          tokenLastCheckedAt: new Date(),
-        },
-        { upsert: true, returnDocument: 'after' }
-      );
-      connectedAccounts.push(fbAccount);
-      if (linkableCampaignId) {
-        await linkAccountToCampaign(linkableCampaignId, fbAccount._id, 'facebook', fbAccount.username, fbAccount.name, fbAccount.accountId, req.user._id, req.user.email || '');
+        });
+
+        const fbAccount = await saveConnectedAccount({
+          reauthorizationAccount: reauthorizationAccount?.platform === 'facebook'
+            ? reauthorizationAccount
+            : null,
+          filter: { userId: req.user._id, accountId: pageId },
+          payload: {
+            userId: reauthorizationAccount?.userId || req.user._id,
+            campaignId: linkableCampaignId || reauthorizationAccount?.campaignId || undefined,
+            platform: 'facebook',
+            accountId: pageId,
+            name: pageName,
+            username: pageUsername,
+            accessToken: pageAccessToken,
+            authProvider: 'facebook',
+            avatarUrl: pageAvatarUrl,
+            isConnected: true,
+            tokenStatus: 'healthy',
+            tokenRefreshError: '',
+            tokenLastCheckedAt: new Date(),
+            scopes: pageGrantedScopes,
+            analyticsStatus: !metaScopeInspectionAvailable
+              ? 'unknown'
+              : missingFacebookAnalyticsScopes.length > 0 ? 'permission_missing' : 'healthy',
+            analyticsError: metaScopeInspectionAvailable && missingFacebookAnalyticsScopes.length > 0
+              ? `Reconnect and grant: ${missingFacebookAnalyticsScopes.join(', ')}`
+              : '',
+            analyticsLastCheckedAt: new Date(),
+          },
+        });
+        connectedAccounts.push(fbAccount);
+        reauthorizationMatched = reauthorizationMatched || Boolean(reauthorizationAccount);
+        if (linkableCampaignId) {
+          await linkAccountToCampaign(linkableCampaignId, fbAccount._id, 'facebook', fbAccount.username, fbAccount.name, fbAccount.accountId, req.user._id, req.user.email || '');
+        }
+      }
+
+      if (reauthorizationAccount?.platform === 'facebook') {
+        continue;
       }
 
       // Find linked Instagram Business Account ID
@@ -994,13 +1155,25 @@ router.post('/facebook-callback', protect, async (req, res) => {
           username: igUsername,
         });
 
+        const instagramPayload = {
+          platform: 'instagram',
+          accountId: igAccountId,
+          name: igName,
+          username: igUsername,
+        };
+        if (reauthorizationAccount && !providerAccountMatches(reauthorizationAccount, instagramPayload)) {
+          continue;
+        }
+
         // Upsert Instagram Account in database
-        let igAccount = await SocialAccount.findOneAndUpdate(
-          { userId: req.user._id, accountId: igAccountId },
-          {
-            userId: req.user._id,
-            campaignId: instagramLinkableCampaignId || undefined,
+        const igAccount = await saveConnectedAccount({
+          reauthorizationAccount,
+          filter: { userId: req.user._id, accountId: igAccountId },
+          payload: {
+            userId: reauthorizationAccount?.userId || req.user._id,
+            campaignId: instagramLinkableCampaignId || reauthorizationAccount?.campaignId || undefined,
             platform: 'instagram',
+            accountId: igAccountId,
             name: igName,
             username: igUsername,
             accessToken: pageAccessToken, // Instagram operations use page tokens or long-lived user tokens
@@ -1011,13 +1184,20 @@ router.post('/facebook-callback', protect, async (req, res) => {
             tokenRefreshError: '',
             tokenLastCheckedAt: new Date(),
           },
-          { upsert: true, returnDocument: 'after' }
-        );
+        });
         connectedAccounts.push(igAccount);
+        reauthorizationMatched = reauthorizationMatched || Boolean(reauthorizationAccount);
         if (instagramLinkableCampaignId) {
           await linkAccountToCampaign(instagramLinkableCampaignId, igAccount._id, 'instagram', igAccount.username, igAccount.name, igAccount.accountId, req.user._id, req.user.email || '');
         }
       }
+    }
+
+    if (reauthorizationAccount && !reauthorizationMatched) {
+      const channelName = reauthorizationAccount.username || reauthorizationAccount.name;
+      return res.status(409).json({
+        message: `Please authorize the original ${reauthorizationAccount.platform} channel "${channelName}".`,
+      });
     }
 
     res.status(200).json({
@@ -1026,7 +1206,7 @@ router.post('/facebook-callback', protect, async (req, res) => {
     });
   } catch (error) {
     console.error('❌ Facebook callback handler error:', error.message);
-    res.status(500).json({ message: error.message });
+    res.status(error.statusCode || 500).json({ message: error.message });
   }
 });
 
@@ -1034,7 +1214,7 @@ router.post('/facebook-callback', protect, async (req, res) => {
 // @route   POST /api/accounts/instagram-callback
 // @access  Private (Owner, Admin)
 router.post('/instagram-callback', protect, async (req, res) => {
-  const { code, redirectUri: requestRedirectUri, campaignId } = req.body;
+  const { code, redirectUri: requestRedirectUri, campaignId, reauthorizeAccountId } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
   }
@@ -1048,6 +1228,12 @@ router.post('/instagram-callback', protect, async (req, res) => {
   }
 
   try {
+    const reauthorizationAccount = await getReauthorizationAccount(
+      req,
+      reauthorizeAccountId,
+      'instagram',
+      campaignId
+    );
 
     const form = new URLSearchParams();
     form.append('client_id', appId);
@@ -1117,10 +1303,23 @@ router.post('/instagram-callback', protect, async (req, res) => {
       return res.status(403).json({ message: `@${username} does not match a pending Instagram handle in this campaign.` });
     }
 
-    const account = await SocialAccount.findOneAndUpdate(
-      { userId: req.user._id, platform: 'instagram', accountId: instagramAccountId },
-      {
-        userId: req.user._id,
+    const accountPayload = {
+      platform: 'instagram',
+      accountId: instagramAccountId,
+      name,
+      username,
+    };
+    if (reauthorizationAccount && !providerAccountMatches(reauthorizationAccount, accountPayload)) {
+      return res.status(409).json({
+        message: `Please authorize the original Instagram channel @${reauthorizationAccount.username || reauthorizationAccount.name}.`,
+      });
+    }
+
+    const account = await saveConnectedAccount({
+      reauthorizationAccount,
+      filter: { userId: req.user._id, platform: 'instagram', accountId: instagramAccountId },
+      payload: {
+        userId: reauthorizationAccount?.userId || req.user._id,
         campaignId: linkableCampaignId || undefined,
         platform: 'instagram',
         accountId: instagramAccountId,
@@ -1135,8 +1334,7 @@ router.post('/instagram-callback', protect, async (req, res) => {
         tokenRefreshError: '',
         tokenLastCheckedAt: new Date(),
       },
-      { upsert: true, returnDocument: 'after' }
-    );
+    });
 
     if (linkableCampaignId) {
       await linkAccountToCampaign(linkableCampaignId, account._id, 'instagram', account.username, account.name, account.accountId, req.user._id, req.user.email || '');
@@ -1148,7 +1346,7 @@ router.post('/instagram-callback', protect, async (req, res) => {
     });
   } catch (error) {
     console.error('❌ Instagram callback handler error:', error.message);
-    res.status(500).json({ message: error.message });
+    res.status(error.statusCode || 500).json({ message: error.message });
   }
 });
 
@@ -1199,7 +1397,31 @@ router.get('/posts/recent', protect, async (req, res) => {
   }
 });
 
-// @desc    Get published posts for a specific account (cache-first; refresh only when requested)
+router.post('/:id/sync', protect, async (req, res) => {
+  try {
+    if (!getDBStatus()) return res.status(503).json({ message: 'Database disconnected.' });
+    const account = await SocialAccount.findOne(getAccountAccessFilter(req, req.params.id)).select('_id');
+    if (!account) return res.status(404).json({ message: 'Account not found.' });
+    const result = await requestAccountSync(account._id);
+    return res.status(202).json({ status: 'queued', ...result });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+});
+
+router.get('/:id/sync-status', protect, async (req, res) => {
+  try {
+    if (!getDBStatus()) return res.status(503).json({ message: 'Database disconnected.' });
+    const account = await SocialAccount.findOne(getAccountAccessFilter(req, req.params.id)).select('_id');
+    if (!account) return res.status(404).json({ message: 'Account not found.' });
+    const status = await MetricSyncStatus.findOne({ accountId: account._id, tier: 'manual' }).lean();
+    return res.status(200).json(status || { status: 'idle', postsProcessed: 0, lastError: '' });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Get published posts for a specific account (cache-first; legacy inline refresh supported)
 // @route   GET /api/accounts/:id/posts
 // @access  Private
 router.get('/:id/posts', protect, async (req, res) => {
@@ -1271,41 +1493,19 @@ router.get('/:id/posts', protect, async (req, res) => {
       }
     };
 
-    const getCommentsPreview = async (postId) => {
-      try {
-        const graphHost = liveAccount.platform === 'instagram' && liveAccount.authProvider === 'instagram'
-          ? 'graph.instagram.com'
-          : 'graph.facebook.com';
-        const fields = liveAccount.platform === 'facebook'
-          ? 'id,from,message,created_time'
-          : 'id,username,text,timestamp';
-        const url = `https://${graphHost}/v20.0/${postId}/comments?fields=${fields}&limit=3&access_token=${liveAccount.accessToken}`;
-        const commentsRes = await fetch(url);
-        const commentsData = await commentsRes.json();
-
-        if (!commentsRes.ok) {
-          console.warn(`Comments preview failed for post ${postId}:`, commentsData.error?.message || 'Unknown error');
-          return [];
-        }
-
-        return serializeCommentsPreview(commentsData.data || []);
-      } catch (error) {
-        console.warn(`Comments preview failed for post ${postId}:`, error.message);
-        return [];
-      }
-    };
-
     const existingPostMap = new Map(
       (cachedPosts.length > 0
         ? cachedPosts
-        : await PublishedPost.find({ accountId: account._id }).select('metaPostId latestViews latestLikes latestComments').lean()
+        : await PublishedPost.find({ accountId: account._id })
+          .select('metaPostId latestViews latestLikes latestComments commentsPreview viewsSource facebookVideoId mediaType lastSyncedAt')
+          .lean()
       ).map((post) => [post.metaPostId, post])
     );
 
     // Call actual Meta APIs
     let posts = [];
     if (liveAccount.platform === 'facebook') {
-      const url = `https://graph.facebook.com/v20.0/${liveAccount.accountId}/published_posts?fields=id,message,created_time,full_picture,permalink_url&limit=100&access_token=${liveAccount.accessToken}`;
+      const url = `https://graph.facebook.com/v20.0/${liveAccount.accountId}/published_posts?fields=id,message,created_time,full_picture,permalink_url,object_id&limit=100&access_token=${liveAccount.accessToken}`;
       const apiResult = await fetchMetaPagedData(url, {
         shouldStop: (pageItems) => pageItems.some((post) => !isInFeedWindow(post.created_time)),
       });
@@ -1313,20 +1513,36 @@ router.get('/:id/posts', protect, async (req, res) => {
       
       if (apiResult.ok) {
         const recentPosts = (apiData.data || []).filter((post) => isInFeedWindow(post.created_time));
-        posts = await Promise.all(recentPosts.map(async (post) => {
+        posts = await mapWithConcurrency(recentPosts, LIVE_METRIC_CONCURRENCY, async (post, index) => {
           const existingPost = existingPostMap.get(post.id);
-          const [viewResult, likes, commentsCount, commentsPreview] = await Promise.all([
+          if (index >= LIVE_METRIC_POST_LIMIT) {
+            return {
+              id: post.id,
+              content: post.message || 'No post message',
+              createdAt: post.created_time,
+              permalink: post.permalink_url || `https://facebook.com/${post.id}`,
+              mediaUrl: post.full_picture || '',
+              mediaType: existingPost?.mediaType || (post.full_picture ? 'IMAGE' : ''),
+              facebookVideoId: existingPost?.facebookVideoId || '',
+              viewsSource: existingPost?.viewsSource || '',
+              views: Number(existingPost?.latestViews || 0),
+              likes: Number(existingPost?.latestLikes || 0),
+              comments: Number(existingPost?.latestComments || 0),
+              hasFreshViews: false,
+              hasFreshLikes: false,
+              hasFreshCommentsCount: false,
+              hasFreshMetrics: false,
+              lastSyncedAt: existingPost?.lastSyncedAt || null,
+              commentsPreview: existingPost?.commentsPreview || [],
+            };
+          }
+          const [viewResult, engagement] = await Promise.all([
             fetchFacebookPostViews(liveAccount.accessToken, post),
-            fetchFacebookPostInsightValue(liveAccount.accessToken, post.id, 'post_reactions_like_total').catch((error) => {
-              console.warn(`Meta insight "post_reactions_like_total" failed for post ${post.id}:`, error.message);
-              return null;
-            }),
-            fetchFacebookPostCommentsCount(liveAccount.accessToken, post.id),
-            getCommentsPreview(post.id),
+            fetchFacebookPostEngagement(liveAccount.accessToken, post.id),
           ]);
           const facebookVideoId = viewResult.videoId || '';
           const hasFreshViews = viewResult.source !== 'unavailable';
-          const hasFreshLikes = likes !== null;
+          const hasFreshLikes = engagement.likes !== null;
 
           return {
             id: post.id,
@@ -1338,14 +1554,15 @@ router.get('/:id/posts', protect, async (req, res) => {
             facebookVideoId,
             viewsSource: viewResult.source,
             views: hasFreshViews ? Number(viewResult.views) || 0 : Number(existingPost?.latestViews || 0),
-            likes: hasFreshLikes ? Number(likes) || 0 : Number(existingPost?.latestLikes || 0),
-            comments: commentsCount ?? existingPost?.latestComments ?? 0,
+            likes: hasFreshLikes ? engagement.likes : Number(existingPost?.latestLikes || 0),
+            comments: engagement.comments ?? existingPost?.latestComments ?? 0,
             hasFreshViews,
             hasFreshLikes,
-            hasFreshCommentsCount: commentsCount !== null,
-            commentsPreview,
+            hasFreshCommentsCount: engagement.comments !== null,
+            hasFreshMetrics: hasFreshViews || hasFreshLikes || engagement.comments !== null,
+            commentsPreview: existingPost?.commentsPreview || [],
           };
-        }));
+        });
       } else {
         const message = apiData.error?.message || 'Meta API returned an error fetching posts';
         await handleProviderAuthFailure(liveAccount, apiData, message);
@@ -1367,17 +1584,15 @@ router.get('/:id/posts', protect, async (req, res) => {
 
       if (apiResult.ok) {
         const recentPosts = (apiData.data || []).filter((post) => isInFeedWindow(post.timestamp));
-        posts = await Promise.all(recentPosts.map(async (post) => {
+        posts = await mapWithConcurrency(recentPosts, LIVE_METRIC_CONCURRENCY, async (post, index) => {
           const existingPost = existingPostMap.get(post.id);
-          const [views, insightLikes, insightComments, commentsPreview] = await Promise.all([
-            getInsightValue(post.id, 'views'),
-            getInsightValue(post.id, 'likes'),
-            getInsightValue(post.id, 'comments'),
-            getCommentsPreview(post.id),
-          ]);
+          const shouldFetchLiveMetrics = index < LIVE_METRIC_POST_LIMIT;
+          const views = shouldFetchLiveMetrics
+            ? await getInsightValue(post.id, 'views')
+            : null;
           const hasFreshViews = views !== null;
-          const hasFreshLikes = insightLikes !== null || post.like_count !== undefined;
-          const hasFreshCommentsCount = insightComments !== null || post.comments_count !== undefined;
+          const hasFreshLikes = post.like_count !== undefined;
+          const hasFreshCommentsCount = post.comments_count !== undefined;
 
           return {
             id: post.id,
@@ -1388,14 +1603,15 @@ router.get('/:id/posts', protect, async (req, res) => {
             videoUrl: post.media_type === 'VIDEO' ? post.media_url : '',
             mediaType: post.media_type,
             views: hasFreshViews ? Number(views) || 0 : Number(existingPost?.latestViews || 0),
-            likes: hasFreshLikes ? Number(insightLikes ?? post.like_count) || 0 : Number(existingPost?.latestLikes || 0),
-            comments: hasFreshCommentsCount ? Number(insightComments ?? post.comments_count) || 0 : Number(existingPost?.latestComments || 0),
+            likes: hasFreshLikes ? Number(post.like_count) || 0 : Number(existingPost?.latestLikes || 0),
+            comments: hasFreshCommentsCount ? Number(post.comments_count) || 0 : Number(existingPost?.latestComments || 0),
             hasFreshViews,
             hasFreshLikes,
             hasFreshCommentsCount,
-            commentsPreview,
+            hasFreshMetrics: hasFreshViews || hasFreshLikes || hasFreshCommentsCount,
+            commentsPreview: existingPost?.commentsPreview || [],
           };
-        }));
+        });
       } else {
         console.error('Meta Instagram Media API error:', apiData);
         await handleProviderAuthFailure(liveAccount, apiData, apiData.error?.message || 'Meta API returned an error fetching posts');
@@ -1404,7 +1620,7 @@ router.get('/:id/posts', protect, async (req, res) => {
         });
       }
     } else if (liveAccount.platform === 'youtube') {
-      posts = (await fetchYoutubeVideos(liveAccount))
+      posts = (await fetchYoutubeVideos(liveAccount, { limit: LIVE_METRIC_POST_LIMIT }))
         .filter((post) => isInFeedWindow(post.createdAt));
     }
 
@@ -1429,7 +1645,7 @@ router.get('/:id/posts', protect, async (req, res) => {
             viewsSource: post.viewsSource || '',
             permalink: post.permalink,
             publishedAt: new Date(post.createdAt),
-            lastSyncedAt: syncTime,
+            ...(post.hasFreshMetrics !== false ? { lastSyncedAt: syncTime } : {}),
             ...(post.hasFreshViews !== false && { latestViews: post.views }),
             ...(post.hasFreshLikes !== false && { latestLikes: post.likes }),
             ...(post.hasFreshCommentsCount !== false && post.comments !== undefined && { latestComments: post.comments }),
@@ -1444,10 +1660,18 @@ router.get('/:id/posts', protect, async (req, res) => {
       }
     }
 
+    await recordStoredMetricSnapshots(
+      liveAccount._id,
+      posts.filter((post) => post.hasFreshMetrics !== false).map((post) => post.id),
+      syncTime
+    ).catch((snapshotError) => {
+      console.error('Failed to record manual-refresh metric snapshots:', snapshotError.message);
+    });
+
     // Add lastSyncedAt to each post in the response
     const result = posts.map(post => ({
       ...post,
-      lastSyncedAt: syncTime,
+      lastSyncedAt: post.hasFreshMetrics === false ? post.lastSyncedAt || null : syncTime,
       commentsPreview: serializeCommentsPreview(post.commentsPreview || []),
     }));
 
@@ -1662,13 +1886,16 @@ router.get('/creator/campaigns', protect, async (req, res) => {
             isConnected: isVerified,
             isVerified,
             status,
-            socialAccountId: isVerified ? matchedAcc._id : null,
+            socialAccountId: matchedAcc?._id || channel.socialAccountId || null,
             matchedAccountId: matchedAcc?._id || null,
             userId: matchedAcc?.userId || channel.assignedHandlerUserId || null,
             assignedHandlerEmail: channel.assignedHandlerEmail || '',
             assignedHandlerUserId: channel.assignedHandlerUserId || null,
             campaignId: campaign._id,
             tokenExpiresAt: matchedAcc?.tokenExpiresAt || null,
+            tokenStatus: matchedAcc?.tokenStatus || 'unknown',
+            analyticsStatus: matchedAcc?.analyticsStatus || 'unknown',
+            analyticsError: matchedAcc?.analyticsError || '',
             verifiedAt: isVerified ? (matchedAcc.updatedAt || matchedAcc.createdAt || null) : null,
             verifiedByUserId: isVerified ? matchedAcc.userId : null,
           };

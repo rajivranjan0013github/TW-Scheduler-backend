@@ -84,6 +84,28 @@ const ScheduledPostSchema = new mongoose.Schema({
     type: String,
     default: '',
   },
+  manualVerificationStatus: {
+    type: String,
+    enum: ['pending', 'verified', 'manual_override', 'not_required', null],
+    default: null,
+  },
+  manualVerificationError: {
+    type: String,
+    default: '',
+  },
+  cooldownBypassGrantedAt: {
+    type: Date,
+    default: null,
+  },
+  cooldownBypassGrantedByUserId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null,
+  },
+  cooldownBypassUsedAt: {
+    type: Date,
+    default: null,
+  },
   postedByUserId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',

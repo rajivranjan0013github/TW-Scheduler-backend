@@ -32,7 +32,10 @@ const findMatchingAccount = (channel, accounts = []) => {
     : null;
   if (linkedMatch) return linkedMatch;
 
-  return accounts.find((account) => accountMatchesHandle(account, channel.platform, normalizedHandle)) || null;
+  const handleMatches = accounts.filter((account) => (
+    accountMatchesHandle(account, channel.platform, normalizedHandle)
+  ));
+  return handleMatches.find((account) => account.isConnected !== false) || handleMatches[0] || null;
 };
 
 const buildAccountLookupQuery = (channels = []) => {
@@ -198,21 +201,42 @@ export const resolveCampaignPublishingChannels = async (
 
   const accounts = accountQueryOr.length > 0
     ? await SocialAccount.find({ $or: accountQueryOr })
-        .select('_id userId platform accountId name username avatarUrl isConnected tokenExpiresAt authProvider')
+        .select('_id userId platform accountId name username avatarUrl isConnected tokenExpiresAt tokenStatus authProvider analyticsStatus analyticsError')
         .lean()
     : [];
   const accountOwnerIds = [...new Set(accounts.map((account) => idToString(account.userId)).filter(Boolean))];
-  const accountOwners = accountOwnerIds.length > 0
-    ? await User.find({ _id: { $in: accountOwnerIds } }).select('_id name email').lean()
+  const assignedHandlerIds = [...new Set(
+    channelDocs.map((channel) => idToString(channel.assignedHandlerUserId)).filter(Boolean)
+  )];
+  const assignedHandlerEmails = [...new Set(
+    channelDocs
+      .map((channel) => String(channel.assignedHandlerEmail || '').trim().toLowerCase())
+      .filter(Boolean)
+  )];
+  const relatedUserQuery = [];
+  const relatedUserIds = [...new Set([...accountOwnerIds, ...assignedHandlerIds])];
+  if (relatedUserIds.length > 0) relatedUserQuery.push({ _id: { $in: relatedUserIds } });
+  if (assignedHandlerEmails.length > 0) relatedUserQuery.push({ email: { $in: assignedHandlerEmails } });
+  const relatedUsers = relatedUserQuery.length > 0
+    ? await User.find({ $or: relatedUserQuery }).select('_id name email').lean()
     : [];
   const accountOwnerById = new Map(
-    accountOwners.map((owner) => [idToString(owner._id), owner])
+    relatedUsers.map((owner) => [idToString(owner._id), owner])
+  );
+  const userByEmail = new Map(
+    relatedUsers
+      .filter((user) => user.email)
+      .map((user) => [String(user.email).trim().toLowerCase(), user])
   );
 
   const resolvedChannels = channelDocs.map((channel) => {
     const matched = findMatchingAccount(channel, accounts);
     const isConnected = Boolean(matched && matched.isConnected !== false);
     const matchedOwner = matched?.userId ? accountOwnerById.get(idToString(matched.userId)) : null;
+    const assignedHandlerEmail = String(channel.assignedHandlerEmail || '').trim().toLowerCase();
+    const assignedHandler = channel.assignedHandlerUserId
+      ? accountOwnerById.get(idToString(channel.assignedHandlerUserId))
+      : userByEmail.get(assignedHandlerEmail);
     const socialAccountId = matched?._id || channel.socialAccountId || null;
     const status = isConnected
       ? 'verified'
@@ -238,19 +262,24 @@ export const resolveCampaignPublishingChannels = async (
       status,
       userId: matched?.userId || null,
       matchedAccountId: matched?._id || null,
-      assignedHandlerEmail: channel.assignedHandlerEmail || (isConnected
+      assignedHandlerEmail: assignedHandlerEmail || (isConnected
         ? (matchedOwner?.email || '')
         : ''),
-      assignedHandlerName: channel.assignedHandlerEmail && matchedOwner?.email === channel.assignedHandlerEmail
-        ? (matchedOwner?.name || matched?.name || matched?.username || '')
-        : (isConnected && !channel.assignedHandlerEmail
+      assignedHandlerName: assignedHandlerEmail
+        ? (assignedHandler?.name || (matchedOwner?.email === assignedHandlerEmail
+          ? (matchedOwner?.name || matched?.name || matched?.username || '')
+          : ''))
+        : (isConnected
           ? (matchedOwner?.name || matched?.name || matched?.username || '')
           : ''),
-      assignedHandlerUserId: channel.assignedHandlerEmail
+      assignedHandlerUserId: assignedHandlerEmail
         ? (channel.assignedHandlerUserId || null)
         : (matched?.userId || channel.assignedHandlerUserId || null),
       campaignId,
       tokenExpiresAt: matched?.tokenExpiresAt || null,
+      tokenStatus: matched?.tokenStatus || 'unknown',
+      analyticsStatus: matched?.analyticsStatus || 'unknown',
+      analyticsError: matched?.analyticsError || '',
       verifiedAt: isConnected ? (channel.verifiedAt || new Date()) : null,
       verifiedByUserId: isConnected ? (channel.verifiedByUserId || matched?.userId || null) : null,
     };
@@ -263,7 +292,9 @@ export const resolveCampaignPublishingChannels = async (
 
     await Promise.all(resolvedChannels.map((channel) => (
       CampaignChannel.findByIdAndUpdate(channel._id, {
-        socialAccountId: channel.isVerified ? channel.socialAccountId : null,
+        // Keep the account identity while its token is expired. Reauthorization
+        // must update this account instead of treating the channel as brand new.
+        socialAccountId: channel.socialAccountId || null,
         status: channel.status,
         assignedHandlerEmail: channel.assignedHandlerEmail || '',
         assignedHandlerUserId: channel.isVerified ? (channel.verifiedByUserId || channel.assignedHandlerUserId || null) : (channel.assignedHandlerUserId || null),
@@ -277,7 +308,7 @@ export const resolveCampaignPublishingChannels = async (
         platform: channel.platform,
         handle: channel.requestedHandle,
         displayName: channel.displayName,
-        socialAccountId: channel.isVerified ? channel.socialAccountId : null,
+        socialAccountId: channel.socialAccountId || null,
         assignedHandlerEmail: channel.assignedHandlerEmail || '',
         assignedHandlerUserId: channel.assignedHandlerUserId || null,
         addedAt: channel.addedAt || new Date(),

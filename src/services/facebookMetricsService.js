@@ -1,7 +1,40 @@
 const API_VERSION = 'v20.0';
 const GRAPH_BASE = `https://graph.facebook.com/${API_VERSION}`;
+const FAILURE_LOG_TTL_MS = 15 * 60 * 1000;
+const UNSUPPORTED_CAPABILITY_TTL_MS = 6 * 60 * 60 * 1000;
+
+const recentFailureLogs = new Map();
+const disabledCapabilities = new Map();
 
 const toNumber = (value) => Number(value) || 0;
+
+const getGraphErrorCode = (error) => Number(error?.error?.code || error?.status || 0);
+
+const warnMetricFailure = (operation, error) => {
+  const code = getGraphErrorCode(error);
+  const key = `${operation}:${code}:${error?.error?.error_subcode || ''}`;
+  const now = Date.now();
+  if ((recentFailureLogs.get(key) || 0) > now) return;
+
+  recentFailureLogs.set(key, now + FAILURE_LOG_TTL_MS);
+  console.warn(`[Facebook Metrics] ${operation} unavailable`, {
+    code: code || undefined,
+    message: String(error?.message || error).slice(0, 300),
+    suppressedForMinutes: FAILURE_LOG_TTL_MS / 60000,
+  });
+};
+
+const disableUnsupportedCapability = (capability, error) => {
+  if (![12, 100].includes(getGraphErrorCode(error))) return;
+  disabledCapabilities.set(capability, Date.now() + UNSUPPORTED_CAPABILITY_TTL_MS);
+};
+
+const isCapabilityDisabled = (capability) => {
+  const disabledUntil = disabledCapabilities.get(capability) || 0;
+  if (disabledUntil > Date.now()) return true;
+  disabledCapabilities.delete(capability);
+  return false;
+};
 
 const fetchGraphJson = async (path, accessToken, params = {}) => {
   const url = new URL(`${GRAPH_BASE}/${path}`);
@@ -41,6 +74,12 @@ const getFacebookReelIdFromPermalink = (permalink = '') => {
   return match?.[1] || '';
 };
 
+const isFacebookVideoPermalink = (permalink = '') => (
+  /\/(?:videos?|watch|share\/v)\//i.test(String(permalink))
+  || /facebook\.com\/watch\/?\?v=/i.test(String(permalink))
+  || /fb\.watch\//i.test(String(permalink))
+);
+
 export const getFacebookAttachmentVideoId = (post = {}) => {
   const attachments = post.attachments?.data || [];
   const queue = [...attachments];
@@ -64,38 +103,24 @@ export const getFacebookAttachmentVideoId = (post = {}) => {
 };
 
 export const fetchFacebookVideoViews = async (accessToken, videoId) => {
-  if (!videoId) return 0;
-
-  const metricCandidates = [
-    'blue_reels_play_count',
-    'post_video_views',
-    'total_video_views',
-  ];
-
-  let zeroMetric = '';
-  for (const metric of metricCandidates) {
-    let data;
-    try {
-      data = await fetchGraphJson(`${videoId}/video_insights`, accessToken, { metric });
-    } catch (error) {
-      console.warn(`Facebook video insight "${metric}" failed for video ${videoId}:`, error.message);
-      continue;
-    }
-
-    const entry = data?.data?.find(item => item.name === metric) || data?.data?.[0];
-    if (!entry) {
-      continue;
-    }
-
-    const views = toNumber(getInsightValue({ data: [entry] }));
-    if (views > 0) {
-      return { views, metric };
-    }
-
-    zeroMetric = zeroMetric || metric;
+  const capabilityKey = `video_views_field:${videoId}`;
+  if (!videoId || isCapabilityDisabled(capabilityKey)) {
+    return { views: null, metric: 'unavailable' };
   }
 
-  return { views: 0, metric: zeroMetric || 'video_insights' };
+  try {
+    // A real Video object exposes its lifetime view count as a field. This avoids
+    // the deprecated singular-status /video_insights metrics previously probed.
+    const data = await fetchGraphJson(videoId, accessToken, { fields: 'views' });
+    if (data?.views === undefined || data?.views === null) {
+      return { views: null, metric: 'unavailable' };
+    }
+    return { views: toNumber(data.views), metric: 'video_views' };
+  } catch (error) {
+    disableUnsupportedCapability(capabilityKey, error);
+    warnMetricFailure('video views', error);
+    return { views: null, metric: 'unavailable' };
+  }
 };
 
 export const fetchFacebookPostInsightValue = async (accessToken, postId, metric) => {
@@ -103,61 +128,62 @@ export const fetchFacebookPostInsightValue = async (accessToken, postId, metric)
   return getInsightValue(data);
 };
 
-export const fetchFacebookPostCommentsCount = async (accessToken, postId) => {
-  if (!postId) return null;
+export const fetchFacebookPostEngagement = async (accessToken, postId) => {
+  if (!postId) return { likes: null, comments: null, errorType: 'invalid_post' };
 
   try {
     const data = await fetchGraphJson(postId, accessToken, {
-      fields: 'comments.summary(true).limit(0)',
+      fields: 'comments.limit(0).summary(true),reactions.type(LIKE).limit(0).summary(total_count)',
     });
-    return toNumber(data?.comments?.summary?.total_count);
+    return {
+      likes: data?.reactions?.summary?.total_count === undefined
+        ? null
+        : toNumber(data.reactions.summary.total_count),
+      comments: data?.comments?.summary?.total_count === undefined
+        ? null
+        : toNumber(data.comments.summary.total_count),
+      errorType: '',
+    };
   } catch (error) {
-    console.warn(`Facebook comments count failed for post ${postId}:`, error.message);
-    return null;
+    const errorType = getGraphErrorCode(error) === 10 ? 'permission_missing' : 'unavailable';
+    warnMetricFailure('post engagement', error);
+    return { likes: null, comments: null, errorType };
   }
 };
 
+export const fetchFacebookPostCommentsCount = async (accessToken, postId) => (
+  (await fetchFacebookPostEngagement(accessToken, postId)).comments
+);
+
 export const fetchFacebookPostViews = async (accessToken, post) => {
   const postId = typeof post === 'string' ? post : post?.id || post?.metaPostId;
-  let zeroVideoResult = null;
 
-  try {
-    const postVideoViews = toNumber(await fetchFacebookPostInsightValue(accessToken, postId, 'post_video_views'));
-    if (postVideoViews > 0) {
-      return { views: postVideoViews, source: 'post_video_views', videoId: '' };
-    }
-    zeroVideoResult = { views: 0, source: 'post_video_views', videoId: '' };
-  } catch (error) {
-    console.warn(`Facebook post video views failed for post ${postId}:`, error.message);
-  }
-
+  // Only use IDs supplied by Facebook as video objects. Do not derive a video
+  // ID from the post ID or send a combined Page_post ID to /video_insights.
   const videoCandidates = [
     typeof post === 'object' ? post.facebookVideoId : '',
-    typeof post === 'object' ? post.object_id : '',
+    typeof post === 'object' && String(post.mediaType || '').toLowerCase().includes('video')
+      ? post.object_id
+      : '',
+    typeof post === 'object' && isFacebookVideoPermalink(post.permalink_url || post.permalink)
+      ? post.object_id
+      : '',
     typeof post === 'object' ? getFacebookReelIdFromPermalink(post.permalink_url || post.permalink) : '',
     typeof post === 'object' ? getFacebookAttachmentVideoId(post) : '',
-    getFacebookPostIdCandidate(postId),
-    postId,
   ].filter(Boolean);
 
   const uniqueVideoCandidates = [...new Set(videoCandidates)];
   for (const videoId of uniqueVideoCandidates) {
-    try {
-      const videoResult = await fetchFacebookVideoViews(accessToken, videoId);
-      if (videoResult.views > 0) {
-        return { views: videoResult.views, source: videoResult.metric, videoId };
-      }
-      zeroVideoResult = zeroVideoResult || { views: 0, source: videoResult.metric, videoId };
-    } catch (error) {
-      console.warn(`Facebook video views failed for video ${videoId}:`, error.message);
+    const videoResult = await fetchFacebookVideoViews(accessToken, videoId);
+    if (videoResult.views !== null) {
+      return { views: videoResult.views, source: videoResult.metric, videoId };
     }
   }
 
-  try {
-    const views = await fetchFacebookPostInsightValue(accessToken, postId, 'post_impressions_unique');
-    return { views: toNumber(views), source: 'post_impressions_unique', videoId: uniqueVideoCandidates[0] || '' };
-  } catch (error) {
-    console.warn(`Facebook post views fallback failed for post ${postId}:`, error.message);
-    return zeroVideoResult || { views: 0, source: 'unavailable', videoId: uniqueVideoCandidates[0] || '' };
-  }
+  return {
+    views: null,
+    source: 'unavailable',
+    videoId: uniqueVideoCandidates[0] || '',
+    postId,
+  };
 };

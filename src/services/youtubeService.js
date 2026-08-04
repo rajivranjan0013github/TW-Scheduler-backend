@@ -180,7 +180,32 @@ export const publishToYoutube = async ({ account, media, caption, specifics }) =
   return uploadData.id;
 };
 
-export const fetchYoutubeVideos = async (account) => {
+export const fetchYoutubeVideoMetrics = async (account, videoIds = []) => {
+  const uniqueVideoIds = [...new Set(videoIds.map(String).filter(Boolean))].slice(0, 50);
+  if (uniqueVideoIds.length === 0) return new Map();
+
+  const freshAccount = await ensureFreshAccountToken(account, { force: true });
+  const response = await fetch(
+    `https://www.googleapis.com/youtube/v3/videos?part=statistics&id=${uniqueVideoIds.join(',')}`,
+    { headers: { Authorization: `Bearer ${freshAccount.accessToken}` } }
+  );
+  const payload = await response.json();
+  if (!response.ok) {
+    const error = new Error(payload.error?.message || `YouTube statistics fetch failed (status ${response.status})`);
+    error.status = response.status;
+    error.retryAfterMs = Number(response.headers.get('retry-after') || 0) * 1000;
+    throw error;
+  }
+
+  return new Map((payload.items || []).map((video) => [String(video.id), {
+    views: Number(video.statistics?.viewCount) || 0,
+    likes: Number(video.statistics?.likeCount) || 0,
+    comments: Number(video.statistics?.commentCount) || 0,
+    viewsSource: 'youtube_viewCount',
+  }]));
+};
+
+export const fetchYoutubeVideos = async (account, { limit = 25 } = {}) => {
   const freshAccount = await ensureFreshAccountToken(account, { force: true });
   const accessToken = freshAccount.accessToken;
   const channelId = freshAccount.accountId;
@@ -188,7 +213,8 @@ export const fetchYoutubeVideos = async (account) => {
 
 
   // 1. Fetch playlist items
-  const playlistItemsUrl = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId=${uploadsPlaylistId}&maxResults=25`;
+  const safeLimit = Math.min(50, Math.max(1, Number(limit) || 25));
+  const playlistItemsUrl = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId=${uploadsPlaylistId}&maxResults=${safeLimit}`;
   const playlistRes = await fetch(playlistItemsUrl, {
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -197,7 +223,10 @@ export const fetchYoutubeVideos = async (account) => {
 
   const playlistData = await playlistRes.json();
   if (!playlistRes.ok) {
-    throw new Error(playlistData.error?.message || `YouTube playlist items fetch failed (status ${playlistRes.status})`);
+    const error = new Error(playlistData.error?.message || `YouTube playlist items fetch failed (status ${playlistRes.status})`);
+    error.status = playlistRes.status;
+    error.retryAfterMs = Number(playlistRes.headers.get('retry-after') || 0) * 1000;
+    throw error;
   }
 
   const items = playlistData.items || [];
@@ -220,7 +249,10 @@ export const fetchYoutubeVideos = async (account) => {
 
   const videosData = await videosRes.json();
   if (!videosRes.ok) {
-    throw new Error(videosData.error?.message || `YouTube video details fetch failed (status ${videosRes.status})`);
+    const error = new Error(videosData.error?.message || `YouTube video details fetch failed (status ${videosRes.status})`);
+    error.status = videosRes.status;
+    error.retryAfterMs = Number(videosRes.headers.get('retry-after') || 0) * 1000;
+    throw error;
   }
 
   return (videosData.items || []).map(video => {

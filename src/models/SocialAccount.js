@@ -56,6 +56,18 @@ const SocialAccountSchema = new mongoose.Schema({
     default: '',
   },
   scopes: [String],
+  analyticsStatus: {
+    type: String,
+    enum: ['unknown', 'healthy', 'permission_missing', 'unavailable'],
+    default: 'unknown',
+  },
+  analyticsError: {
+    type: String,
+    default: '',
+  },
+  analyticsLastCheckedAt: {
+    type: Date,
+  },
   avatarUrl: {
     type: String,
   },
