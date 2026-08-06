@@ -46,7 +46,11 @@ export const fetchMetaPagedData = async (initialUrl, { maxPages = MAX_FEED_SYNC_
     const data = await response.json();
 
     if (!response.ok) {
-      throw new Error(data.error?.message || `Meta feed fetch failed (status ${response.status})`);
+      const error = new Error(data.error?.message || `Meta feed fetch failed (status ${response.status})`);
+      error.status = response.status;
+      error.error = data.error;
+      error.retryAfterMs = Number(response.headers.get('retry-after') || 0) * 1000;
+      throw error;
     }
 
     const pageItems = data.data || [];
@@ -65,12 +69,43 @@ export const fetchMetaPagedData = async (initialUrl, { maxPages = MAX_FEED_SYNC_
  * @returns {Promise<Array>} - Array of normalized post objects
  */
 export const fetchFacebookPosts = async (account, { maxPages = MAX_FEED_SYNC_PAGES, limit = 100, sinceDate = null } = {}) => {
-  const url = `https://graph.facebook.com/v20.0/${account.accountId}/published_posts?fields=id,message,created_time,full_picture,permalink_url,object_id&limit=${limit}&access_token=${account.accessToken}`;
   const cutoff = sinceDate ? new Date(sinceDate).getTime() : null;
-  const data = (await fetchMetaPagedData(url, {
+  const fetchOptions = {
     maxPages,
     shouldStop: cutoff ? (items) => items.some((post) => new Date(post.created_time).getTime() < cutoff) : null,
-  })).filter((post) => !cutoff || new Date(post.created_time).getTime() >= cutoff);
+  };
+  const buildUrl = (fields) => {
+    const url = new URL(`https://graph.facebook.com/v20.0/${account.accountId}/published_posts`);
+    url.searchParams.set('fields', fields);
+    url.searchParams.set('limit', String(limit));
+    url.searchParams.set('access_token', account.accessToken);
+    return url.toString();
+  };
+
+  let rawPosts;
+  try {
+    rawPosts = await fetchMetaPagedData(
+      buildUrl('id,message,created_time,full_picture,permalink_url,object_id'),
+      fetchOptions
+    );
+  } catch (error) {
+    const graphCode = Number(error?.error?.code || 0);
+    const deprecatedAggregates = graphCode === 12
+      || String(error?.message || '').includes('deprecate_post_aggregated_fields_for_attachement');
+    if (!deprecatedAggregates) throw error;
+
+    console.warn('[Feed Sync] Facebook deprecated aggregate fields; retrying with stable fields.', {
+      accountId: String(account._id),
+      pageId: String(account.accountId || ''),
+      graphCode: graphCode || undefined,
+    });
+    rawPosts = await fetchMetaPagedData(
+      buildUrl('id,message,created_time,permalink_url'),
+      fetchOptions
+    );
+  }
+
+  const data = rawPosts.filter((post) => !cutoff || new Date(post.created_time).getTime() >= cutoff);
 
   return mapWithConcurrency(data, FACEBOOK_POST_CONCURRENCY, async (post) => {
     const [viewResult, engagement] = await Promise.all([
@@ -83,9 +118,9 @@ export const fetchFacebookPosts = async (account, { maxPages = MAX_FEED_SYNC_PAG
       metaPostId: post.id,
       platform: 'facebook',
       content: post.message || '',
-      mediaUrl: post.full_picture || '',
-      videoUrl: '',
-      mediaType: facebookVideoId ? 'VIDEO' : (post.full_picture ? 'IMAGE' : ''),
+      ...(post.full_picture ? { mediaUrl: post.full_picture } : {}),
+      ...(facebookVideoId ? { videoUrl: '', mediaType: 'VIDEO' }
+        : post.full_picture ? { mediaType: 'IMAGE' } : {}),
       facebookVideoId,
       viewsSource: viewResult.source,
       permalink: post.permalink_url || `https://facebook.com/${post.id}`,
@@ -161,14 +196,15 @@ export const runAccountFeedSync = async (accountOrId, { windowDays = 14, acquire
           metaPostId: postData.metaPostId || postData.id,
           platform: freshAccount.platform,
           content: postData.content || '',
-          mediaUrl: postData.mediaUrl || '',
-          videoUrl: postData.videoUrl || '',
-          mediaType: postData.mediaType || '',
-          facebookVideoId: postData.facebookVideoId || '',
-          viewsSource: postData.viewsSource || '',
           permalink: postData.permalink || '',
           publishedAt: new Date(postData.publishedAt || postData.createdAt),
           lastSyncedAt: syncTime,
+          ...(postData.mediaUrl !== undefined ? { mediaUrl: postData.mediaUrl || '' } : {}),
+          ...(postData.videoUrl !== undefined ? { videoUrl: postData.videoUrl || '' } : {}),
+          ...(postData.mediaType !== undefined ? { mediaType: postData.mediaType || '' } : {}),
+          ...(postData.facebookVideoId ? { facebookVideoId: postData.facebookVideoId } : {}),
+          ...(postData.viewsSource && postData.viewsSource !== 'unavailable'
+            ? { viewsSource: postData.viewsSource } : {}),
           ...(postData.latestViews !== undefined || postData.views !== undefined
             ? { latestViews: Number(postData.latestViews ?? postData.views) || 0 } : {}),
           ...(postData.latestLikes !== undefined || postData.likes !== undefined

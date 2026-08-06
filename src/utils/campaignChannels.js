@@ -121,11 +121,21 @@ const loadCampaignChannels = async (campaign, { persist = false, addedByUserId =
 
 export const syncCampaignChannelList = async (campaignId, channels = [], { userId = null } = {}) => {
   const cleanChannels = cleanChannelInputs(channels);
-  const keepKeys = new Set(cleanChannels.map((channel) => `${channel.platform}:${channel.normalizedHandle}`));
-
   const existing = await CampaignChannel.find({ campaignId }).lean();
   const existingByKey = new Map(
     existing.map((channel) => [`${channel.platform}:${channel.normalizedHandle}`, channel])
+  );
+  const existingById = new Map(
+    existing.map((channel) => [idToString(channel._id), channel])
+  );
+
+  const keepIds = new Set(
+    cleanChannels
+      .map((channel) => channel._id ? idToString(channel._id) : null)
+      .filter(Boolean)
+  );
+  const keepKeys = new Set(
+    cleanChannels.map((channel) => `${channel.platform}:${channel.normalizedHandle}`)
   );
 
   await CampaignChannel.deleteMany({
@@ -133,22 +143,25 @@ export const syncCampaignChannelList = async (campaignId, channels = [], { userI
     $or: [
       { platform: { $nin: cleanChannels.map((channel) => channel.platform) } },
       ...existing
-        .filter((channel) => !keepKeys.has(`${channel.platform}:${channel.normalizedHandle}`))
+        .filter((channel) => !keepIds.has(idToString(channel._id)) && !keepKeys.has(`${channel.platform}:${channel.normalizedHandle}`))
         .map((channel) => ({ _id: channel._id })),
     ],
   });
 
   for (const channel of cleanChannels) {
-    const existingChannel = existingByKey.get(`${channel.platform}:${channel.normalizedHandle}`);
+    const existingChannel = (channel._id ? existingById.get(idToString(channel._id)) : null)
+      || existingByKey.get(`${channel.platform}:${channel.normalizedHandle}`);
+
     const assignedUser = channel.assignedHandlerEmail
       ? await User.findOne({ email: channel.assignedHandlerEmail }).select('_id').lean()
       : null;
+
+    const query = existingChannel?._id
+      ? { _id: existingChannel._id }
+      : { campaignId, platform: channel.platform, normalizedHandle: channel.normalizedHandle };
+
     await CampaignChannel.findOneAndUpdate(
-      {
-        campaignId,
-        platform: channel.platform,
-        normalizedHandle: channel.normalizedHandle,
-      },
+      query,
       {
         campaignId,
         platform: channel.platform,

@@ -7,7 +7,7 @@ import Insight from '../models/Insight.js';
 import PublishedPost from '../models/PublishedPost.js';
 import PostInsight from '../models/PostInsight.js';
 import { recordStoredMetricSnapshots } from '../queues/metricSyncWorker.js';
-import { protect, authorize } from '../middleware/auth.js';
+import { protect, authorize, resolveHandlerPreview } from '../middleware/auth.js';
 import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount, fetchYoutubeVideos } from '../services/youtubeService.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
 import {
@@ -294,7 +294,7 @@ const linkAccountToCampaign = async (campaignId, socialAccountId, platform, user
 // @desc    Get all connected accounts
 // @route   GET /api/accounts
 // @access  Private
-router.get('/', protect, async (req, res) => {
+router.get('/', protect, resolveHandlerPreview, async (req, res) => {
   try {
     const isConnected = getDBStatus();
     if (!isConnected) {
@@ -329,7 +329,7 @@ router.get('/', protect, async (req, res) => {
 // @desc    Get campaign publishing channels, including pending verification rows
 // @route   GET /api/accounts/publishing-channels?campaignId=...
 // @access  Private
-router.get('/publishing-channels', protect, async (req, res) => {
+router.get('/publishing-channels', protect, resolveHandlerPreview, async (req, res) => {
   try {
     const isConnected = getDBStatus();
     if (!isConnected) {
@@ -442,7 +442,7 @@ router.get('/publishing-channels', protect, async (req, res) => {
 // @desc    Get campaign workspaces visible to the signed-in user's email
 // @route   GET /api/accounts/campaigns
 // @access  Private
-router.get('/campaigns', protect, async (req, res) => {
+router.get('/campaigns', protect, resolveHandlerPreview, async (req, res) => {
   try {
     const isConnected = getDBStatus();
     if (!isConnected) {
@@ -754,7 +754,7 @@ router.get('/insights', protect, async (req, res) => {
 // @desc    Connect a new account
 // @route   POST /api/accounts/connect
 // @access  Private (Owner, Admin)
-router.post('/connect', protect, async (req, res) => {
+router.post('/connect', protect, resolveHandlerPreview, async (req, res) => {
   const { platform, accountId, name, username, accessToken, avatarUrl, campaignId } = req.body;
 
   try {
@@ -813,7 +813,7 @@ router.post('/connect', protect, async (req, res) => {
 // @desc    Get YouTube OAuth URL
 // @route   GET /api/accounts/youtube/auth-url
 // @access  Private (Owner, Admin)
-router.get('/youtube/auth-url', protect, async (req, res) => {
+router.get('/youtube/auth-url', protect, resolveHandlerPreview, async (req, res) => {
   try {
     const url = getYoutubeAuthUrl();
     res.status(200).json({ url });
@@ -825,7 +825,7 @@ router.get('/youtube/auth-url', protect, async (req, res) => {
 // @desc    Callback from YouTube OAuth to connect a channel
 // @route   POST /api/accounts/youtube-callback
 // @access  Private (Owner, Admin)
-router.post('/youtube-callback', protect, async (req, res) => {
+router.post('/youtube-callback', protect, resolveHandlerPreview, async (req, res) => {
   const { code, campaignId, reauthorizeAccountId } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
@@ -884,7 +884,7 @@ router.post('/youtube-callback', protect, async (req, res) => {
 // @desc    Disconnect an account
 // @route   DELETE /api/accounts/:id
 // @access  Private (Owner, Admin)
-router.delete('/:id', protect, async (req, res) => {
+router.delete('/:id', protect, resolveHandlerPreview, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -908,7 +908,7 @@ router.delete('/:id', protect, async (req, res) => {
 // @desc    Callback from Facebook OAuth to connect accounts
 // @route   POST /api/accounts/facebook-callback
 // @access  Private (Owner, Admin)
-router.post('/facebook-callback', protect, async (req, res) => {
+router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, res) => {
   const { code, campaignId, reauthorizeAccountId } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
@@ -1213,7 +1213,7 @@ router.post('/facebook-callback', protect, async (req, res) => {
 // @desc    Callback from Instagram OAuth to connect a professional Instagram account directly
 // @route   POST /api/accounts/instagram-callback
 // @access  Private (Owner, Admin)
-router.post('/instagram-callback', protect, async (req, res) => {
+router.post('/instagram-callback', protect, resolveHandlerPreview, async (req, res) => {
   const { code, redirectUri: requestRedirectUri, campaignId, reauthorizeAccountId } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
@@ -1761,7 +1761,7 @@ router.get('/:id/posts/:metaPostId/insights', protect, async (req, res) => {
 });
 
 // @desc    Get all campaigns where this creator's connected accounts match the campaign channels
-router.get('/creator/campaigns', protect, async (req, res) => {
+router.get('/creator/campaigns', protect, resolveHandlerPreview, async (req, res) => {
   try {
     const isConnected = getDBStatus();
     if (!isConnected) {

@@ -7,7 +7,7 @@ import Media from '../models/Media.js';
 import Folder from '../models/Folder.js';
 import SocialAccount from '../models/SocialAccount.js';
 import CampaignChannel from '../models/CampaignChannel.js';
-import { protect, authorize } from '../middleware/auth.js';
+import { protect, authorize, resolveHandlerPreview } from '../middleware/auth.js';
 import {
   addPostToQueue,
   assertPostQueueEditable,
@@ -1362,7 +1362,7 @@ router.post('/carousels', protect, authorize('owner', 'admin', 'editor'), async 
 // @desc    Mark creator access/download on a manual or hybrid post
 // @route   POST /api/scheduler/:id/downloaded
 // @access  Private
-router.post('/:id/downloaded', protect, async (req, res) => {
+router.post('/:id/downloaded', protect, resolveHandlerPreview, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -1427,7 +1427,7 @@ router.post('/:id/downloaded', protect, async (req, res) => {
 // @desc    Return a downloaded manual/hybrid post to share-ready state
 // @route   POST /api/scheduler/:id/not-posted
 // @access  Private
-router.post('/:id/not-posted', protect, async (req, res) => {
+router.post('/:id/not-posted', protect, resolveHandlerPreview, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -1500,7 +1500,7 @@ router.post('/:id/not-posted', protect, async (req, res) => {
 // @desc    Mark a manual/hybrid post as posted by the creator
 // @route   POST /api/scheduler/:id/manual-posted
 // @access  Private
-router.post('/:id/manual-posted', protect, async (req, res) => {
+router.post('/:id/manual-posted', protect, resolveHandlerPreview, async (req, res) => {
   const { id } = req.params;
   const { manualPostUrl = '' } = req.body || {};
 
@@ -1578,7 +1578,7 @@ router.post('/:id/manual-posted', protect, async (req, res) => {
 // @desc    Confirm a manual post and advance without provider verification
 // @route   POST /api/scheduler/:id/manual-posted-override
 // @access  Private
-router.post('/:id/manual-posted-override', protect, async (req, res) => {
+router.post('/:id/manual-posted-override', protect, resolveHandlerPreview, async (req, res) => {
   try {
     if (!getDBStatus()) {
       return res.status(503).json({ message: 'Database disconnected.' });
@@ -1617,7 +1617,7 @@ router.post('/:id/manual-posted-override', protect, async (req, res) => {
 // @desc    Allow one scheduled post to bypass an active six-hour cooldown
 // @route   POST /api/scheduler/:id/cooldown-bypass
 // @access  Private
-router.post('/:id/cooldown-bypass', protect, async (req, res) => {
+router.post('/:id/cooldown-bypass', protect, resolveHandlerPreview, async (req, res) => {
   try {
     if (!getDBStatus()) {
       return res.status(503).json({ message: 'Database disconnected.' });
@@ -1997,7 +1997,7 @@ router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req
 });
 
 // @desc    Get today's live-post tracking for verified creator accounts
-router.get('/creator/today-tracking', protect, async (req, res) => {
+router.get('/creator/today-tracking', protect, resolveHandlerPreview, async (req, res) => {
   try {
     const isConnected = getDBStatus();
     if (!isConnected) {
@@ -2136,7 +2136,7 @@ router.get('/creator/today-tracking', protect, async (req, res) => {
 });
 
 // @desc    Get all scheduled posts assigned to this creator's accounts
-router.get('/creator/posts', protect, async (req, res) => {
+router.get('/creator/posts', protect, resolveHandlerPreview, async (req, res) => {
   try {
     const isConnected = getDBStatus();
     if (!isConnected) {
