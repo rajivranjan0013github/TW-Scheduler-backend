@@ -68,6 +68,10 @@ const ScheduledPostSchema = new mongoose.Schema({
     type: Date,
     default: null,
   },
+  manualConfirmedAt: {
+    type: Date,
+    default: null,
+  },
   manualPostUrl: {
     type: String,
     default: '',

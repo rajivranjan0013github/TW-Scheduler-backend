@@ -127,7 +127,7 @@ const getSchedulerPostListQuery = (campaignId, query = {}) => {
   return filters;
 };
 const populateSchedulerPostList = (query) => query
-  .select('campaignId socialAccountIds campaignChannelIds mediaIds caption scheduledAt scheduleMode status publishSource manualDownloadedAt manualPostedAt manualPostUrl publishError platformSpecifics publishResponseId createdAt updatedAt')
+  .select('campaignId socialAccountIds campaignChannelIds mediaIds caption scheduledAt scheduleMode status publishSource manualDownloadedAt manualPostedAt manualConfirmedAt manualPostUrl publishError platformSpecifics publishResponseId createdAt updatedAt')
   .populate({ path: 'socialAccountIds', select: 'username name platform avatarUrl isConnected tokenStatus' })
   .populate({ path: 'campaignChannelIds', select: 'requestedHandle normalizedHandle displayName platform status socialAccountId assignedHandlerEmail assignedHandlerUserId' })
   .populate({ path: 'mediaIds', select: 'name type url folderId caption' })
@@ -252,12 +252,25 @@ const getPostConnectedAccountIds = (post) => ([
 const markManualPostAsPosted = async (
   post,
   user,
-  { manualPostUrl = '', verificationStatus = 'verified', verificationError = '' } = {}
+  {
+    manualPostUrl = '',
+    postedAt = null,
+    verificationStatus = 'verified',
+    verificationError = '',
+  } = {}
 ) => {
+  const confirmedAt = new Date();
+  const candidatePostedAt = postedAt ? new Date(postedAt) : confirmedAt;
+  const effectivePostedAt = !Number.isNaN(candidatePostedAt.getTime())
+    && candidatePostedAt.getTime() <= confirmedAt.getTime()
+    ? candidatePostedAt
+    : confirmedAt;
+
   await removePostFromQueue(post._id);
   post.status = 'posted_manual';
   post.publishSource = 'creator';
-  post.manualPostedAt = new Date();
+  post.manualPostedAt = effectivePostedAt;
+  post.manualConfirmedAt = confirmedAt;
   post.manualPostUrl = manualPostUrl;
   post.manualAutoCheckError = '';
   post.manualVerificationStatus = verificationStatus;
@@ -266,6 +279,16 @@ const markManualPostAsPosted = async (
   await post.save();
   return post;
 };
+
+const getLatestVerifiedPublishedAt = (matchingPosts = []) => (
+  matchingPosts.reduce((latest, item) => {
+    const publishedAt = item?.publishedAt ? new Date(item.publishedAt) : null;
+    if (!publishedAt || Number.isNaN(publishedAt.getTime()) || publishedAt.getTime() > Date.now()) {
+      return latest;
+    }
+    return !latest || publishedAt > latest ? publishedAt : latest;
+  }, null)
+);
 
 const getManualPostCooldown = async (post) => {
   const accountIds = getUniqueIds(getPostConnectedAccountIds(post));
@@ -496,7 +519,9 @@ export const runCreatorAutoPostedCheck = async ({ limit = 20 } = {}) => {
     }
 
     post.manualAutoCheckError = '';
-    const updatedPost = await markManualPostAsPosted(post, getManualPostActorId(post));
+    const updatedPost = await markManualPostAsPosted(post, getManualPostActorId(post), {
+      postedAt: getLatestVerifiedPublishedAt(verification.matchingPosts),
+    });
     markedPosts.push(updatedPost);
   }
 
@@ -1446,6 +1471,7 @@ router.post('/:id/not-posted', protect, resolveHandlerPreview, async (req, res) 
       }
       post.manualDownloadedAt = null;
       post.manualPostedAt = null;
+      post.manualConfirmedAt = null;
       post.manualPostUrl = '';
       post.manualAutoCheckedAt = null;
       post.manualAutoCheckCount = 0;
@@ -1479,6 +1505,7 @@ router.post('/:id/not-posted', protect, resolveHandlerPreview, async (req, res) 
 
     post.manualDownloadedAt = null;
     post.manualPostedAt = null;
+    post.manualConfirmedAt = null;
     post.manualPostUrl = '';
     post.manualAutoCheckedAt = null;
     post.manualAutoCheckCount = 0;
@@ -1512,6 +1539,7 @@ router.post('/:id/manual-posted', protect, resolveHandlerPreview, async (req, re
       post.status = 'posted_manual';
       post.publishSource = 'creator';
       post.manualPostedAt = new Date();
+      post.manualConfirmedAt = new Date();
       post.manualPostUrl = manualPostUrl;
       post.postedByUserId = req.user._id;
       post.updatedAt = new Date();
@@ -1566,6 +1594,7 @@ router.post('/:id/manual-posted', protect, resolveHandlerPreview, async (req, re
 
     await markManualPostAsPosted(post, req.user, {
       manualPostUrl,
+      postedAt: getLatestVerifiedPublishedAt(verification.matchingPosts),
       verificationStatus: verification.accountsChecked.length > 0 ? 'verified' : 'not_required',
     });
 
@@ -1670,6 +1699,7 @@ router.post('/:id/return-to-auto', protect, authorize('owner', 'admin', 'editor'
       post.status = 'scheduled';
       post.publishSource = null;
       post.manualPostedAt = null;
+      post.manualConfirmedAt = null;
       post.manualPostUrl = '';
       post.postedByUserId = null;
       post.updatedAt = new Date();
@@ -1687,6 +1717,7 @@ router.post('/:id/return-to-auto', protect, authorize('owner', 'admin', 'editor'
     post.status = 'scheduled';
     post.publishSource = null;
     post.manualPostedAt = null;
+    post.manualConfirmedAt = null;
     post.manualPostUrl = '';
     post.postedByUserId = null;
     await post.save();

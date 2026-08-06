@@ -107,6 +107,7 @@ const splitPost = async (post) => {
       publishSource: post.publishSource,
       manualDownloadedAt: post.manualDownloadedAt,
       manualPostedAt: post.manualPostedAt,
+      manualConfirmedAt: post.manualConfirmedAt,
       manualPostUrl: post.manualPostUrl,
       postedByUserId: post.postedByUserId,
       publishError: post.publishError,
