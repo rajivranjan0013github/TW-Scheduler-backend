@@ -168,6 +168,22 @@ const getLast7DayActivity = (now = new Date(), timeZone = DEFAULT_DASHBOARD_TIME
   });
 };
 
+const getLast30DayActivity = (now = new Date(), timeZone = DEFAULT_DASHBOARD_TIMEZONE) => {
+  return Array.from({ length: 30 }, (_, index) => {
+    const date = addDays(startOfDay(now, timeZone), -index);
+    const parts = getZonedParts(date, timeZone);
+    return {
+      dateStr: dateKey(date, timeZone),
+      label: parts.weekday,
+      count: 0,
+      views: 0,
+      likes: 0,
+      comments: 0,
+      posts: [],
+    };
+  });
+};
+
 const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZONE } = {}) => {
   const campaignChannels = await CampaignChannel.find({
     campaignId: campaign._id,
@@ -254,6 +270,7 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
   const todayStart = startOfDay(now, timeZone);
   const yesterdayStart = addDays(todayStart, -1);
   const last7DayActivityTemplate = getLast7DayActivity(now, timeZone);
+  const last30DayActivityTemplate = getLast30DayActivity(now, timeZone);
   const last7DaysStart = addDays(todayStart, -6);
   const last30DaysStart = addDays(todayStart, -29);
   const monthStart = startOfMonth(now, timeZone);
@@ -310,6 +327,10 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
       recentLikeDelta: 0,
       recentCommentDelta: 0,
       last7DaysActivity: last7DayActivityTemplate.map((day) => ({
+        ...day,
+        posts: [],
+      })),
+      last30DaysActivity: last30DayActivityTemplate.map((day) => ({
         ...day,
         posts: [],
       })),
@@ -669,8 +690,27 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
       const activityDay = row.last7DaysActivity.find((day) => day.dateStr === publishedDateStr);
       if (activityDay) {
         activityDay.count += 1;
+        activityDay.views = (activityDay.views || 0) + lifetimeViews;
+        activityDay.likes = (activityDay.likes || 0) + latestLikes;
+        activityDay.comments = (activityDay.comments || 0) + latestComments;
         activityDay.posts.push({
           publishedAt: post.publishedAt,
+          views: lifetimeViews,
+          likes: latestLikes,
+          comments: latestComments,
+        });
+      }
+      const activity30Day = row.last30DaysActivity.find((day) => day.dateStr === publishedDateStr);
+      if (activity30Day) {
+        activity30Day.count += 1;
+        activity30Day.views = (activity30Day.views || 0) + lifetimeViews;
+        activity30Day.likes = (activity30Day.likes || 0) + latestLikes;
+        activity30Day.comments = (activity30Day.comments || 0) + latestComments;
+        activity30Day.posts.push({
+          publishedAt: post.publishedAt,
+          views: lifetimeViews,
+          likes: latestLikes,
+          comments: latestComments,
         });
       }
     }
