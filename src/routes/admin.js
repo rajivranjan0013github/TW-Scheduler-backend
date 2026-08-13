@@ -11,6 +11,8 @@ import Insight from '../models/Insight.js';
 import PostInsight from '../models/PostInsight.js';
 import Campaign from '../models/Campaign.js';
 import CampaignChannel from '../models/CampaignChannel.js';
+import MetricSyncStatus from '../models/MetricSyncStatus.js';
+import PostMetricSnapshot from '../models/PostMetricSnapshot.js';
 import { resolveCampaignPublishingChannels, syncCampaignChannelList } from '../utils/campaignChannels.js';
 import { deleteFile } from '../services/r2Service.js';
 
@@ -166,26 +168,37 @@ const getLast7DayActivity = (now = new Date(), timeZone = DEFAULT_DASHBOARD_TIME
   });
 };
 
-const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZONE } = {}) => {
-  const channels = campaign.channels || [];
-  const lookups = channels.map((ch) => ({
-    platform: ch.platform,
-    handle: ch.handle?.replace(/^@/, '').toLowerCase(),
-  }));
+const getLast30DayActivity = (now = new Date(), timeZone = DEFAULT_DASHBOARD_TIMEZONE) => {
+  return Array.from({ length: 30 }, (_, index) => {
+    const date = addDays(startOfDay(now, timeZone), -index);
+    const parts = getZonedParts(date, timeZone);
+    return {
+      dateStr: dateKey(date, timeZone),
+      label: parts.weekday,
+      count: 0,
+      views: 0,
+      likes: 0,
+      comments: 0,
+      posts: [],
+    };
+  });
+};
 
-  const orConditions = lookups.map(({ platform, handle }) => ({
-    platform,
-    $or: [
-      { username: { $regex: new RegExp(`^${handle}$`, 'i') } },
-      { name: { $regex: new RegExp(`^${handle}$`, 'i') } },
-    ],
-  }));
+const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZONE } = {}) => {
+  const campaignChannels = await CampaignChannel.find({
+    campaignId: campaign._id,
+  })
+    .select('_id socialAccountId platform normalizedHandle requestedHandle displayName')
+    .lean();
+  const linkedAccountIds = campaignChannels
+    .map((channel) => channel.socialAccountId)
+    .filter(Boolean);
 
   const accountQuery = {
     $or: [
       { campaignId: campaign._id },
       { _id: { $in: campaign.accountIds || [] } },
-      ...(orConditions.length > 0 ? orConditions : []),
+      { _id: { $in: linkedAccountIds } },
     ]
   };
 
@@ -243,6 +256,11 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
       thisMonthLikes: 0,
       thisMonthComments: 0,
       upcomingPosts: 0,
+      lastSyncedAt: null,
+      syncIssues: 0,
+      recentViewDelta: 0,
+      recentLikeDelta: 0,
+      recentCommentDelta: 0,
       last30DaysPostedViews: [],
       accountRows: [],
     };
@@ -252,6 +270,7 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
   const todayStart = startOfDay(now, timeZone);
   const yesterdayStart = addDays(todayStart, -1);
   const last7DayActivityTemplate = getLast7DayActivity(now, timeZone);
+  const last30DayActivityTemplate = getLast30DayActivity(now, timeZone);
   const last7DaysStart = addDays(todayStart, -6);
   const last30DaysStart = addDays(todayStart, -29);
   const monthStart = startOfMonth(now, timeZone);
@@ -268,7 +287,7 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
   );
 
   const posts = await PublishedPost.find({ accountId: { $in: accountIds } })
-    .select('_id accountId publishedAt latestViews latestLikes latestComments')
+    .select('_id accountId campaignId metaPostId platform publishedAt latestViews latestLikes latestComments lastSyncedAt viewsSource facebookVideoId')
     .lean();
 
   const accountRowsMap = new Map(accountDetails.map((account) => [
@@ -301,12 +320,62 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
       thisMonthLikes: 0,
       thisMonthComments: 0,
       upcomingPosts: 0,
+      lastSyncedAt: null,
+      syncStatus: 'pending',
+      syncError: '',
+      recentViewDelta: 0,
+      recentLikeDelta: 0,
+      recentCommentDelta: 0,
       last7DaysActivity: last7DayActivityTemplate.map((day) => ({
+        ...day,
+        posts: [],
+      })),
+      last30DaysActivity: last30DayActivityTemplate.map((day) => ({
         ...day,
         posts: [],
       })),
     },
   ]));
+  const metricSyncStatuses = await MetricSyncStatus.find({ accountId: { $in: accountIds } })
+    .sort({ lastAttemptAt: -1 })
+    .lean();
+  metricSyncStatuses.forEach((status) => {
+    const row = accountRowsMap.get(toKey(status.accountId));
+    if (!row || row.syncStatus !== 'pending') return;
+    if (['failed', 'rate_limited'].includes(status.status)) {
+      row.syncStatus = 'failed';
+      row.syncError = status.lastError || '';
+    } else if (status.status === 'partial') {
+      row.syncStatus = 'partial';
+      row.syncError = status.lastError || '';
+    } else if (['queued', 'running'].includes(status.status)) {
+      row.syncStatus = 'running';
+    } else if (status.status === 'success') {
+      row.syncStatus = 'success';
+    }
+  });
+  const syncIssues = Array.from(accountRowsMap.values()).filter((row) => row.syncStatus === 'failed').length;
+  const recentMetricRows = await PostMetricSnapshot.aggregate([
+    { $match: { accountId: { $in: accountIds }, capturedAt: { $gte: new Date(now.getTime() - 2 * 60 * 60 * 1000) } } },
+    { $group: {
+      _id: '$accountId',
+      recentViewDelta: { $sum: '$viewDelta' },
+      recentLikeDelta: { $sum: '$likeDelta' },
+      recentCommentDelta: { $sum: '$commentDelta' },
+    } },
+  ]);
+  recentMetricRows.forEach((item) => {
+    const row = accountRowsMap.get(toKey(item._id));
+    if (!row) return;
+    row.recentViewDelta = Number(item.recentViewDelta || 0);
+    row.recentLikeDelta = Number(item.recentLikeDelta || 0);
+    row.recentCommentDelta = Number(item.recentCommentDelta || 0);
+  });
+  const recentDeltas = recentMetricRows.reduce((totals, item) => ({
+    recentViewDelta: totals.recentViewDelta + Number(item.recentViewDelta || 0),
+    recentLikeDelta: totals.recentLikeDelta + Number(item.recentLikeDelta || 0),
+    recentCommentDelta: totals.recentCommentDelta + Number(item.recentCommentDelta || 0),
+  }), { recentViewDelta: 0, recentLikeDelta: 0, recentCommentDelta: 0 });
   const accountHandleMap = new Map();
   accountDetails.forEach((account) => {
     const handles = [account.username, account.name]
@@ -359,16 +428,9 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
     status: { $in: DASHBOARD_UPCOMING_STATUSES },
   };
 
-  const [upcomingPostsList, campaignChannels] = await Promise.all([
-    ScheduledPost.find(upcomingQuery)
-      .select('_id socialAccountIds campaignChannelIds')
-      .lean(),
-    CampaignChannel.find({
-      campaignId: campaign._id,
-    })
-      .select('_id socialAccountId platform normalizedHandle requestedHandle displayName')
-      .lean(),
-  ]);
+  const upcomingPostsList = await ScheduledPost.find(upcomingQuery)
+    .select('_id socialAccountIds campaignChannelIds')
+    .lean();
 
   const accountIdSet = new Set(accountIds.map(toKey));
   const channelAccountMap = new Map(
@@ -449,6 +511,9 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
       thisMonthLikes: 0,
       thisMonthComments: 0,
       upcomingPosts,
+      lastSyncedAt: null,
+      syncIssues,
+      ...recentDeltas,
       last30DaysPostedViews: Array.from(last30DaysPostedViewsMap.values()),
       accountRows: Array.from(accountRowsMap.values()),
     };
@@ -546,6 +611,7 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
     const lifetimeViews = Number(post.latestViews || 0);
     const latestLikes = Number(post.latestLikes || 0);
     const latestComments = Number(post.latestComments || 0);
+    const postLastSyncedAt = post.lastSyncedAt ? new Date(post.lastSyncedAt) : null;
     const publishedDateStr = post.publishedAt ? dateKey(post.publishedAt, timeZone) : '';
     const todayPosts = isPublishedSince(post, todayStart) ? 1 : 0;
     const yesterdayPosts = isPublishedBetween(post, yesterdayStart, todayStart) ? 1 : 0;
@@ -584,6 +650,9 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
     metrics.last7DaysComments += last7DaysComments;
     metrics.thisMonthLikes += thisMonthLikes;
     metrics.thisMonthComments += thisMonthComments;
+    if (postLastSyncedAt && (!metrics.lastSyncedAt || postLastSyncedAt > metrics.lastSyncedAt)) {
+      metrics.lastSyncedAt = postLastSyncedAt;
+    }
 
     if (last30DaysPublished) {
       const chartDay = last30DaysPostedViewsMap.get(publishedDateStr);
@@ -614,12 +683,34 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
       row.last7DaysComments += last7DaysComments;
       row.thisMonthLikes += thisMonthLikes;
       row.thisMonthComments += thisMonthComments;
+      if (postLastSyncedAt && (!row.lastSyncedAt || postLastSyncedAt > row.lastSyncedAt)) {
+        row.lastSyncedAt = postLastSyncedAt;
+      }
 
       const activityDay = row.last7DaysActivity.find((day) => day.dateStr === publishedDateStr);
       if (activityDay) {
         activityDay.count += 1;
+        activityDay.views = (activityDay.views || 0) + lifetimeViews;
+        activityDay.likes = (activityDay.likes || 0) + latestLikes;
+        activityDay.comments = (activityDay.comments || 0) + latestComments;
         activityDay.posts.push({
           publishedAt: post.publishedAt,
+          views: lifetimeViews,
+          likes: latestLikes,
+          comments: latestComments,
+        });
+      }
+      const activity30Day = row.last30DaysActivity.find((day) => day.dateStr === publishedDateStr);
+      if (activity30Day) {
+        activity30Day.count += 1;
+        activity30Day.views = (activity30Day.views || 0) + lifetimeViews;
+        activity30Day.likes = (activity30Day.likes || 0) + latestLikes;
+        activity30Day.comments = (activity30Day.comments || 0) + latestComments;
+        activity30Day.posts.push({
+          publishedAt: post.publishedAt,
+          views: lifetimeViews,
+          likes: latestLikes,
+          comments: latestComments,
         });
       }
     }
@@ -653,6 +744,9 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
     thisMonthLikes: 0,
     thisMonthComments: 0,
     upcomingPosts,
+    lastSyncedAt: null,
+    syncIssues,
+    ...recentDeltas,
   });
 
   return {

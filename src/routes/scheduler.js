@@ -7,8 +7,13 @@ import Media from '../models/Media.js';
 import Folder from '../models/Folder.js';
 import SocialAccount from '../models/SocialAccount.js';
 import CampaignChannel from '../models/CampaignChannel.js';
-import { protect, authorize } from '../middleware/auth.js';
-import { addPostToQueue, removePostFromQueue } from '../queues/publisherQueue.js';
+import { protect, authorize, resolveHandlerPreview } from '../middleware/auth.js';
+import {
+  addPostToQueue,
+  assertPostQueueEditable,
+  removePostFromQueue,
+  syncPostInQueue,
+} from '../queues/publisherQueue.js';
 import { fetchFacebookPosts, fetchInstagramPosts } from '../queues/feedSyncWorker.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
 import { fetchYoutubeVideos } from '../services/youtubeService.js';
@@ -39,6 +44,7 @@ const requireCampaignId = (req, res) => {
 const idsToStrings = (items = []) => items.map((item) => String(item?._id || item));
 const validScheduleModes = new Set(['auto', 'manual', 'hybrid']);
 const terminalManualStatuses = new Set(['posted_manual', 'published', 'published_auto', 'cancelled']);
+const cancellablePostStatuses = new Set(['scheduled', 'manual_ready', 'downloaded', 'paused', 'posted_manual']);
 const dashboardUpcomingStatuses = ['scheduled', 'publishing'];
 const MANUAL_POST_FEED_SYNC_MAX_PAGES = 1;
 const MANUAL_POST_FEED_SYNC_LIMIT = 10;
@@ -78,27 +84,50 @@ const splitQueryList = (value) => String(value || '')
 
 const getSchedulerPostListQuery = (campaignId, query = {}) => {
   const accountIds = splitQueryList(query.accountIds);
+  const campaignChannelIds = splitQueryList(query.campaignChannelIds);
   const statuses = splitQueryList(query.statuses);
+  const scheduleRange = getScheduleRangeQuery(query);
   const filters = {
     campaignId,
-    ...getScheduleRangeQuery(query),
+    ...(query.includeManualPostedRange === 'true' ? {} : scheduleRange),
   };
+
+  if (query.includeManualPostedRange === 'true' && scheduleRange.scheduledAt) {
+    filters.$and = [{
+      $or: [
+        { scheduledAt: scheduleRange.scheduledAt },
+        { status: 'posted_manual', manualPostedAt: scheduleRange.scheduledAt },
+      ],
+    }];
+  }
+
+  if (query.includePastPaused === 'true' && filters.scheduledAt) {
+    const scheduledAt = filters.scheduledAt;
+    delete filters.scheduledAt;
+    filters.$and = [
+      ...(filters.$and || []),
+      { $or: [{ status: 'paused' }, { scheduledAt }] },
+    ];
+  }
 
   if (statuses.length > 0) {
     filters.status = { $in: statuses };
   }
 
-  if (accountIds.length > 0) {
-    filters.$or = [
-      { socialAccountIds: { $in: accountIds } },
-      { campaignChannelIds: { $in: accountIds } },
-    ];
+  if (accountIds.length > 0 || campaignChannelIds.length > 0) {
+    filters.$or = [];
+    if (accountIds.length > 0) {
+      filters.$or.push({ socialAccountIds: { $in: accountIds } });
+    }
+    if (campaignChannelIds.length > 0) {
+      filters.$or.push({ campaignChannelIds: { $in: campaignChannelIds } });
+    }
   }
 
   return filters;
 };
 const populateSchedulerPostList = (query) => query
-  .select('campaignId socialAccountIds campaignChannelIds mediaIds caption scheduledAt scheduleMode status publishSource manualDownloadedAt manualPostedAt manualPostUrl publishError platformSpecifics publishResponseId createdAt updatedAt')
+  .select('campaignId socialAccountIds campaignChannelIds mediaIds caption scheduledAt scheduleMode status publishSource manualDownloadedAt manualPostedAt manualConfirmedAt manualPostUrl publishError platformSpecifics publishResponseId createdAt updatedAt')
   .populate({ path: 'socialAccountIds', select: 'username name platform avatarUrl isConnected tokenStatus' })
   .populate({ path: 'campaignChannelIds', select: 'requestedHandle normalizedHandle displayName platform status socialAccountId assignedHandlerEmail assignedHandlerUserId' })
   .populate({ path: 'mediaIds', select: 'name type url folderId caption' })
@@ -118,8 +147,62 @@ const getUniqueIds = (items = []) => (
 );
 
 const activeQueueStatuses = ['scheduled', 'manual_ready', 'downloaded', 'publishing', 'paused'];
+const editableQueueStatuses = new Set(['scheduled', 'manual_ready', 'downloaded', 'paused']);
+const allowedQueuePatchKeys = new Set(['scheduledAt', 'caption', 'status']);
 const MANUAL_POST_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 let creatorAutoCheckIntervalId = null;
+
+const createHttpError = (statusCode, message) => {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+};
+
+const normalizeQueuePatch = (post, patch) => {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+    throw createHttpError(400, 'Each queue update must include a patch object.');
+  }
+
+  const unknownKeys = Object.keys(patch).filter((key) => !allowedQueuePatchKeys.has(key));
+  if (unknownKeys.length > 0) {
+    throw createHttpError(400, `Unsupported queue update field: ${unknownKeys[0]}.`);
+  }
+
+  const normalized = {};
+  if (Object.prototype.hasOwnProperty.call(patch, 'scheduledAt')) {
+    const scheduledAt = new Date(patch.scheduledAt);
+    if (patch.scheduledAt === null || patch.scheduledAt === '' || Number.isNaN(scheduledAt.getTime())) {
+      throw createHttpError(400, 'Choose a valid scheduled date and time.');
+    }
+    normalized.scheduledAt = scheduledAt;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(patch, 'caption')) {
+    if (typeof patch.caption !== 'string') {
+      throw createHttpError(400, 'Caption must be text.');
+    }
+    normalized.caption = patch.caption;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(patch, 'status')) {
+    if (!editableQueueStatuses.has(patch.status)) {
+      throw createHttpError(400, 'This queue status cannot be set from Edit Queue.');
+    }
+    const mode = post.scheduleMode || 'auto';
+    if (patch.status === 'scheduled' && mode === 'manual') {
+      throw createHttpError(400, 'A manual post must be resumed as ready for manual posting.');
+    }
+    if (patch.status === 'manual_ready' && mode !== 'manual') {
+      throw createHttpError(400, 'Only a manual post can be resumed as ready for manual posting.');
+    }
+    normalized.status = patch.status;
+  }
+
+  if (Object.keys(normalized).length === 0) {
+    throw createHttpError(400, 'No queue changes were provided.');
+  }
+  return normalized;
+};
 
 const getDateBoundary = (value, fallback) => {
   const date = value ? new Date(value) : fallback;
@@ -166,17 +249,46 @@ const getPostConnectedAccountIds = (post) => ([
     .filter(Boolean)),
 ]);
 
-const markManualPostAsPosted = async (post, user, { manualPostUrl = '' } = {}) => {
+const markManualPostAsPosted = async (
+  post,
+  user,
+  {
+    manualPostUrl = '',
+    postedAt = null,
+    verificationStatus = 'verified',
+    verificationError = '',
+  } = {}
+) => {
+  const confirmedAt = new Date();
+  const candidatePostedAt = postedAt ? new Date(postedAt) : confirmedAt;
+  const effectivePostedAt = !Number.isNaN(candidatePostedAt.getTime())
+    && candidatePostedAt.getTime() <= confirmedAt.getTime()
+    ? candidatePostedAt
+    : confirmedAt;
+
   await removePostFromQueue(post._id);
   post.status = 'posted_manual';
   post.publishSource = 'creator';
-  post.manualPostedAt = new Date();
+  post.manualPostedAt = effectivePostedAt;
+  post.manualConfirmedAt = confirmedAt;
   post.manualPostUrl = manualPostUrl;
   post.manualAutoCheckError = '';
+  post.manualVerificationStatus = verificationStatus;
+  post.manualVerificationError = verificationError;
   post.postedByUserId = user?._id || user || post.userId;
   await post.save();
   return post;
 };
+
+const getLatestVerifiedPublishedAt = (matchingPosts = []) => (
+  matchingPosts.reduce((latest, item) => {
+    const publishedAt = item?.publishedAt ? new Date(item.publishedAt) : null;
+    if (!publishedAt || Number.isNaN(publishedAt.getTime()) || publishedAt.getTime() > Date.now()) {
+      return latest;
+    }
+    return !latest || publishedAt > latest ? publishedAt : latest;
+  }, null)
+);
 
 const getManualPostCooldown = async (post) => {
   const accountIds = getUniqueIds(getPostConnectedAccountIds(post));
@@ -407,7 +519,9 @@ export const runCreatorAutoPostedCheck = async ({ limit = 20 } = {}) => {
     }
 
     post.manualAutoCheckError = '';
-    const updatedPost = await markManualPostAsPosted(post, getManualPostActorId(post));
+    const updatedPost = await markManualPostAsPosted(post, getManualPostActorId(post), {
+      postedAt: getLatestVerifiedPublishedAt(verification.matchingPosts),
+    });
     markedPosts.push(updatedPost);
   }
 
@@ -673,8 +787,35 @@ router.get('/', protect, async (req, res) => {
 
     const campaignId = requireCampaignId(req, res);
     if (!campaignId) return;
+    const requestedAccountIds = splitQueryList(req.query.accountIds);
+    let matchingCampaignChannelIds = [];
+
+    if (requestedAccountIds.length > 0) {
+      const requestedAccounts = await SocialAccount.find({ _id: { $in: requestedAccountIds } })
+        .select('platform username name accountId')
+        .lean();
+      const handleClauses = requestedAccounts.flatMap((account) => (
+        [account.username, account.name, account.accountId]
+          .map(normalizeChannelHandle)
+          .filter(Boolean)
+          .map((normalizedHandle) => ({ platform: account.platform, normalizedHandle }))
+      ));
+      const channelMatch = {
+        campaignId,
+        $or: [
+          { _id: { $in: requestedAccountIds } },
+          { socialAccountId: { $in: requestedAccountIds } },
+          ...handleClauses,
+        ],
+      };
+      matchingCampaignChannelIds = await CampaignChannel.find(channelMatch).distinct('_id');
+    }
+
     const posts = await populateSchedulerPostList(
-      ScheduledPost.find(getSchedulerPostListQuery(campaignId, req.query))
+      ScheduledPost.find(getSchedulerPostListQuery(campaignId, {
+        ...req.query,
+        campaignChannelIds: matchingCampaignChannelIds.join(','),
+      }))
     );
     
     // Enrich with PublishedPost metrics
@@ -1246,7 +1387,7 @@ router.post('/carousels', protect, authorize('owner', 'admin', 'editor'), async 
 // @desc    Mark creator access/download on a manual or hybrid post
 // @route   POST /api/scheduler/:id/downloaded
 // @access  Private
-router.post('/:id/downloaded', protect, async (req, res) => {
+router.post('/:id/downloaded', protect, resolveHandlerPreview, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -1258,6 +1399,8 @@ router.post('/:id/downloaded', protect, async (req, res) => {
       post.manualAutoCheckedAt = null;
       post.manualAutoCheckCount = 0;
       post.manualAutoCheckError = '';
+      post.manualVerificationStatus = 'pending';
+      post.manualVerificationError = '';
       if (post.status === 'manual_ready') post.status = 'downloaded';
       post.updatedAt = new Date();
       return res.status(200).json(post);
@@ -1278,7 +1421,10 @@ router.post('/:id/downloaded', protect, async (req, res) => {
       return res.status(400).json({ message: 'This post is already complete or cancelled.' });
     }
     const cooldown = await getManualPostCooldown(post);
-    if (cooldown) {
+    const hasCooldownBypass = Boolean(
+      post.cooldownBypassGrantedAt && !post.cooldownBypassUsedAt
+    );
+    if (cooldown && !hasCooldownBypass) {
       return res.status(429).json({
         message: 'Please wait 6 hours between posts on this account.',
         cooldown,
@@ -1289,6 +1435,11 @@ router.post('/:id/downloaded', protect, async (req, res) => {
     post.manualAutoCheckedAt = null;
     post.manualAutoCheckCount = 0;
     post.manualAutoCheckError = '';
+    post.manualVerificationStatus = 'pending';
+    post.manualVerificationError = '';
+    if (cooldown && hasCooldownBypass) {
+      post.cooldownBypassUsedAt = new Date();
+    }
     if (post.status === 'manual_ready') post.status = 'downloaded';
     await post.save();
 
@@ -1301,7 +1452,7 @@ router.post('/:id/downloaded', protect, async (req, res) => {
 // @desc    Return a downloaded manual/hybrid post to share-ready state
 // @route   POST /api/scheduler/:id/not-posted
 // @access  Private
-router.post('/:id/not-posted', protect, async (req, res) => {
+router.post('/:id/not-posted', protect, resolveHandlerPreview, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -1312,12 +1463,21 @@ router.post('/:id/not-posted', protect, async (req, res) => {
       if (!['manual', 'hybrid'].includes(post.scheduleMode || 'auto')) {
         return res.status(400).json({ message: 'Only manual or hybrid posts can be marked as not posted.' });
       }
+      if (post.status === 'posted_manual' && post.scheduleMode !== 'manual') {
+        return res.status(400).json({ message: 'Only posts using manual scheduling can be returned from Posted Manually.' });
+      }
+      if (['published', 'published_auto', 'cancelled'].includes(post.status)) {
+        return res.status(400).json({ message: 'This post is already complete or cancelled.' });
+      }
       post.manualDownloadedAt = null;
       post.manualPostedAt = null;
+      post.manualConfirmedAt = null;
       post.manualPostUrl = '';
       post.manualAutoCheckedAt = null;
       post.manualAutoCheckCount = 0;
       post.manualAutoCheckError = '';
+      post.manualVerificationStatus = null;
+      post.manualVerificationError = '';
       post.postedByUserId = null;
       post.publishSource = null;
       post.status = getInitialStatusForMode(post.scheduleMode || 'auto');
@@ -1333,23 +1493,30 @@ router.post('/:id/not-posted', protect, async (req, res) => {
     if (!['manual', 'hybrid'].includes(post.scheduleMode || 'auto')) {
       return res.status(400).json({ message: 'Only manual or hybrid posts can be marked as not posted.' });
     }
+    if (post.status === 'posted_manual' && post.scheduleMode !== 'manual') {
+      return res.status(400).json({ message: 'Only posts using manual scheduling can be returned from Posted Manually.' });
+    }
     if (!(await canAccessManualPost(post, req.user))) {
       return res.status(403).json({ message: 'Access denied for this scheduled post.' });
     }
-    if (terminalManualStatuses.has(post.status)) {
+    if (['published', 'published_auto', 'cancelled'].includes(post.status)) {
       return res.status(400).json({ message: 'This post is already complete or cancelled.' });
     }
 
     post.manualDownloadedAt = null;
     post.manualPostedAt = null;
+    post.manualConfirmedAt = null;
     post.manualPostUrl = '';
     post.manualAutoCheckedAt = null;
     post.manualAutoCheckCount = 0;
     post.manualAutoCheckError = '';
+    post.manualVerificationStatus = null;
+    post.manualVerificationError = '';
     post.postedByUserId = null;
     post.publishSource = null;
     post.status = getInitialStatusForMode(post.scheduleMode || 'auto');
     await post.save();
+    await syncPostInQueue(post);
 
     res.status(200).json(post);
   } catch (error) {
@@ -1360,7 +1527,7 @@ router.post('/:id/not-posted', protect, async (req, res) => {
 // @desc    Mark a manual/hybrid post as posted by the creator
 // @route   POST /api/scheduler/:id/manual-posted
 // @access  Private
-router.post('/:id/manual-posted', protect, async (req, res) => {
+router.post('/:id/manual-posted', protect, resolveHandlerPreview, async (req, res) => {
   const { id } = req.params;
   const { manualPostUrl = '' } = req.body || {};
 
@@ -1372,6 +1539,7 @@ router.post('/:id/manual-posted', protect, async (req, res) => {
       post.status = 'posted_manual';
       post.publishSource = 'creator';
       post.manualPostedAt = new Date();
+      post.manualConfirmedAt = new Date();
       post.manualPostUrl = manualPostUrl;
       post.postedByUserId = req.user._id;
       post.updatedAt = new Date();
@@ -1398,6 +1566,8 @@ router.post('/:id/manual-posted', protect, async (req, res) => {
       post.manualAutoCheckedAt = null;
       post.manualAutoCheckCount = 0;
       post.manualAutoCheckError = '';
+      post.manualVerificationStatus = 'pending';
+      post.manualVerificationError = '';
       if (post.status === 'manual_ready') post.status = 'downloaded';
       await post.save();
     }
@@ -1407,6 +1577,9 @@ router.post('/:id/manual-posted', protect, async (req, res) => {
   
 
     if (verification.accountsChecked.length > 0 && verification.matchingPosts.length === 0) {
+      post.manualVerificationStatus = 'pending';
+      post.manualVerificationError = 'No live post was detected after this video was downloaded.';
+      await post.save();
       return res.status(409).json({
         message: 'No live post was detected after this video was downloaded. Post it first, then tap Mark Posted again.',
         verification: {
@@ -1419,8 +1592,92 @@ router.post('/:id/manual-posted', protect, async (req, res) => {
       });
     }
 
-    await markManualPostAsPosted(post, req.user, { manualPostUrl });
+    await markManualPostAsPosted(post, req.user, {
+      manualPostUrl,
+      postedAt: getLatestVerifiedPublishedAt(verification.matchingPosts),
+      verificationStatus: verification.accountsChecked.length > 0 ? 'verified' : 'not_required',
+    });
 
+    res.status(200).json(post);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Confirm a manual post and advance without provider verification
+// @route   POST /api/scheduler/:id/manual-posted-override
+// @access  Private
+router.post('/:id/manual-posted-override', protect, resolveHandlerPreview, async (req, res) => {
+  try {
+    if (!getDBStatus()) {
+      return res.status(503).json({ message: 'Database disconnected.' });
+    }
+
+    const post = await ScheduledPost.findById(req.params.id)
+      .populate('socialAccountIds')
+      .populate('campaignChannelIds')
+      .populate('mediaIds');
+    if (!post) return res.status(404).json({ message: 'Post not found' });
+    if (!['manual', 'hybrid'].includes(post.scheduleMode || 'auto')) {
+      return res.status(400).json({ message: 'Only manual or hybrid posts can use manual confirmation.' });
+    }
+    if (!(await canAccessManualPost(post, req.user))) {
+      return res.status(403).json({ message: 'Access denied for this scheduled post.' });
+    }
+    if (['posted_manual', 'published', 'published_auto'].includes(post.status)) {
+      return res.status(200).json(post);
+    }
+    const canConfirmFromQueue = req.body?.queueManagementOverride === true
+      && ['owner', 'admin', 'editor'].includes(req.user?.role);
+    if (!post.manualDownloadedAt && !canConfirmFromQueue) {
+      return res.status(400).json({ message: 'Share or download this post before confirming it manually.' });
+    }
+
+    await markManualPostAsPosted(post, req.user, {
+      verificationStatus: 'manual_override',
+      verificationError: post.manualVerificationError || 'Provider verification was bypassed by the handler.',
+    });
+    res.status(200).json(post);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Allow one scheduled post to bypass an active six-hour cooldown
+// @route   POST /api/scheduler/:id/cooldown-bypass
+// @access  Private
+router.post('/:id/cooldown-bypass', protect, resolveHandlerPreview, async (req, res) => {
+  try {
+    if (!getDBStatus()) {
+      return res.status(503).json({ message: 'Database disconnected.' });
+    }
+
+    const post = await ScheduledPost.findById(req.params.id)
+      .populate('socialAccountIds')
+      .populate('campaignChannelIds')
+      .populate('mediaIds');
+    if (!post) return res.status(404).json({ message: 'Post not found' });
+    if (!['manual', 'hybrid'].includes(post.scheduleMode || 'auto')) {
+      return res.status(400).json({ message: 'Only manual or hybrid posts can bypass the cooldown.' });
+    }
+    if (!(await canAccessManualPost(post, req.user))) {
+      return res.status(403).json({ message: 'Access denied for this scheduled post.' });
+    }
+    if (terminalManualStatuses.has(post.status)) {
+      return res.status(400).json({ message: 'This post is already complete or cancelled.' });
+    }
+    if (post.cooldownBypassUsedAt) {
+      return res.status(409).json({ message: 'The one-time cooldown bypass for this post was already used.' });
+    }
+
+    const cooldown = await getManualPostCooldown(post);
+    if (!cooldown) {
+      return res.status(409).json({ message: 'This post does not currently have an active cooldown.' });
+    }
+
+    post.cooldownBypassGrantedAt = new Date();
+    post.cooldownBypassGrantedByUserId = req.user._id;
+    await post.save();
     res.status(200).json(post);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -1442,6 +1699,7 @@ router.post('/:id/return-to-auto', protect, authorize('owner', 'admin', 'editor'
       post.status = 'scheduled';
       post.publishSource = null;
       post.manualPostedAt = null;
+      post.manualConfirmedAt = null;
       post.manualPostUrl = '';
       post.postedByUserId = null;
       post.updatedAt = new Date();
@@ -1459,6 +1717,7 @@ router.post('/:id/return-to-auto', protect, authorize('owner', 'admin', 'editor'
     post.status = 'scheduled';
     post.publishSource = null;
     post.manualPostedAt = null;
+    post.manualConfirmedAt = null;
     post.manualPostUrl = '';
     post.postedByUserId = null;
     await post.save();
@@ -1475,6 +1734,101 @@ router.post('/:id/return-to-auto', protect, authorize('owner', 'admin', 'editor'
   }
 });
 
+// @desc    Atomically update multiple editable queue posts
+// @route   POST /api/scheduler/queue/bulk-update
+// @access  Private (Owner, Admin, Editor)
+router.post('/queue/bulk-update', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
+  try {
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+
+    const updates = Array.isArray(req.body?.updates) ? req.body.updates : [];
+    if (updates.length === 0 || updates.length > 100) {
+      return res.status(400).json({ message: 'Provide between 1 and 100 queue updates.' });
+    }
+
+    const postIds = updates.map((update) => String(update?.id || '')).filter(Boolean);
+    if (postIds.length !== updates.length || new Set(postIds).size !== postIds.length) {
+      return res.status(400).json({ message: 'Each queue update must have a unique post ID.' });
+    }
+
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      const postsById = new Map(mockStore.scheduledPosts.map((post) => [String(post._id), post]));
+      const prepared = updates.map((update) => {
+        const post = postsById.get(String(update.id));
+        if (!post) throw createHttpError(404, 'One or more queue posts were not found.');
+        if (!editableQueueStatuses.has(post.status)) {
+          throw createHttpError(409, 'A selected post is already publishing or is no longer editable.');
+        }
+        return { post, patch: normalizeQueuePatch(post, update.patch) };
+      });
+      prepared.forEach(({ post, patch }) => {
+        Object.assign(post, patch, { updatedAt: new Date() });
+      });
+      return res.status(200).json({ posts: prepared.map(({ post }) => post), queueSyncPending: false });
+    }
+
+    const posts = await ScheduledPost.find({ _id: { $in: postIds }, campaignId });
+    if (posts.length !== postIds.length) {
+      return res.status(404).json({ message: 'One or more queue posts were not found in this campaign.' });
+    }
+
+    const postsById = new Map(posts.map((post) => [String(post._id), post]));
+    const prepared = updates.map((update) => {
+      const post = postsById.get(String(update.id));
+      if (!editableQueueStatuses.has(post.status)) {
+        throw createHttpError(409, 'A selected post is already publishing or is no longer editable.');
+      }
+      return { post, patch: normalizeQueuePatch(post, update.patch) };
+    });
+
+    await Promise.all(prepared.map(({ post }) => assertPostQueueEditable(post)));
+
+    const session = await ScheduledPost.db.startSession();
+    try {
+      await session.withTransaction(async () => {
+        const transactionalPosts = await ScheduledPost.find({
+          _id: { $in: postIds },
+          campaignId,
+        }).session(session);
+        if (transactionalPosts.length !== postIds.length) {
+          throw createHttpError(409, 'The queue changed while it was being edited. Refresh and try again.');
+        }
+
+        const transactionalById = new Map(
+          transactionalPosts.map((post) => [String(post._id), post])
+        );
+        for (const update of updates) {
+          const post = transactionalById.get(String(update.id));
+          if (!editableQueueStatuses.has(post.status)) {
+            throw createHttpError(409, 'A selected post started publishing while the queue was being edited.');
+          }
+          Object.assign(post, normalizeQueuePatch(post, update.patch));
+          await post.save({ session });
+        }
+      });
+    } finally {
+      await session.endSession();
+    }
+
+    const savedPosts = await ScheduledPost.find({ _id: { $in: postIds }, campaignId });
+    const queueResults = await Promise.allSettled(savedPosts.map((post) => syncPostInQueue(post)));
+    const queueSyncPending = queueResults.some((result) => result.status === 'rejected');
+    if (queueSyncPending) {
+      console.error('One or more bulk queue updates are waiting for queue reconciliation.');
+    }
+
+    const populatedPosts = await populateSchedulerPostList(
+      ScheduledPost.find({ _id: { $in: postIds }, campaignId })
+    );
+    res.status(200).json({ posts: populatedPosts, queueSyncPending });
+  } catch (error) {
+    const statusCode = error.code === 'PUBLISH_JOB_ACTIVE' ? 409 : (error.statusCode || 500);
+    res.status(statusCode).json({ message: error.message });
+  }
+});
+
 // @desc    Update/Reschedule a post (supports Drag & Drop)
 // @route   PUT /api/scheduler/:id
 // @access  Private (Owner, Admin, Editor)
@@ -1482,6 +1836,14 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
   const { id } = req.params;
   const { scheduledAt, caption, mediaIds, socialAccountIds, platformSpecifics, status } = req.body;
   const nextScheduleMode = req.body.scheduleMode === undefined ? null : normalizeScheduleMode(req.body.scheduleMode);
+  const parsedScheduledAt = scheduledAt === undefined ? null : new Date(scheduledAt);
+
+  if (
+    scheduledAt !== undefined
+    && (scheduledAt === null || scheduledAt === '' || Number.isNaN(parsedScheduledAt.getTime()))
+  ) {
+    return res.status(400).json({ message: 'Choose a valid scheduled date and time.' });
+  }
 
   try {
     const isConnected = getDBStatus();
@@ -1494,7 +1856,11 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
         return res.status(404).json({ message: 'Post not found' });
       }
 
-      if (scheduledAt) post.scheduledAt = new Date(scheduledAt);
+      if (post.status === 'publishing') {
+        return res.status(409).json({ message: 'This post is already publishing and can no longer be edited.' });
+      }
+
+      if (parsedScheduledAt) post.scheduledAt = parsedScheduledAt;
       if (caption !== undefined) post.caption = caption;
       if (mediaIds) post.mediaIds = mediaIds;
       if (socialAccountIds) post.socialAccountIds = socialAccountIds;
@@ -1512,6 +1878,8 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
       return res.status(404).json({ message: 'Post not found' });
     }
 
+    await assertPostQueueEditable(post);
+
     if (mediaIds || socialAccountIds) {
       const access = await validateSchedulingAccess({
         campaignId,
@@ -1524,7 +1892,7 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
       }
     }
 
-    if (scheduledAt) post.scheduledAt = new Date(scheduledAt);
+    if (parsedScheduledAt) post.scheduledAt = parsedScheduledAt;
     if (caption !== undefined) post.caption = caption;
     if (mediaIds) post.mediaIds = mediaIds;
     if (socialAccountIds) post.socialAccountIds = socialAccountIds;
@@ -1535,9 +1903,12 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
     
     await post.save();
 
-    await removePostFromQueue(post._id);
-    if (shouldQueuePost(post)) {
-      await addPostToQueue(post);
+    let queueSyncPending = false;
+    try {
+      await syncPostInQueue(post);
+    } catch (queueError) {
+      queueSyncPending = true;
+      console.error(`Queue sync deferred for post ${post._id}:`, queueError.message);
     }
     
     const populated = await ScheduledPost.findOne({ _id: id, campaignId })
@@ -1545,9 +1916,11 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
       .populate('campaignChannelIds')
       .populate('mediaIds');
       
+    if (queueSyncPending) res.set('X-Queue-Sync-Pending', 'true');
     res.status(200).json(populated);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    const statusCode = error.code === 'PUBLISH_JOB_ACTIVE' ? 409 : (error.statusCode || 500);
+    res.status(statusCode).json({ message: error.message });
   }
 });
 
@@ -1631,6 +2004,9 @@ router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req
       if (index === -1) {
         return res.status(404).json({ message: 'Post not found' });
       }
+      if (!cancellablePostStatuses.has(mockStore.scheduledPosts[index].status)) {
+        return res.status(409).json({ message: 'Only pending, paused, or manually posted queue records can be deleted.' });
+      }
       mockStore.scheduledPosts.splice(index, 1);
       return res.status(200).json({ message: 'Scheduled post removed successfully' });
     }
@@ -1638,6 +2014,9 @@ router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req
     const post = await ScheduledPost.findOne({ _id: id, campaignId });
     if (!post) {
       return res.status(404).json({ message: 'Post not found' });
+    }
+    if (!cancellablePostStatuses.has(post.status)) {
+      return res.status(409).json({ message: 'Only pending, paused, or manually posted queue records can be deleted.' });
     }
 
     await removePostFromQueue(post._id);
@@ -1649,7 +2028,7 @@ router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req
 });
 
 // @desc    Get today's live-post tracking for verified creator accounts
-router.get('/creator/today-tracking', protect, async (req, res) => {
+router.get('/creator/today-tracking', protect, resolveHandlerPreview, async (req, res) => {
   try {
     const isConnected = getDBStatus();
     if (!isConnected) {
@@ -1788,7 +2167,7 @@ router.get('/creator/today-tracking', protect, async (req, res) => {
 });
 
 // @desc    Get all scheduled posts assigned to this creator's accounts
-router.get('/creator/posts', protect, async (req, res) => {
+router.get('/creator/posts', protect, resolveHandlerPreview, async (req, res) => {
   try {
     const isConnected = getDBStatus();
     if (!isConnected) {

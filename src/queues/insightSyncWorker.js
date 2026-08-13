@@ -2,17 +2,18 @@
  * Insight Sync Worker
  * 
  * Runs once per day at 2:00 AM IST. Fetches per-post lifetime metrics
- * from Meta Graph API using the Batch API (50 requests per HTTP call)
- * and snapshots them into the PostInsight collection for daily tracking.
+ * from Meta Graph API and snapshots them into the PostInsight collection for
+ * daily tracking. Instagram engagement counts come from media fields while
+ * views come from the media insights endpoint.
  */
 
 import SocialAccount from '../models/SocialAccount.js';
 import PublishedPost from '../models/PublishedPost.js';
 import PostInsight from '../models/PostInsight.js';
-import { sendBatchRequests } from '../services/metaBatchService.js';
 import { getDBStatus } from '../config/db.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
-import { fetchFacebookPostCommentsCount, fetchFacebookPostInsightValue, fetchFacebookPostViews } from '../services/facebookMetricsService.js';
+import { fetchFacebookPostEngagement, fetchFacebookPostViews } from '../services/facebookMetricsService.js';
+import { fetchInstagramMediaMetrics } from '../services/instagramMetricsService.js';
 
 const dateKey = (date = new Date()) => {
   const year = date.getFullYear();
@@ -22,43 +23,11 @@ const dateKey = (date = new Date()) => {
 };
 
 /**
- * Extracts metric values from a Meta insights API response body.
- * 
- * @param {Object} responseBody - Parsed JSON body from Meta insights endpoint
- * @param {string} platform - 'instagram' or 'facebook'
- * @returns {{ views: number, likes: number, comments: number }}
- */
-const extractMetrics = (responseBody, platform) => {
-  const metrics = { views: 0, likes: 0, comments: 0 };
-
-  if (!responseBody || !responseBody.data) {
-    return metrics;
-  }
-
-  for (const entry of responseBody.data) {
-    const name = entry.name;
-    // Get the first value (lifetime total)
-    const value = entry.values?.[0]?.value ?? entry.total_value?.value ?? 0;
-
-    if (platform === 'instagram') {
-      if (name === 'views') metrics.views = Number(value) || 0;
-      else if (name === 'likes') metrics.likes = Number(value) || 0;
-      else if (name === 'comments') metrics.comments = Number(value) || 0;
-    } else if (platform === 'facebook') {
-      if (name === 'post_impressions_unique') metrics.views = Number(value) || 0;
-      else if (name === 'post_reactions_like_total') metrics.likes = Number(value) || 0;
-    }
-  }
-
-  return metrics;
-};
-
-/**
  * Runs the daily insight sync job.
  * 
  * 1. Queries all PublishedPosts published in the last 30 days
  * 2. Groups them by account
- * 3. Sends batch requests to Meta for post-level insights
+ * 3. Requests supported post/media metrics from Meta
  * 4. Upserts PostInsight rows for today's date
  * 5. Updates PublishedPost lifetime metric fields
  */
@@ -112,16 +81,15 @@ export const runInsightSync = async () => {
         if (freshAccount.platform === 'facebook') {
           for (const post of accountPosts) {
             try {
-              const [viewResult, likes, commentsCount] = await Promise.all([
+              const [viewResult, engagement] = await Promise.all([
                 fetchFacebookPostViews(freshAccount.accessToken, post),
-                fetchFacebookPostInsightValue(freshAccount.accessToken, post.metaPostId, 'post_reactions_like_total').catch(() => 0),
-                fetchFacebookPostCommentsCount(freshAccount.accessToken, post.metaPostId),
+                fetchFacebookPostEngagement(freshAccount.accessToken, post.metaPostId),
               ]);
 
               const metrics = {
-                views: Number(viewResult.views) || 0,
-                likes: Number(likes) || 0,
-                comments: commentsCount ?? Number(post.latestComments || 0),
+                views: viewResult.views ?? Number(post.latestViews || 0),
+                likes: engagement.likes ?? Number(post.latestLikes || 0),
+                comments: engagement.comments ?? Number(post.latestComments || 0),
               };
 
               await PostInsight.findOneAndUpdate(
@@ -143,7 +111,7 @@ export const runInsightSync = async () => {
                 {
                   latestViews: metrics.views,
                   latestLikes: metrics.likes,
-                  ...(commentsCount !== null && { latestComments: metrics.comments }),
+                  ...(engagement.comments !== null && { latestComments: metrics.comments }),
                   facebookVideoId: viewResult.videoId || post.facebookVideoId || '',
                   viewsSource: viewResult.source,
                 }
@@ -158,40 +126,20 @@ export const runInsightSync = async () => {
           continue;
         }
 
-        // Build batch request items for this account's posts
-        const batchRequests = accountPosts.map(post => {
-          let metricParam;
-          if (freshAccount.platform === 'instagram') {
-            metricParam = 'views,likes,comments';
-          } else {
-            metricParam = 'post_impressions_unique,post_reactions_like_total';
-          }
-
-          return {
-            id: post._id.toString(),
-            relativeUrl: `${post.metaPostId}/insights?metric=${metricParam}`,
-          };
-        });
-
-        // Determine graph host based on auth provider
-        const graphHost = (freshAccount.platform === 'instagram' && freshAccount.authProvider === 'instagram')
-          ? 'graph.instagram.com'
-          : 'graph.facebook.com';
-
-        // Send batch requests
-        const batchResults = await sendBatchRequests(freshAccount.accessToken, batchRequests, graphHost);
-
-        // Process results and upsert insights
+        let instagramFailures = 0;
         for (const post of accountPosts) {
-          const postIdStr = post._id.toString();
-          const responseBody = batchResults.get(postIdStr);
-
-          if (!responseBody) {
+          const freshMetrics = await fetchInstagramMediaMetrics(freshAccount, post.metaPostId);
+          if (!freshMetrics.hasFreshMetrics) {
             totalErrors++;
+            instagramFailures++;
             continue;
           }
-
-          const metrics = extractMetrics(responseBody, freshAccount.platform);
+          if (freshMetrics.errors.length > 0) instagramFailures += freshMetrics.errors.length;
+          const metrics = {
+            views: freshMetrics.views ?? Number(post.latestViews || 0),
+            likes: freshMetrics.likes ?? Number(post.latestLikes || 0),
+            comments: freshMetrics.comments ?? Number(post.latestComments || 0),
+          };
 
           try {
             // Upsert daily snapshot
@@ -227,6 +175,9 @@ export const runInsightSync = async () => {
               console.error(`❌ [Insight Sync] DB error for post ${post.metaPostId}:`, dbErr.message);
             }
           }
+        }
+        if (instagramFailures > 0) {
+          console.warn(`[Insight Sync] Instagram account "${freshAccount.name}" had ${instagramFailures} unavailable metric request(s).`);
         }
       } catch (accountErr) {
         totalErrors++;
