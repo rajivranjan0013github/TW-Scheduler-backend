@@ -44,6 +44,11 @@ const CampaignSchema = new mongoose.Schema({
     default: 'active',
     index: true,
   },
+  promoFolderId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Folder',
+    default: null,
+  },
   accountIds: [{
     type: mongoose.Schema.Types.ObjectId,
     ref: 'SocialAccount',
