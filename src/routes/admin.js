@@ -1356,6 +1356,7 @@ router.post('/campaigns', protect, authorize('owner', 'admin'), async (req, res)
       primaryGoal = '',
       mainEmail = req.user.email || '',
       status = 'active',
+      promoFolderId = null,
       accountIds = [],
       channels = [],
     } = req.body;
@@ -1381,6 +1382,7 @@ router.post('/campaigns', protect, authorize('owner', 'admin'), async (req, res)
       primaryGoal,
       mainEmail: mainEmail.trim().toLowerCase(),
       status,
+      promoFolderId: promoFolderId || null,
       accountIds: [],
       channels: [],
       createdBy: req.user._id,
@@ -1417,7 +1419,7 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
       return res.status(404).json({ message: 'Campaign not found.' });
     }
 
-    const { name, description, productName, productWebsite, targetAudience, primaryGoal, mainEmail, status, accountIds, channels } = req.body;
+    const { name, description, productName, productWebsite, targetAudience, primaryGoal, mainEmail, status, promoFolderId, accountIds, channels } = req.body;
 
     if (name !== undefined) {
       if (!name.trim()) {
@@ -1433,6 +1435,29 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
     if (primaryGoal !== undefined) campaign.primaryGoal = primaryGoal;
     if (mainEmail !== undefined) campaign.mainEmail = mainEmail.trim().toLowerCase();
     if (status !== undefined) campaign.status = status;
+    if (promoFolderId !== undefined) {
+      if (!promoFolderId) {
+        campaign.promoFolderId = null;
+      } else {
+        let promoFolder;
+        try {
+          promoFolder = await Folder.findOne({
+            _id: promoFolderId,
+            kind: { $ne: 'carousel_set' },
+            $or: [
+              { campaignId: campaign._id },
+              { scope: 'global' },
+            ],
+          }).select('_id');
+        } catch {
+          return res.status(400).json({ message: 'The selected promo folder is invalid.' });
+        }
+        if (!promoFolder) {
+          return res.status(400).json({ message: 'The selected promo folder is unavailable for this campaign.' });
+        }
+        campaign.promoFolderId = promoFolder._id;
+      }
+    }
 
     await campaign.save();
 
