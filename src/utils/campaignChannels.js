@@ -310,7 +310,7 @@ export const resolveCampaignPublishingChannels = async (
         socialAccountId: channel.socialAccountId || null,
         status: channel.status,
         assignedHandlerEmail: channel.assignedHandlerEmail || '',
-        assignedHandlerUserId: channel.isVerified ? (channel.verifiedByUserId || channel.assignedHandlerUserId || null) : (channel.assignedHandlerUserId || null),
+        assignedHandlerUserId: channel.isVerified ? (channel.assignedHandlerUserId || channel.verifiedByUserId || null) : (channel.assignedHandlerUserId || null),
         verifiedAt: channel.isVerified ? channel.verifiedAt : null,
         verifiedByUserId: channel.isVerified ? channel.verifiedByUserId : null,
       })
