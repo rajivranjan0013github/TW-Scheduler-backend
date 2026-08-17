@@ -8,7 +8,9 @@ import CampaignChannel from '../models/CampaignChannel.js';
 import SocialAccount from '../models/SocialAccount.js';
 import { uploadFile, deleteFile, createPresignedUploadUrl, fileExists, getStorageUrl, isR2DirectUploadAvailable } from '../services/r2Service.js';
 import { protect, authorize } from '../middleware/auth.js';
-import { getOriginalStorageKey } from '../utils/storageKeys.js';
+import { getOriginalStorageKey, getThumbnailStorageKey } from '../utils/storageKeys.js';
+import { generateThumbnailFromBuffer, ensureMediaThumbnail } from '../services/videoThumbnailService.js';
+import path from 'path';
 
 const router = express.Router();
 const ADMIN_ROLES = ['owner', 'admin'];
@@ -255,12 +257,89 @@ router.get('/folders', protect, async (req, res) => {
   try {
     const isConnected = getDBStatus();
     if (!isConnected) {
-      return res.status(200).json(mockStore.folders);
+      const folders = mockStore.folders.map((folder) => {
+        const folderMedia = mockStore.media.filter(
+          (item) => String(item.folderId || '') === String(folder._id),
+        );
+        const previewMedia = folderMedia.find((item) => (
+          ['image', 'video'].includes(item.type) && (item.thumbnailUrl || item.url)
+        ));
+        const coverMedia = folder.coverMediaId
+          ? folderMedia.find((item) => String(item._id) === String(folder.coverMediaId) && item.type === 'image')
+          : null;
+        return {
+          ...folder,
+          itemCount: folderMedia.length,
+          coverMedia: coverMedia || null,
+          previewMedia: previewMedia || null,
+        };
+      });
+      return res.status(200).json(folders);
     }
     const campaignId = requireCampaignId(req, res);
     if (!campaignId) return;
-    const folders = await Folder.find(getReadableScopeQuery(campaignId, getRequestedScope(req)));
-    res.status(200).json(folders);
+    const folders = await Folder.find(
+      getReadableScopeQuery(campaignId, getRequestedScope(req)),
+    ).lean();
+    const folderIds = folders.map((folder) => folder._id);
+    const coverMediaIds = folders.map((folder) => folder.coverMediaId).filter(Boolean);
+    const [countSummaries, previewSummaries, coverMediaItems] = folderIds.length > 0
+      ? await Promise.all([
+        Media.aggregate([
+          { $match: { folderId: { $in: folderIds } } },
+          { $group: { _id: '$folderId', itemCount: { $sum: 1 } } },
+        ]),
+        Media.aggregate([
+          {
+            $match: {
+              folderId: { $in: folderIds },
+              type: { $in: ['image', 'video'] },
+            },
+          },
+          { $sort: { uploadBatchCreatedAt: -1, createdAt: -1 } },
+          {
+            $group: {
+              _id: '$folderId',
+              previewMedia: {
+                $first: {
+                  _id: '$_id',
+                  name: '$name',
+                  type: '$type',
+                  url: '$url',
+                  thumbnailUrl: '$thumbnailUrl',
+                },
+              },
+            },
+          },
+        ]),
+        coverMediaIds.length > 0
+          ? Media.find({
+              _id: { $in: coverMediaIds },
+              folderId: { $in: folderIds },
+              type: 'image',
+            }).select('_id name type url thumbnailUrl').lean()
+          : [],
+      ])
+      : [[], [], []];
+    const countsByFolderId = new Map(
+      countSummaries.map((summary) => [String(summary._id), Number(summary.itemCount || 0)]),
+    );
+    const previewsByFolderId = new Map(
+      previewSummaries.map((summary) => [String(summary._id), summary.previewMedia]),
+    );
+    const coverMediaById = new Map(
+      coverMediaItems.map((item) => [String(item._id), item]),
+    );
+
+    res.status(200).json(folders.map((folder) => {
+      const folderId = String(folder._id);
+      return {
+        ...folder,
+        itemCount: countsByFolderId.get(folderId) || 0,
+        coverMedia: coverMediaById.get(String(folder.coverMediaId || '')) || null,
+        previewMedia: previewsByFolderId.get(folderId) || null,
+      };
+    }));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -389,10 +468,14 @@ router.put('/folders/:id', protect, authorize('owner', 'admin', 'editor'), async
   const hasName = Object.prototype.hasOwnProperty.call(req.body || {}, 'name');
   const hasTags = Object.prototype.hasOwnProperty.call(req.body || {}, 'tags');
   const hasScope = Object.prototype.hasOwnProperty.call(req.body || {}, 'scope');
+  const hasCoverMediaId = Object.prototype.hasOwnProperty.call(req.body || {}, 'coverMediaId');
   const nextName = hasName ? String(req.body?.name || '').trim() : '';
   const nextScope = normalizeScope(req.body?.scope);
+  const nextCoverMediaId = hasCoverMediaId && req.body?.coverMediaId
+    ? String(req.body.coverMediaId)
+    : null;
 
-  if (!hasName && !hasTags && !hasScope) {
+  if (!hasName && !hasTags && !hasScope && !hasCoverMediaId) {
     return res.status(400).json({ message: 'No folder updates were provided.' });
   }
 
@@ -409,6 +492,19 @@ router.put('/folders/:id', protect, authorize('owner', 'admin', 'editor'), async
       }
       if (hasName) folder.name = nextName;
       if (hasTags) folder.tags = parseTagList(req.body.tags);
+      if (hasCoverMediaId) {
+        const coverMedia = nextCoverMediaId
+          ? mockStore.media.find((item) => (
+              String(item._id) === nextCoverMediaId
+              && String(item.folderId || '') === String(id)
+              && item.type === 'image'
+            ))
+          : null;
+        if (nextCoverMediaId && !coverMedia) {
+          return res.status(400).json({ message: 'Folder cover must be an image inside this folder.' });
+        }
+        folder.coverMediaId = nextCoverMediaId;
+      }
       if (hasScope) {
         if (nextScope === 'global' && !requireGlobalPermission(req, res)) return;
         folder.scope = nextScope;
@@ -431,9 +527,22 @@ router.put('/folders/:id', protect, authorize('owner', 'admin', 'editor'), async
     if (folderScope === 'global' && !requireGlobalPermission(req, res)) return;
     if (hasScope && nextScope === 'global' && !requireGlobalPermission(req, res)) return;
 
+    if (nextCoverMediaId) {
+      const coverMedia = await Media.findOne({
+        _id: nextCoverMediaId,
+        folderId: id,
+        type: 'image',
+        ...(folderScope === 'global' ? { scope: 'global' } : { campaignId }),
+      }).select('_id');
+      if (!coverMedia) {
+        return res.status(400).json({ message: 'Folder cover must be an image inside this folder.' });
+      }
+    }
+
     const updates = {};
     if (hasName) updates.name = nextName;
     if (hasTags) updates.tags = parseTagList(req.body.tags);
+    if (hasCoverMediaId) updates.coverMediaId = nextCoverMediaId;
     if (hasScope) {
       updates.scope = nextScope;
       if (nextScope === 'global') {
@@ -653,12 +762,32 @@ router.post('/direct-upload/init', protect, authorize('owner', 'admin', 'editor'
       contentType,
     });
 
+    const mediaType = getMediaTypeFromMime(contentType);
+    let thumbnailInfo = {};
+    if (mediaType === 'video') {
+      const thumbnailStorageKey = getThumbnailStorageKey({
+        userId: req.user._id,
+        folderId: scopeContext.folderId,
+        mediaId,
+      });
+      const thumbUpload = await createPresignedUploadUrl({
+        storageKey: thumbnailStorageKey,
+        contentType: 'image/jpeg',
+      });
+      thumbnailInfo = {
+        thumbnailStorageKey,
+        thumbnailUrl: thumbUpload.url,
+        thumbnailUploadUrl: thumbUpload.uploadUrl,
+      };
+    }
+
     res.status(200).json({
       mediaId,
       storageKey,
       url: upload.url,
       uploadUrl: upload.uploadUrl,
       expiresIn: upload.expiresIn,
+      ...thumbnailInfo,
     });
   } catch (error) {
     console.error('Direct upload init error:', error);
@@ -683,6 +812,8 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
     contentType = '',
     folderId,
     storageKey,
+    thumbnailStorageKey: passedThumbKey,
+    thumbnailUrl: passedThumbUrl,
     caption = '',
     tags,
     size,
@@ -735,6 +866,32 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
       return res.status(400).json({ message: 'Uploaded file was not found in R2.' });
     }
 
+    const mediaType = getMediaTypeFromMime(contentType);
+    let thumbnailStorageKey = '';
+    let thumbnailUrl = '';
+    let thumbnailGeneratedAt = undefined;
+
+    if (mediaType === 'video') {
+      const expectedThumbKey = getThumbnailStorageKey({
+        userId: req.user._id,
+        folderId: scopeContext.folderId,
+        mediaId,
+      });
+
+      if (passedThumbKey && passedThumbKey === expectedThumbKey) {
+        thumbnailStorageKey = passedThumbKey;
+        thumbnailUrl = passedThumbUrl || getStorageUrl(passedThumbKey);
+        thumbnailGeneratedAt = new Date();
+      } else {
+        const thumbExists = await fileExists(expectedThumbKey);
+        if (thumbExists) {
+          thumbnailStorageKey = expectedThumbKey;
+          thumbnailUrl = getStorageUrl(expectedThumbKey);
+          thumbnailGeneratedAt = new Date();
+        }
+      }
+    }
+
     const media = await Media.create({
       _id: mediaId,
       userId: req.user._id,
@@ -743,9 +900,12 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
       folderId: scopeContext.folderId,
       socialAccountIds,
       name,
-      type: getMediaTypeFromMime(contentType),
+      type: mediaType,
       url: getStorageUrl(storageKey),
       storageKey,
+      thumbnailUrl,
+      thumbnailStorageKey,
+      thumbnailGeneratedAt,
       caption: caption || '',
       uploadBatchId: String(uploadBatchId || ''),
       uploadBatchCreatedAt: parseUploadBatchCreatedAt(uploadBatchCreatedAt),
@@ -753,6 +913,11 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
       tags: parseTagList(tags),
       size: Number(size) || undefined,
     });
+
+    if (mediaType === 'video' && !thumbnailUrl) {
+      // Trigger background fallback to extract frame using ffmpeg
+      ensureMediaThumbnail(media._id).catch(() => {});
+    }
 
     const populated = await Media.findById(media._id)
       .populate('socialAccountIds', 'name username platform avatarUrl isConnected');
@@ -844,6 +1009,25 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
     });
     const { url } = await uploadFile({ ...req.file, storageKey });
 
+    let thumbnailUrl = '';
+    let thumbnailStorageKey = '';
+    let thumbnailGeneratedAt = undefined;
+
+    if (mediaType === 'video') {
+      const thumbResult = await generateThumbnailFromBuffer({
+        buffer: req.file.buffer,
+        extension: path.extname(req.file.originalname),
+        userId: req.user._id,
+        folderId: scopeContext.folderId,
+        mediaId,
+      });
+      if (thumbResult) {
+        thumbnailUrl = thumbResult.thumbnailUrl;
+        thumbnailStorageKey = thumbResult.thumbnailStorageKey;
+        thumbnailGeneratedAt = thumbResult.thumbnailGeneratedAt;
+      }
+    }
+
     const media = await Media.create({
       _id: mediaId,
       userId: req.user._id,
@@ -855,6 +1039,9 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
       type: mediaType,
       url,
       storageKey,
+      thumbnailUrl,
+      thumbnailStorageKey,
+      thumbnailGeneratedAt,
       caption: caption || '',
       uploadBatchId: String(uploadBatchId || ''),
       uploadBatchCreatedAt: parseUploadBatchCreatedAt(uploadBatchCreatedAt),

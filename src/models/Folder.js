@@ -42,6 +42,11 @@ const FolderSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Media',
   }],
+  coverMediaId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Media',
+    default: null,
+  },
   tags: [String],
 }, { timestamps: true });
 
