@@ -161,7 +161,7 @@ export const fetchInstagramPosts = async (account, { maxPages = MAX_FEED_SYNC_PA
   }));
 };
 
-export const runAccountFeedSync = async (accountOrId, { windowDays = 14, acquireLease = true } = {}) => {
+export const runAccountFeedSync = async (accountOrId, { windowDays = 30, acquireLease = true } = {}) => {
   const account = typeof accountOrId === 'object' && accountOrId?._id
     ? accountOrId
     : await SocialAccount.findById(accountOrId);
@@ -174,7 +174,7 @@ export const runAccountFeedSync = async (accountOrId, { windowDays = 14, acquire
 
   try {
     const freshAccount = await ensureFreshAccountToken(account);
-    const cutoff = Date.now() - Math.max(1, Number(windowDays) || 14) * 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - Math.max(1, Number(windowDays) || 30) * 24 * 60 * 60 * 1000;
     const sinceDate = new Date(cutoff);
     let posts = await withProviderSyncSlot(freshAccount.platform, async () => {
       if (freshAccount.platform === 'facebook') return fetchFacebookPosts(freshAccount, { sinceDate });

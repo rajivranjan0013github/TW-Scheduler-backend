@@ -383,11 +383,11 @@ export const runManualAccountSync = async (accountId) => {
     throw error;
   }
   try {
-    const discovery = await runAccountFeedSync(accountId, { windowDays: 14, acquireLease: false });
+    const discovery = await runAccountFeedSync(accountId, { windowDays: 30, acquireLease: false });
     logSyncEvent('info', 'manual_feed_discovery_completed', {
       accountId: String(accountId),
       postsDiscovered: discovery.postsDiscovered,
-      windowDays: 14,
+      windowDays: 30,
     });
     return await runAccountMetricSync(accountId, 'manual', new Date(), { acquireAccountLease: false });
   } finally {

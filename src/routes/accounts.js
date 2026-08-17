@@ -59,8 +59,8 @@ const serializeCachedPublishedPost = (post) => ({
 const INSIGHT_SKIP_MS = 15 * 60 * 1000;
 const ADMIN_ROLES = ['owner', 'admin'];
 const MAX_FEED_SYNC_PAGES = 20;
-const PUBLISHED_FEED_WINDOW_DAYS = 14;
-const LIVE_METRIC_POST_LIMIT = 14;
+const PUBLISHED_FEED_WINDOW_DAYS = 30;
+const LIVE_METRIC_POST_LIMIT = 30;
 const LIVE_METRIC_CONCURRENCY = 3;
 const hasAdminAccess = (user) => ADMIN_ROLES.includes(user?.role) && user?.userType !== 'account_handler';
 
