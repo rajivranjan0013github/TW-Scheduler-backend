@@ -111,6 +111,13 @@ export const initWorker = () => {
   }
 };
 
+export const isLivePublishingEnabled = () => {
+  if (process.env.ENABLE_LIVE_PUBLISHING !== undefined) {
+    return process.env.ENABLE_LIVE_PUBLISHING === 'true';
+  }
+  return process.env.NODE_ENV === 'production';
+};
+
 /**
  * Shared job execution function
  * @param {string} postId 
@@ -175,12 +182,25 @@ export const publishPostJob = async (postId) => {
     // Success and response metadata
     const publishResponses = [];
 
-    if (!isConnected) {
-      // In sandbox/dev mode, we simulate network request latency.
-      await new Promise(resolve => setTimeout(resolve, 3000));
+    if (!isConnected || !isLivePublishingEnabled()) {
+      // In development or simulation mode, simulate publication safely without calling external APIs
+      console.info(`[Dev Mode] Simulating publish for Post "${postId}" (ENABLE_LIVE_PUBLISHING is false).`);
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      for (const account of accounts) {
+        publishResponses.push({
+          accountId: account._id || account,
+          platform: account.platform || 'simulated',
+          publishId: `simulated_${account.platform || 'post'}_${Date.now()}`,
+        });
+      }
       post.status = 'published_auto';
       post.publishSource = 'software';
-      post.updatedAt = new Date();
+      post.publishResponseId = JSON.stringify(publishResponses);
+      if (isConnected) {
+        await post.save();
+      } else {
+        post.updatedAt = new Date();
+      }
     } else {
       // Call actual Meta API for each connected account
       for (const account of accounts) {

@@ -287,7 +287,7 @@ router.get('/folders', protect, async (req, res) => {
     ).lean();
     const folderIds = folders.map((folder) => folder._id);
     const coverMediaIds = folders.map((folder) => folder.coverMediaId).filter(Boolean);
-    const [countSummaries, previewSummaries, coverMediaItems] = folderIds.length > 0
+    const [countSummaries, previewSummaries, coverMediaItems, subfolderCountSummaries] = folderIds.length > 0
       ? await Promise.all([
         Media.aggregate([
           { $match: { folderId: { $in: folderIds } } },
@@ -323,10 +323,17 @@ router.get('/folders', protect, async (req, res) => {
               type: 'image',
             }).select('_id name type url thumbnailUrl').lean()
           : [],
+        Folder.aggregate([
+          { $match: { parentFolderId: { $in: folderIds } } },
+          { $group: { _id: '$parentFolderId', subfolderCount: { $sum: 1 } } },
+        ]),
       ])
-      : [[], [], []];
+      : [[], [], [], []];
     const countsByFolderId = new Map(
       countSummaries.map((summary) => [String(summary._id), Number(summary.itemCount || 0)]),
+    );
+    const subfolderCountsByFolderId = new Map(
+      subfolderCountSummaries.map((summary) => [String(summary._id), Number(summary.subfolderCount || 0)]),
     );
     const previewsByFolderId = new Map(
       previewSummaries.map((summary) => [String(summary._id), summary.previewMedia]),
@@ -345,12 +352,14 @@ router.get('/folders', protect, async (req, res) => {
 
     res.status(200).json(folders.map((folder) => {
       const folderId = String(folder._id);
+      const mediaCount = countsByFolderId.get(folderId) || 0;
+      const subfolderCount = subfolderCountsByFolderId.get(folderId) || 0;
       return {
         ...folder,
         itemCount: countsByFolderId.get(folderId) || 0,
         subfolderCount: subfoldersByParentId.get(folderId) || 0,
         coverMedia: coverMediaById.get(String(folder.coverMediaId || '')) || null,
-        previewMedia: previewsByFolderId.get(folderId) || null,
+        previewMedia: getFolderPreviewMedia(folderId),
       };
     }));
   } catch (error) {

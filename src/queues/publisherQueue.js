@@ -39,8 +39,16 @@ const getPostJobDelay = (post) => {
   return Math.max(0, scheduledAtMs - Date.now());
 };
 
+export const isBackgroundSyncEnabled = () => {
+  if (process.env.ENABLE_BACKGROUND_SYNC !== undefined) {
+    return process.env.ENABLE_BACKGROUND_SYNC === 'true';
+  }
+  return process.env.NODE_ENV === 'production';
+};
+
 export const initQueue = async () => {
   const connection = getRedisConnection();
+  const backgroundSyncActive = isBackgroundSyncEnabled();
 
   if (connection) {
     publishQueue = new Queue('publishing-queue', {
@@ -49,30 +57,6 @@ export const initQueue = async () => {
         removeOnComplete: true,
         removeOnFail: false,
       }
-    });
-
-    // Feed Sync Queue — runs every 2 hours
-    feedSyncQueue = new Queue('feed-sync-queue', {
-      connection,
-      defaultJobOptions: { removeOnComplete: true, removeOnFail: false },
-    });
-    await feedSyncQueue.add('feed-sync', {}, {
-      repeat: { pattern: '0 */2 * * *' }, // Every 2 hours
-      jobId: 'feed-sync-repeatable',
-    });
-    await feedSyncQueue.add('startup-sync', { startupFullSync: true }, { jobId: 'sync-startup' });
-
-    metricSyncQueue = new Queue('metric-sync-queue', {
-      connection,
-      defaultJobOptions: { removeOnComplete: true, removeOnFail: false },
-    });
-    await metricSyncQueue.add('metric-sync', { tier: 'hot' }, {
-      repeat: { pattern: '*/30 * * * *' },
-      jobId: 'metric-sync-hot-repeatable',
-    });
-    await metricSyncQueue.add('metric-sync', { tier: 'warm' }, {
-      repeat: { pattern: '10 */2 * * *' },
-      jobId: 'metric-sync-warm-repeatable',
     });
 
     accountSyncQueue = new Queue('account-sync-queue', {
@@ -85,29 +69,61 @@ export const initQueue = async () => {
       },
     });
 
-    // Full 30-day metric sync — runs daily at 2:00 AM IST (20:30 UTC)
-    insightSyncQueue = new Queue('insight-sync-queue', {
-      connection,
-      defaultJobOptions: { removeOnComplete: true, removeOnFail: false },
-    });
-    await insightSyncQueue.add('insight-sync', { tier: 'daily' }, {
-      repeat: { pattern: '30 20 * * *' }, // 20:30 UTC = 2:00 AM IST
-      jobId: 'insight-sync-repeatable',
-    });
+    if (backgroundSyncActive) {
+      // Feed Sync Queue — runs every 2 hours
+      feedSyncQueue = new Queue('feed-sync-queue', {
+        connection,
+        defaultJobOptions: { removeOnComplete: true, removeOnFail: false },
+      });
+      await feedSyncQueue.add('feed-sync', {}, {
+        repeat: { pattern: '0 */2 * * *' }, // Every 2 hours
+        jobId: 'feed-sync-repeatable',
+      });
+      await feedSyncQueue.add('startup-sync', { startupFullSync: true }, { jobId: 'sync-startup' });
 
-    tokenHealthQueue = new Queue('token-health-queue', {
-      connection,
-      defaultJobOptions: { removeOnComplete: true, removeOnFail: false },
-    });
-    await tokenHealthQueue.add('token-health', {}, {
-      repeat: { pattern: '0 */12 * * *' }, // Every 12 hours
-      jobId: 'token-health-repeatable',
-    });
+      metricSyncQueue = new Queue('metric-sync-queue', {
+        connection,
+        defaultJobOptions: { removeOnComplete: true, removeOnFail: false },
+      });
+      await metricSyncQueue.add('metric-sync', { tier: 'hot' }, {
+        repeat: { pattern: '*/30 * * * *' },
+        jobId: 'metric-sync-hot-repeatable',
+      });
+      await metricSyncQueue.add('metric-sync', { tier: 'warm' }, {
+        repeat: { pattern: '10 */2 * * *' },
+        jobId: 'metric-sync-warm-repeatable',
+      });
+
+      // Full 30-day metric sync — runs daily at 2:00 AM IST (20:30 UTC)
+      insightSyncQueue = new Queue('insight-sync-queue', {
+        connection,
+        defaultJobOptions: { removeOnComplete: true, removeOnFail: false },
+      });
+      await insightSyncQueue.add('insight-sync', { tier: 'daily' }, {
+        repeat: { pattern: '30 20 * * *' }, // 20:30 UTC = 2:00 AM IST
+        jobId: 'insight-sync-repeatable',
+      });
+
+      tokenHealthQueue = new Queue('token-health-queue', {
+        connection,
+        defaultJobOptions: { removeOnComplete: true, removeOnFail: false },
+      });
+      await tokenHealthQueue.add('token-health', {}, {
+        repeat: { pattern: '0 */12 * * *' }, // Every 12 hours
+        jobId: 'token-health-repeatable',
+      });
+    } else {
+      console.info('[Queue] Background sync queues disabled (ENABLE_BACKGROUND_SYNC is false).');
+    }
 
     startPublishQueueReconciler();
   } else {
     startIntervalFallback();
-    startSyncFallbacks();
+    if (backgroundSyncActive) {
+      startSyncFallbacks();
+    } else {
+      console.info('[Fallback] Background sync intervals disabled (ENABLE_BACKGROUND_SYNC is false).');
+    }
   }
 };
 
