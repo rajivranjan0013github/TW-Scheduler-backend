@@ -6,7 +6,7 @@ import Campaign from '../models/Campaign.js';
 import Insight from '../models/Insight.js';
 import PublishedPost from '../models/PublishedPost.js';
 import PostInsight from '../models/PostInsight.js';
-import { recordStoredMetricSnapshots } from '../queues/metricSyncWorker.js';
+import { recordStoredMetricSnapshots, healStaleSyncStatuses } from '../queues/metricSyncWorker.js';
 import { protect, authorize, resolveHandlerPreview } from '../middleware/auth.js';
 import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount, fetchYoutubeVideos } from '../services/youtubeService.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
@@ -25,6 +25,7 @@ import {
 import CampaignChannel from '../models/CampaignChannel.js';
 import MetricSyncStatus from '../models/MetricSyncStatus.js';
 import { requestAccountSync } from '../queues/publisherQueue.js';
+import { ensureDefaultCampaignFolders } from '../services/campaignFolderService.js';
 
 const router = express.Router();
 const insightSkipCache = new Map();
@@ -502,6 +503,8 @@ router.post('/campaigns', protect, async (req, res) => {
       accountIds: [],
       createdBy: req.user._id,
     });
+
+    await ensureDefaultCampaignFolders(campaign._id, req.user._id);
 
     const populated = await Campaign.findById(campaign._id)
       .populate('createdBy', 'name email')
@@ -1200,6 +1203,12 @@ router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, re
       });
     }
 
+    connectedAccounts.forEach((acc) => {
+      void requestAccountSync(acc._id).catch((syncErr) => {
+        console.warn(`[OAuth Connect] Initial sync failed to queue for ${acc.name}:`, syncErr.message);
+      });
+    });
+
     res.status(200).json({
       message: `Successfully connected ${connectedAccounts.length} Meta accounts/pages.`,
       accounts: connectedAccounts,
@@ -1340,6 +1349,10 @@ router.post('/instagram-callback', protect, resolveHandlerPreview, async (req, r
       await linkAccountToCampaign(linkableCampaignId, account._id, 'instagram', account.username, account.name, account.accountId, req.user._id, req.user.email || '');
     }
 
+    void requestAccountSync(account._id).catch((syncErr) => {
+      console.warn(`[OAuth Connect] Initial sync failed to queue for ${account.name}:`, syncErr.message);
+    });
+
     res.status(200).json({
       message: `Successfully connected Instagram account @${username}.`,
       account,
@@ -1414,6 +1427,7 @@ router.get('/:id/sync-status', protect, async (req, res) => {
     if (!getDBStatus()) return res.status(503).json({ message: 'Database disconnected.' });
     const account = await SocialAccount.findOne(getAccountAccessFilter(req, req.params.id)).select('_id');
     if (!account) return res.status(404).json({ message: 'Account not found.' });
+    await healStaleSyncStatuses(10).catch(() => {});
     const status = await MetricSyncStatus.findOne({ accountId: account._id, tier: 'manual' }).lean();
     return res.status(200).json(status || { status: 'idle', postsProcessed: 0, lastError: '' });
   } catch (error) {

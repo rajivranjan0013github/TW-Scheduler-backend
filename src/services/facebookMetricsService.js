@@ -24,6 +24,11 @@ const warnMetricFailure = (operation, error) => {
   });
 };
 
+export const isFacebookRateLimit = (error) => {
+  const code = getGraphErrorCode(error);
+  return code === 429 || [4, 17, 32, 613, 80004].includes(code);
+};
+
 const disableUnsupportedCapability = (capability, error) => {
   if (![12, 100].includes(getGraphErrorCode(error))) return;
   disabledCapabilities.set(capability, Date.now() + UNSUPPORTED_CAPABILITY_TTL_MS);

@@ -15,6 +15,9 @@ import MetricSyncStatus from '../models/MetricSyncStatus.js';
 import PostMetricSnapshot from '../models/PostMetricSnapshot.js';
 import { resolveCampaignPublishingChannels, syncCampaignChannelList } from '../utils/campaignChannels.js';
 import { deleteFile } from '../services/r2Service.js';
+import { healStaleSyncStatuses } from '../queues/metricSyncWorker.js';
+import { requestAccountSync } from '../queues/publisherQueue.js';
+import { ensureDefaultCampaignFolders } from '../services/campaignFolderService.js';
 
 const router = express.Router();
 const VALID_ROLES = ['owner', 'admin', 'editor', 'viewer'];
@@ -336,15 +339,32 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
       })),
     },
   ]));
+  await healStaleSyncStatuses(10).catch(() => {});
+
+  let campaignLastSyncedAt = null;
   const metricSyncStatuses = await MetricSyncStatus.find({ accountId: { $in: accountIds } })
     .sort({ lastAttemptAt: -1 })
     .lean();
   metricSyncStatuses.forEach((status) => {
     const row = accountRowsMap.get(toKey(status.accountId));
-    if (!row || row.syncStatus !== 'pending') return;
+    const syncTimestamp = status.lastSuccessAt || status.lastAttemptAt;
+    if (syncTimestamp) {
+      const syncDate = new Date(syncTimestamp);
+      if (!campaignLastSyncedAt || syncDate > campaignLastSyncedAt) {
+        campaignLastSyncedAt = syncDate;
+      }
+    }
+    if (!row) return;
+    if (status.lastSuccessAt) {
+      const successDate = new Date(status.lastSuccessAt);
+      if (!row.lastSyncedAt || successDate > row.lastSyncedAt) {
+        row.lastSyncedAt = successDate;
+      }
+    }
+    if (row.syncStatus !== 'pending') return;
     if (['failed', 'rate_limited'].includes(status.status)) {
-      row.syncStatus = 'failed';
-      row.syncError = status.lastError || '';
+      row.syncStatus = status.status;
+      row.syncError = status.lastError || (status.status === 'rate_limited' ? 'Rate limited by provider.' : 'Sync failed.');
     } else if (status.status === 'partial') {
       row.syncStatus = 'partial';
       row.syncError = status.lastError || '';
@@ -354,7 +374,7 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
       row.syncStatus = 'success';
     }
   });
-  const syncIssues = Array.from(accountRowsMap.values()).filter((row) => row.syncStatus === 'failed').length;
+  const syncIssues = Array.from(accountRowsMap.values()).filter((row) => ['failed', 'rate_limited'].includes(row.syncStatus)).length;
   const recentMetricRows = await PostMetricSnapshot.aggregate([
     { $match: { accountId: { $in: accountIds }, capturedAt: { $gte: new Date(now.getTime() - 2 * 60 * 60 * 1000) } } },
     { $group: {
@@ -511,7 +531,7 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
       thisMonthLikes: 0,
       thisMonthComments: 0,
       upcomingPosts,
-      lastSyncedAt: null,
+      lastSyncedAt: campaignLastSyncedAt,
       syncIssues,
       ...recentDeltas,
       last30DaysPostedViews: Array.from(last30DaysPostedViewsMap.values()),
@@ -650,8 +670,8 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
     metrics.last7DaysComments += last7DaysComments;
     metrics.thisMonthLikes += thisMonthLikes;
     metrics.thisMonthComments += thisMonthComments;
-    if (postLastSyncedAt && (!metrics.lastSyncedAt || postLastSyncedAt > metrics.lastSyncedAt)) {
-      metrics.lastSyncedAt = postLastSyncedAt;
+    if (postLastSyncedAt && (!campaignLastSyncedAt || postLastSyncedAt > campaignLastSyncedAt)) {
+      campaignLastSyncedAt = postLastSyncedAt;
     }
 
     if (last30DaysPublished) {
@@ -744,7 +764,7 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
     thisMonthLikes: 0,
     thisMonthComments: 0,
     upcomingPosts,
-    lastSyncedAt: null,
+    lastSyncedAt: campaignLastSyncedAt,
     syncIssues,
     ...recentDeltas,
   });
@@ -1128,6 +1148,9 @@ router.get('/folders', protect, authorize('owner', 'admin'), async (req, res) =>
     }
 
     const query = req.query.campaignId ? { campaignId: req.query.campaignId } : {};
+    if (req.query.campaignId) {
+      await ensureDefaultCampaignFolders(req.query.campaignId, req.user._id);
+    }
     const folders = await Folder.find(query)
       .populate('userId', 'name email')
       .populate('campaignId', 'name mainEmail')
@@ -1292,6 +1315,138 @@ router.get('/campaigns/:id/metrics', protect, authorize('owner', 'admin'), async
   }
 });
 
+// @route   POST /api/admin/campaigns/:id/sync
+// @desc    Trigger background synchronization for all connected accounts in a campaign
+// @access  Private (Owner, Admin)
+router.post('/campaigns/:id/sync', protect, authorize('owner', 'admin'), async (req, res) => {
+  try {
+    if (!getDBStatus()) {
+      return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
+    }
+
+    const campaign = await findAccessibleCampaign(req, req.params.id);
+    if (!campaign) {
+      return res.status(404).json({ message: 'Campaign not found.' });
+    }
+
+    const campaignChannels = await CampaignChannel.find({ campaignId: campaign._id })
+      .select('socialAccountId')
+      .lean();
+    const linkedAccountIds = campaignChannels
+      .map((channel) => channel.socialAccountId)
+      .filter(Boolean);
+
+    const accountQuery = {
+      $or: [
+        { campaignId: campaign._id },
+        { _id: { $in: campaign.accountIds || [] } },
+        { _id: { $in: linkedAccountIds } },
+      ],
+      isConnected: true,
+      accessToken: { $exists: true, $not: /^mock-/ },
+    };
+
+    const accounts = await SocialAccount.find(accountQuery).select('_id name platform').lean();
+    if (accounts.length === 0) {
+      return res.status(200).json({
+        message: 'No connected accounts found for this campaign.',
+        queued: 0,
+        totalAccounts: 0,
+      });
+    }
+
+    const results = await Promise.allSettled(
+      accounts.map((account) => requestAccountSync(account._id))
+    );
+
+    const queuedCount = results.filter((result) => result.status === 'fulfilled').length;
+    res.status(202).json({
+      message: `Queued synchronization for ${queuedCount} account(s).`,
+      queued: queuedCount,
+      totalAccounts: accounts.length,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @route   GET /api/admin/campaigns/:id/sync-status
+// @desc    Get aggregate sync status for a campaign
+// @access  Private (Owner, Admin)
+router.get('/campaigns/:id/sync-status', protect, authorize('owner', 'admin'), async (req, res) => {
+  try {
+    if (!getDBStatus()) {
+      return res.status(503).json({ message: 'Database disconnected. Admin panel is unavailable.' });
+    }
+
+    const campaign = await findAccessibleCampaign(req, req.params.id);
+    if (!campaign) {
+      return res.status(404).json({ message: 'Campaign not found.' });
+    }
+
+    await healStaleSyncStatuses(10).catch(() => {});
+
+    const campaignChannels = await CampaignChannel.find({ campaignId: campaign._id })
+      .select('socialAccountId')
+      .lean();
+    const linkedAccountIds = campaignChannels
+      .map((channel) => channel.socialAccountId)
+      .filter(Boolean);
+
+    const accounts = await SocialAccount.find({
+      $or: [
+        { campaignId: campaign._id },
+        { _id: { $in: campaign.accountIds || [] } },
+        { _id: { $in: linkedAccountIds } },
+      ],
+      isConnected: true,
+    }).select('_id name platform').lean();
+
+    const accountIds = accounts.map((account) => account._id);
+    if (accountIds.length === 0) {
+      return res.status(200).json({
+        status: 'idle',
+        activeCount: 0,
+        syncIssues: 0,
+        lastSyncedAt: null,
+      });
+    }
+
+    const statuses = await MetricSyncStatus.find({ accountId: { $in: accountIds } })
+      .sort({ lastAttemptAt: -1 })
+      .lean();
+
+    let isRunning = false;
+    let syncIssues = 0;
+    let lastSyncedAt = null;
+    const seenAccounts = new Set();
+
+    statuses.forEach((statusDoc) => {
+      const accId = String(statusDoc.accountId);
+      const syncTime = statusDoc.lastSuccessAt || statusDoc.lastAttemptAt;
+      if (syncTime) {
+        const syncDate = new Date(syncTime);
+        if (!lastSyncedAt || syncDate > lastSyncedAt) lastSyncedAt = syncDate;
+      }
+      if (seenAccounts.has(accId)) return;
+      seenAccounts.add(accId);
+
+      if (['queued', 'running'].includes(statusDoc.status)) isRunning = true;
+      if (['failed', 'rate_limited'].includes(statusDoc.status)) syncIssues += 1;
+    });
+
+    const status = isRunning ? 'running' : syncIssues > 0 ? 'issues' : 'success';
+    res.status(200).json({
+      status,
+      activeCount: seenAccounts.size,
+      syncIssues,
+      lastSyncedAt,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 router.get('/campaigns/:id', protect, authorize('owner', 'admin'), async (req, res) => {
   try {
     if (!getDBStatus()) {
@@ -1388,6 +1543,7 @@ router.post('/campaigns', protect, authorize('owner', 'admin'), async (req, res)
       createdBy: req.user._id,
     });
 
+    await ensureDefaultCampaignFolders(campaign._id, req.user._id, { promoFolderId });
     await syncCampaignAccounts(req, campaign._id, accountIds);
     await syncCampaignChannelList(campaign._id, cleanChannels, { userId: req.user._id });
 

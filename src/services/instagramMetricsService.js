@@ -34,6 +34,11 @@ const isAuthenticationError = (error) => (
   Number(error?.error?.code || 0) === 190 || [401, 403].includes(Number(error?.status || 0))
 );
 
+export const isRateLimitError = (error) => {
+  const code = Number(error?.error?.code || error?.status || 0);
+  return code === 429 || [4, 17, 32, 613, 80004].includes(code);
+};
+
 export const fetchInstagramMediaMetrics = async (account, mediaId) => {
   const [mediaResult, insightResult] = await Promise.allSettled([
     // Likes and comments are media fields, not media-insight metrics.
@@ -46,6 +51,13 @@ export const fetchInstagramMediaMetrics = async (account, mediaId) => {
     .map((result) => result.reason);
   const authenticationError = failures.find(isAuthenticationError);
   if (authenticationError) throw authenticationError;
+
+  const rateLimitError = failures.find(isRateLimitError);
+  if (rateLimitError) {
+    rateLimitError.status = 429;
+    rateLimitError.retryable = true;
+    throw rateLimitError;
+  }
 
   const media = mediaResult.status === 'fulfilled' ? mediaResult.value : null;
   const insights = insightResult.status === 'fulfilled' ? insightResult.value : null;

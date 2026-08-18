@@ -10,6 +10,7 @@ import { uploadFile, deleteFile, createPresignedUploadUrl, fileExists, getStorag
 import { protect, authorize } from '../middleware/auth.js';
 import { getOriginalStorageKey, getThumbnailStorageKey } from '../utils/storageKeys.js';
 import { generateThumbnailFromBuffer, ensureMediaThumbnail } from '../services/videoThumbnailService.js';
+import { ensureDefaultCampaignFolders } from '../services/campaignFolderService.js';
 import path from 'path';
 
 const router = express.Router();
@@ -278,6 +279,9 @@ router.get('/folders', protect, async (req, res) => {
     }
     const campaignId = requireCampaignId(req, res);
     if (!campaignId) return;
+    if (getRequestedScope(req) !== 'global') {
+      await ensureDefaultCampaignFolders(campaignId, req.user?._id);
+    }
     const folders = await Folder.find(
       getReadableScopeQuery(campaignId, getRequestedScope(req)),
     ).lean();
@@ -331,11 +335,20 @@ router.get('/folders', protect, async (req, res) => {
       coverMediaItems.map((item) => [String(item._id), item]),
     );
 
+    const subfoldersByParentId = new Map();
+    folders.forEach((folder) => {
+      if (folder.parentFolderId) {
+        const parentId = String(folder.parentFolderId);
+        subfoldersByParentId.set(parentId, (subfoldersByParentId.get(parentId) || 0) + 1);
+      }
+    });
+
     res.status(200).json(folders.map((folder) => {
       const folderId = String(folder._id);
       return {
         ...folder,
         itemCount: countsByFolderId.get(folderId) || 0,
+        subfolderCount: subfoldersByParentId.get(folderId) || 0,
         coverMedia: coverMediaById.get(String(folder.coverMediaId || '')) || null,
         previewMedia: previewsByFolderId.get(folderId) || null,
       };
@@ -685,18 +698,23 @@ router.get('/', protect, async (req, res) => {
       
       return res.status(200).json(filtered);
     }
-    const PLATFORM_AUDIO_FOLDER_ID = '6a35f428fa3873d31da585b8';
-    const folderIdStr = folderId ? String(folderId) : '';
+    const includeSubfolders = String(req.query.includeSubfolders || '').toLowerCase() === 'true';
     const query = {};
 
-    if (folderIdStr === PLATFORM_AUDIO_FOLDER_ID) {
-      query.folderId = PLATFORM_AUDIO_FOLDER_ID;
-    } else {
-      const campaignId = requireCampaignId(req, res);
-      if (!campaignId) return;
-      Object.assign(query, getReadableScopeQuery(campaignId, getRequestedScope(req)));
-      if (folderId) {
-        query.folderId = folderId === 'root' ? null : folderId;
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId && getRequestedScope(req) !== 'global') return;
+    Object.assign(query, getReadableScopeQuery(campaignId, getRequestedScope(req)));
+
+    if (folderId) {
+      if (folderId === 'root') {
+        query.folderId = null;
+      } else if (includeSubfolders) {
+        const folder = await Folder.findById(folderId);
+        const folderScope = normalizeScope(folder?.scope);
+        const descendantIds = await getDescendantFolderIds(folderId, folderScope, campaignId);
+        query.folderId = { $in: descendantIds };
+      } else {
+        query.folderId = folderId;
       }
     }
     if (tag) {

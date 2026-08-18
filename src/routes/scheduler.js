@@ -16,6 +16,7 @@ import {
 } from '../queues/publisherQueue.js';
 import { fetchFacebookPosts, fetchInstagramPosts } from '../queues/feedSyncWorker.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
+import { withProviderSyncSlot } from '../services/syncLeaseService.js';
 import { fetchYoutubeVideos } from '../services/youtubeService.js';
 import { normalizeChannelHandle } from '../utils/campaignChannels.js';
 
@@ -374,30 +375,32 @@ const syncRecentFeedForManualPost = async (post, { verificationStart } = {}) => 
   for (const account of accounts) {
     try {
       const freshAccount = await ensureFreshAccountToken(account);
-      let fetchedPosts = [];
-
-      if (freshAccount.platform === 'facebook') {
-        fetchedPosts = await fetchFacebookPosts(freshAccount, {
-          maxPages: MANUAL_POST_FEED_SYNC_MAX_PAGES,
-          limit: MANUAL_POST_FEED_SYNC_LIMIT,
-        });
-      } else if (freshAccount.platform === 'instagram') {
-        fetchedPosts = await fetchInstagramPosts(freshAccount, {
-          maxPages: MANUAL_POST_FEED_SYNC_MAX_PAGES,
-          limit: MANUAL_POST_FEED_SYNC_LIMIT,
-        });
-      } else if (freshAccount.platform === 'youtube') {
-        fetchedPosts = await fetchYoutubeVideos(freshAccount);
-      }
-
-     
+      const fetchedPosts = await withProviderSyncSlot(freshAccount.platform, async () => {
+        if (freshAccount.platform === 'facebook') {
+          return fetchFacebookPosts(freshAccount, {
+            maxPages: MANUAL_POST_FEED_SYNC_MAX_PAGES,
+            limit: MANUAL_POST_FEED_SYNC_LIMIT,
+            includeMetrics: false,
+          });
+        }
+        if (freshAccount.platform === 'instagram') {
+          return fetchInstagramPosts(freshAccount, {
+            maxPages: MANUAL_POST_FEED_SYNC_MAX_PAGES,
+            limit: MANUAL_POST_FEED_SYNC_LIMIT,
+          });
+        }
+        if (freshAccount.platform === 'youtube') {
+          return fetchYoutubeVideos(freshAccount);
+        }
+        return [];
+      });
 
       for (const postData of fetchedPosts) {
         const cachedPost = await PublishedPost.findOneAndUpdate(
           { userId: freshAccount.userId, metaPostId: postData.metaPostId },
           {
             userId: freshAccount.userId,
-            campaignId: freshAccount.campaignId,
+            campaignId: freshAccount.campaignId || post.campaignId,
             accountId: freshAccount._id,
             ...postData,
             lastSyncedAt: new Date(),

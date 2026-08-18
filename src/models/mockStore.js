@@ -82,6 +82,12 @@ export const mockStore = {
     }
   ],
   folders: [
+    { _id: 'f_hooks', name: 'Hooks', parentFolderId: null, tags: ['hooks'], createdAt: new Date() },
+    { _id: 'f_showcase', name: 'App Showcase', parentFolderId: null, tags: ['app-showcase', 'promo'], createdAt: new Date() },
+    { _id: 'f_generated', name: 'Generated', parentFolderId: null, tags: ['generated', 'schedule'], createdAt: new Date() },
+    { _id: 'f_audio', name: 'Audio', parentFolderId: null, tags: ['audio'], createdAt: new Date() },
+    { _id: 'f_audio_trending', name: 'Trending songs', parentFolderId: 'f_audio', tags: ['audio', 'trending'], createdAt: new Date() },
+    { _id: 'f_audio_myown', name: 'My own audios', parentFolderId: 'f_audio', tags: ['audio', 'custom'], createdAt: new Date() },
     { _id: 'f1', name: 'Summer Reels', parentFolderId: null, createdAt: new Date() },
     { _id: 'f2', name: 'Product Launches', parentFolderId: null, createdAt: new Date() },
     { _id: 'f3', name: 'Behind The Scenes', parentFolderId: null, createdAt: new Date() }

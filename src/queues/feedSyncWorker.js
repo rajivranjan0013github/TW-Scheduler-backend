@@ -68,7 +68,7 @@ export const fetchMetaPagedData = async (initialUrl, { maxPages = MAX_FEED_SYNC_
  * @param {Object} account - SocialAccount document
  * @returns {Promise<Array>} - Array of normalized post objects
  */
-export const fetchFacebookPosts = async (account, { maxPages = MAX_FEED_SYNC_PAGES, limit = 100, sinceDate = null } = {}) => {
+export const fetchFacebookPosts = async (account, { maxPages = MAX_FEED_SYNC_PAGES, limit = 100, sinceDate = null, includeMetrics = true } = {}) => {
   const cutoff = sinceDate ? new Date(sinceDate).getTime() : null;
   const fetchOptions = {
     maxPages,
@@ -106,6 +106,19 @@ export const fetchFacebookPosts = async (account, { maxPages = MAX_FEED_SYNC_PAG
   }
 
   const data = rawPosts.filter((post) => !cutoff || new Date(post.created_time).getTime() >= cutoff);
+
+  if (!includeMetrics) {
+    return data.map((post) => ({
+      metaPostId: post.id,
+      platform: 'facebook',
+      content: post.message || '',
+      ...(post.full_picture ? { mediaUrl: post.full_picture } : {}),
+      ...(post.object_id ? { facebookVideoId: post.object_id, mediaType: 'VIDEO' }
+        : post.full_picture ? { mediaType: 'IMAGE' } : {}),
+      permalink: post.permalink_url || `https://facebook.com/${post.id}`,
+      publishedAt: new Date(post.created_time),
+    }));
+  }
 
   return mapWithConcurrency(data, FACEBOOK_POST_CONCURRENCY, async (post) => {
     const [viewResult, engagement] = await Promise.all([

@@ -57,9 +57,38 @@ const mapWithConcurrency = async (items, limit, mapper) => {
   return results;
 };
 
+const META_RATE_LIMIT_CODES = new Set([4, 17, 32, 613, 80004]);
+
+export const isProviderRateLimit = (error) => {
+  const status = Number(error?.status || 0);
+  const code = Number(error?.error?.code || error?.code || 0);
+  return status === 429 || META_RATE_LIMIT_CODES.has(code);
+};
+
 const isRetryableProviderError = (error) => {
-  const status = Number(error?.status || error?.error?.code || 0);
-  return error?.retryable === true || status === 429 || status >= 500 || ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes(error?.code);
+  const status = Number(error?.status || 0);
+  const code = Number(error?.error?.code || error?.code || 0);
+  return error?.retryable === true
+    || status === 429
+    || META_RATE_LIMIT_CODES.has(code)
+    || status >= 500
+    || ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes(error?.code);
+};
+
+export const healStaleSyncStatuses = async (cutoffMinutes = 10) => {
+  const cutoff = new Date(Date.now() - cutoffMinutes * 60 * 1000);
+  return MetricSyncStatus.updateMany(
+    {
+      status: { $in: ['running', 'queued'] },
+      lastAttemptAt: { $lt: cutoff },
+    },
+    {
+      $set: {
+        status: 'failed',
+        lastError: 'Synchronization session timed out.',
+      },
+    }
+  );
 };
 
 const withProviderRetry = async (task, attempts = 4) => {
@@ -70,12 +99,14 @@ const withProviderRetry = async (task, attempts = 4) => {
     } catch (error) {
       lastError = error;
       if (!isRetryableProviderError(error) || attempt === attempts - 1) throw error;
+      const isRateLimited = isProviderRateLimit(error);
       const retryAfterMs = Number(error?.retryAfterMs || 0);
-      const backoffMs = retryAfterMs || (5000 * (2 ** attempt)) + Math.floor(Math.random() * 1000);
+      const backoffMs = retryAfterMs || (isRateLimited ? (15000 * (2 ** attempt)) : (5000 * (2 ** attempt))) + Math.floor(Math.random() * 1000);
       logSyncEvent('warn', 'provider_retry_scheduled', {
         attempt: attempt + 1,
         nextAttempt: attempt + 2,
         waitMs: backoffMs,
+        isRateLimited,
         status: Number(error?.status || error?.error?.code || 0) || undefined,
         error: String(error?.message || error).slice(0, 300),
       });
@@ -357,15 +388,19 @@ export const runAccountMetricSync = async (accountOrId, tier = 'manual', syncTim
     return { status, postsProcessed: processed, postsRequested: posts.length, lastError };
   } catch (error) {
     await handleProviderAuthFailure(account, error, error.message);
-    const statusCode = Number(error?.status || error?.error?.code || 0);
-    const status = statusCode === 429 ? 'rate_limited' : 'failed';
-    await updateStatus(account._id, tier, { status, postsProcessed: 0, lastError: String(error.message || error).slice(0, 500) });
+    const isRateLimited = isProviderRateLimit(error);
+    const status = isRateLimited ? 'rate_limited' : 'failed';
+    const errorMessage = isRateLimited
+      ? 'Provider rate limit reached. Synchronization will resume on the next interval.'
+      : String(error.message || error).slice(0, 500);
+    await updateStatus(account._id, tier, { status, postsProcessed: 0, lastError: errorMessage });
     logSyncEvent('error', `account_sync_${status}`, {
       accountId: String(account._id),
       platform: account.platform,
       tier,
-      statusCode: statusCode || undefined,
-      error: String(error.message || error).slice(0, 500),
+      isRateLimited,
+      statusCode: Number(error?.status || error?.error?.code || 0) || undefined,
+      error: errorMessage,
     });
     throw error;
   } finally {
