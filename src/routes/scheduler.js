@@ -534,6 +534,15 @@ export const runCreatorAutoPostedCheck = async ({ limit = 20 } = {}) => {
 };
 
 export const startCreatorAutoCheckInterval = () => {
+  const isEnabled = process.env.ENABLE_BACKGROUND_SYNC !== undefined
+    ? process.env.ENABLE_BACKGROUND_SYNC === 'true'
+    : process.env.NODE_ENV === 'production';
+
+  if (!isEnabled) {
+    console.info('[creator-auto-check] Background creator auto-check disabled (ENABLE_BACKGROUND_SYNC is false).');
+    return;
+  }
+
   if (creatorAutoCheckIntervalId) {
     clearInterval(creatorAutoCheckIntervalId);
   }

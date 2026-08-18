@@ -283,7 +283,7 @@ router.get('/folders', protect, async (req, res) => {
     ).lean();
     const folderIds = folders.map((folder) => folder._id);
     const coverMediaIds = folders.map((folder) => folder.coverMediaId).filter(Boolean);
-    const [countSummaries, previewSummaries, coverMediaItems] = folderIds.length > 0
+    const [countSummaries, previewSummaries, coverMediaItems, subfolderCountSummaries] = folderIds.length > 0
       ? await Promise.all([
         Media.aggregate([
           { $match: { folderId: { $in: folderIds } } },
@@ -319,10 +319,17 @@ router.get('/folders', protect, async (req, res) => {
               type: 'image',
             }).select('_id name type url thumbnailUrl').lean()
           : [],
+        Folder.aggregate([
+          { $match: { parentFolderId: { $in: folderIds } } },
+          { $group: { _id: '$parentFolderId', subfolderCount: { $sum: 1 } } },
+        ]),
       ])
-      : [[], [], []];
+      : [[], [], [], []];
     const countsByFolderId = new Map(
       countSummaries.map((summary) => [String(summary._id), Number(summary.itemCount || 0)]),
+    );
+    const subfolderCountsByFolderId = new Map(
+      subfolderCountSummaries.map((summary) => [String(summary._id), Number(summary.subfolderCount || 0)]),
     );
     const previewsByFolderId = new Map(
       previewSummaries.map((summary) => [String(summary._id), summary.previewMedia]),
@@ -331,13 +338,39 @@ router.get('/folders', protect, async (req, res) => {
       coverMediaItems.map((item) => [String(item._id), item]),
     );
 
+    const childFoldersByParentId = new Map();
+    folders.forEach((folder) => {
+      if (folder.parentFolderId) {
+        const parentId = String(folder.parentFolderId);
+        if (!childFoldersByParentId.has(parentId)) {
+          childFoldersByParentId.set(parentId, []);
+        }
+        childFoldersByParentId.get(parentId).push(String(folder._id));
+      }
+    });
+
+    const getFolderPreviewMedia = (folderId) => {
+      const directPreview = previewsByFolderId.get(folderId);
+      if (directPreview) return directPreview;
+      const childIds = childFoldersByParentId.get(folderId) || [];
+      for (const childId of childIds) {
+        const childPreview = previewsByFolderId.get(childId);
+        if (childPreview) return childPreview;
+      }
+      return null;
+    };
+
     res.status(200).json(folders.map((folder) => {
       const folderId = String(folder._id);
+      const mediaCount = countsByFolderId.get(folderId) || 0;
+      const subfolderCount = subfolderCountsByFolderId.get(folderId) || 0;
       return {
         ...folder,
-        itemCount: countsByFolderId.get(folderId) || 0,
+        itemCount: mediaCount + subfolderCount,
+        mediaCount,
+        subfolderCount,
         coverMedia: coverMediaById.get(String(folder.coverMediaId || '')) || null,
-        previewMedia: previewsByFolderId.get(folderId) || null,
+        previewMedia: getFolderPreviewMedia(folderId),
       };
     }));
   } catch (error) {
