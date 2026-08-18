@@ -342,18 +342,32 @@ router.get('/folders', protect, async (req, res) => {
       coverMediaItems.map((item) => [String(item._id), item]),
     );
 
+    const childFoldersByParentId = new Map();
     const subfoldersByParentId = new Map();
     folders.forEach((folder) => {
       if (folder.parentFolderId) {
         const parentId = String(folder.parentFolderId);
         subfoldersByParentId.set(parentId, (subfoldersByParentId.get(parentId) || 0) + 1);
+        if (!childFoldersByParentId.has(parentId)) {
+          childFoldersByParentId.set(parentId, []);
+        }
+        childFoldersByParentId.get(parentId).push(String(folder._id));
       }
     });
 
+    const getFolderPreviewMedia = (folderId) => {
+      const directPreview = previewsByFolderId.get(folderId);
+      if (directPreview) return directPreview;
+      const childIds = childFoldersByParentId.get(folderId) || [];
+      for (const childId of childIds) {
+        const childPreview = previewsByFolderId.get(childId);
+        if (childPreview) return childPreview;
+      }
+      return null;
+    };
+
     res.status(200).json(folders.map((folder) => {
       const folderId = String(folder._id);
-      const mediaCount = countsByFolderId.get(folderId) || 0;
-      const subfolderCount = subfolderCountsByFolderId.get(folderId) || 0;
       return {
         ...folder,
         itemCount: countsByFolderId.get(folderId) || 0,
