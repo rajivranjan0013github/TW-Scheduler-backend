@@ -1,4 +1,5 @@
 import express from 'express';
+import mongoose from 'mongoose';
 import multer from 'multer';
 import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
@@ -157,6 +158,30 @@ const parseUploadBatchCreatedAt = (value) => {
   if (!value) return undefined;
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+};
+
+const parseSourceUsage = (value) => {
+  let parsed = value;
+  if (typeof value === 'string') {
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      parsed = {};
+    }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) parsed = {};
+
+  const normalizeMediaId = (mediaId) => {
+    const id = String(mediaId || '').trim();
+    return mongoose.Types.ObjectId.isValid(id) ? id : null;
+  };
+
+  return {
+    firstVideoId: normalizeMediaId(parsed.firstVideoId),
+    secondVideoId: normalizeMediaId(parsed.secondVideoId),
+    musicId: normalizeMediaId(parsed.musicId),
+    text: String(parsed.text || '').trim(),
+  };
 };
 
 const getMediaTypeFromMime = (mimeType = '') => {
@@ -978,13 +1003,22 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
     return res.status(400).json({ message: 'No file uploaded' });
   }
 
-  const { folderId, tags, caption, uploadBatchId = '', uploadBatchCreatedAt, uploadOrder } = req.body;
+  const {
+    folderId,
+    tags,
+    caption,
+    sourceUsage,
+    uploadBatchId = '',
+    uploadBatchCreatedAt,
+    uploadOrder,
+  } = req.body;
   const requestedAccountIds = parseIdList(req.body.socialAccountIds);
   const mimeType = req.file.mimetype;
   const mediaType = getMediaTypeFromMime(mimeType);
 
   try {
     const tagList = parseTagList(tags);
+    const parsedSourceUsage = parseSourceUsage(sourceUsage);
     const isConnected = getDBStatus();
     const scopeContext = isConnected
       ? await getUploadScopeContext(req, res, folderId)
@@ -1029,6 +1063,7 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
         url,
         storageKey,
         caption: caption || '',
+        sourceUsage: parsedSourceUsage,
         uploadBatchId: String(uploadBatchId || ''),
         uploadBatchCreatedAt: parseUploadBatchCreatedAt(uploadBatchCreatedAt),
         uploadOrder: parseUploadOrder(uploadOrder),
@@ -1084,6 +1119,7 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
       thumbnailStorageKey,
       thumbnailGeneratedAt,
       caption: caption || '',
+      sourceUsage: parsedSourceUsage,
       uploadBatchId: String(uploadBatchId || ''),
       uploadBatchCreatedAt: parseUploadBatchCreatedAt(uploadBatchCreatedAt),
       uploadOrder: parseUploadOrder(uploadOrder),

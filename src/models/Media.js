@@ -1,5 +1,27 @@
 import mongoose from 'mongoose';
 
+const MediaSourceUsageSchema = new mongoose.Schema({
+  firstVideoId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Media',
+    default: null,
+  },
+  secondVideoId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Media',
+    default: null,
+  },
+  musicId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Media',
+    default: null,
+  },
+  text: {
+    type: String,
+    default: '',
+  },
+}, { _id: false });
+
 const MediaSchema = new mongoose.Schema({
   userId: {
     type: mongoose.Schema.Types.ObjectId,
@@ -59,6 +81,10 @@ const MediaSchema = new mongoose.Schema({
   caption: {
     type: String,
     default: '',
+  },
+  sourceUsage: {
+    type: MediaSourceUsageSchema,
+    default: () => ({}),
   },
   uploadBatchId: {
     type: String,
