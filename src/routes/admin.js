@@ -1506,7 +1506,10 @@ router.post('/campaigns', protect, authorize('owner', 'admin'), async (req, res)
       name,
       description = '',
       productName = '',
+      productSource = 'website',
+      productUrl = '',
       productWebsite = '',
+      productDescription = '',
       targetAudience = '',
       primaryGoal = '',
       mainEmail = req.user.email || '',
@@ -1532,7 +1535,10 @@ router.post('/campaigns', protect, authorize('owner', 'admin'), async (req, res)
       name: name.trim(),
       description,
       productName,
-      productWebsite,
+      productSource: ['website', 'app_store', 'play_store'].includes(productSource) ? productSource : 'website',
+      productUrl,
+      productWebsite: productWebsite || (productSource === 'website' ? productUrl : ''),
+      productDescription,
       targetAudience,
       primaryGoal,
       mainEmail: mainEmail.trim().toLowerCase(),
@@ -1575,7 +1581,22 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
       return res.status(404).json({ message: 'Campaign not found.' });
     }
 
-    const { name, description, productName, productWebsite, targetAudience, primaryGoal, mainEmail, status, promoFolderId, accountIds, channels } = req.body;
+    const {
+      name,
+      description,
+      productName,
+      productSource,
+      productUrl,
+      productWebsite,
+      productDescription,
+      targetAudience,
+      primaryGoal,
+      mainEmail,
+      status,
+      promoFolderId,
+      accountIds,
+      channels,
+    } = req.body;
 
     if (name !== undefined) {
       if (!name.trim()) {
@@ -1586,7 +1607,11 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
 
     if (description !== undefined) campaign.description = description;
     if (productName !== undefined) campaign.productName = productName;
+    if (productSource !== undefined && ['website', 'app_store', 'play_store'].includes(productSource)) campaign.productSource = productSource;
+    if (productUrl !== undefined) campaign.productUrl = productUrl;
     if (productWebsite !== undefined) campaign.productWebsite = productWebsite;
+    else if (productUrl !== undefined && (productSource || campaign.productSource) === 'website') campaign.productWebsite = productUrl;
+    if (productDescription !== undefined) campaign.productDescription = productDescription;
     if (targetAudience !== undefined) campaign.targetAudience = targetAudience;
     if (primaryGoal !== undefined) campaign.primaryGoal = primaryGoal;
     if (mainEmail !== undefined) campaign.mainEmail = mainEmail.trim().toLowerCase();

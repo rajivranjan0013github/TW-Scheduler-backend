@@ -101,6 +101,42 @@ const MediaSchema = new mongoose.Schema({
   size: {
     type: Number,
   },
+  aiStatus: {
+    type: String,
+    enum: ['none', 'pending', 'processing', 'completed', 'failed'],
+    default: 'none',
+    index: true,
+  },
+  aiProcessedAt: {
+    type: Date,
+  },
+  aiError: {
+    type: String,
+    default: '',
+  },
+  aiAnalysis: {
+    type: new mongoose.Schema({
+      summary: { type: String, default: '' },
+      reaction: {
+        primaryEmotion: { type: String, default: '' },
+        description: { type: String, default: '' },
+        openingDialogue: { type: String, default: '' },
+      },
+      hook: {
+        detected: { type: Boolean, default: false },
+        description: { type: String, default: '' },
+        hookConcept: { type: String, default: '' },
+        openingDialogue: { type: String, default: '' },
+      },
+      appShowcase: {
+        detected: { type: Boolean, default: false },
+        featuresShown: { type: [String], default: [] },
+        screenDetails: { type: String, default: '' },
+      },
+      autoTags: { type: [String], default: [] },
+    }, { _id: false }),
+    default: () => ({}),
+  },
 }, { timestamps: true });
 
 MediaSchema.index({ campaignId: 1, folderId: 1, uploadBatchCreatedAt: -1, uploadOrder: 1, createdAt: -1 });

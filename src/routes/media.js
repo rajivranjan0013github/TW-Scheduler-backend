@@ -12,6 +12,7 @@ import { protect, authorize } from '../middleware/auth.js';
 import { getOriginalStorageKey, getThumbnailStorageKey } from '../utils/storageKeys.js';
 import { generateThumbnailFromBuffer, ensureMediaThumbnail } from '../services/videoThumbnailService.js';
 import { ensureDefaultCampaignFolders } from '../services/campaignFolderService.js';
+import { analyzeMediaVideo } from '../services/videoAiService.js';
 import path from 'path';
 
 const router = express.Router();
@@ -980,9 +981,17 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
       size: Number(size) || undefined,
     });
 
-    if (mediaType === 'video' && !thumbnailUrl) {
-      // Trigger background fallback to extract frame using ffmpeg
-      ensureMediaThumbnail(media._id).catch(() => {});
+    if (mediaType === 'video') {
+      if (!thumbnailUrl) {
+        // Trigger background fallback to extract frame using ffmpeg
+        ensureMediaThumbnail(media._id).catch(() => {});
+      }
+      media.aiStatus = 'processing';
+      await media.save();
+      // Asynchronously analyze with Gemini (non-blocking)
+      analyzeMediaVideo(media._id).catch((err) => {
+        console.error(`[media.js] Failed to analyze video ${media._id}:`, err);
+      });
     }
 
     const populated = await Media.findById(media._id)
@@ -1130,10 +1139,96 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
     const populated = await Media.findById(media._id)
       .populate('socialAccountIds', 'name username platform avatarUrl isConnected');
 
+    if (mediaType === 'video') {
+      media.aiStatus = 'processing';
+      await media.save();
+      analyzeMediaVideo(media._id).catch((err) => {
+        console.error(`[media.js] Failed to analyze video ${media._id}:`, err);
+      });
+    }
+
     res.status(201).json(populated);
   } catch (error) {
     console.error('Upload error in route:', error);
     res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Get AI analysis status/results for one video media asset
+// @route   GET /api/media/:id/analyze-ai
+// @access  Private
+router.get('/:id/analyze-ai', protect, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      const mediaItem = mockStore.media.find((item) => String(item._id) === String(id));
+      if (!mediaItem) {
+        return res.status(404).json({ message: 'Media not found' });
+      }
+      return res.status(200).json({
+        _id: mediaItem._id,
+        type: mediaItem.type,
+        tags: mediaItem.tags || [],
+        aiStatus: mediaItem.aiStatus || 'pending',
+        aiError: mediaItem.aiError || '',
+        aiProcessedAt: mediaItem.aiProcessedAt,
+        aiAnalysis: mediaItem.aiAnalysis,
+      });
+    }
+
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+
+    const media = await Media.findOne({
+      _id: id,
+      ...getReadableScopeQuery(campaignId),
+    })
+      .select('_id type tags aiStatus aiError aiProcessedAt aiAnalysis')
+      .lean();
+
+    if (!media) {
+      return res.status(404).json({ message: 'Media not found' });
+    }
+    if (media.type !== 'video') {
+      return res.status(400).json({ message: 'AI video analysis is only available for video files.' });
+    }
+
+    return res.status(200).json(media);
+  } catch (error) {
+    console.error('Error refreshing AI analysis status:', error);
+    return res.status(500).json({ message: error.message || 'Failed to refresh AI analysis status.' });
+  }
+});
+
+// @desc    Trigger or re-run AI analysis on a video media asset
+// @route   POST /api/media/:id/analyze-ai
+// @access  Private (Owner, Admin, Editor)
+router.post('/:id/analyze-ai', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
+  const { id } = req.params;
+  try {
+    const media = await Media.findById(id);
+    if (!media) {
+      return res.status(404).json({ message: 'Media not found' });
+    }
+    if (media.type !== 'video') {
+      return res.status(400).json({ message: 'AI video analysis is only available for video files.' });
+    }
+
+    media.aiStatus = 'processing';
+    media.aiError = '';
+    await media.save();
+
+    // Trigger analysis asynchronously in background
+    analyzeMediaVideo(media._id).catch((err) => {
+      console.error(`[media.js] Manual AI analysis failed for ${media._id}:`, err);
+    });
+
+    res.status(200).json({ message: 'AI video analysis started', media });
+  } catch (error) {
+    console.error('Error starting AI analysis:', error);
+    res.status(500).json({ message: error.message || 'Failed to start AI analysis.' });
   }
 });
 

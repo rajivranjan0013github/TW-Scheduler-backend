@@ -16,7 +16,22 @@ const CampaignSchema = new mongoose.Schema({
     default: '',
     trim: true,
   },
+  productSource: {
+    type: String,
+    enum: ['website', 'app_store', 'play_store'],
+    default: 'website',
+  },
+  productUrl: {
+    type: String,
+    default: '',
+    trim: true,
+  },
   productWebsite: {
+    type: String,
+    default: '',
+    trim: true,
+  },
+  productDescription: {
     type: String,
     default: '',
     trim: true,
