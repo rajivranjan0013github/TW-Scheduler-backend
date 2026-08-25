@@ -82,6 +82,15 @@ const MediaSchema = new mongoose.Schema({
     type: String,
     default: '',
   },
+  visualSummary: {
+    type: String,
+    default: '',
+  },
+  visualTags: [String],
+  visualAnalyzedAt: {
+    type: Date,
+    default: null,
+  },
   sourceUsage: {
     type: MediaSourceUsageSchema,
     default: () => ({}),

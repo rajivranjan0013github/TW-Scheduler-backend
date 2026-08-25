@@ -5,6 +5,9 @@ import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import Folder from '../models/Folder.js';
 import Media from '../models/Media.js';
+import BulkMediaReservation from '../models/BulkMediaReservation.js';
+import BulkAgentPlan from '../models/BulkAgentPlan.js';
+import { countPlanSourceOccurrences } from '../services/bulkAgentService.js';
 import CampaignChannel from '../models/CampaignChannel.js';
 import SocialAccount from '../models/SocialAccount.js';
 import { uploadFile, deleteFile, createPresignedUploadUrl, fileExists, getStorageUrl, isR2DirectUploadAvailable } from '../services/r2Service.js';
@@ -183,6 +186,54 @@ const parseSourceUsage = (value) => {
     musicId: normalizeMediaId(parsed.musicId),
     text: String(parsed.text || '').trim(),
   };
+};
+
+const releaseCompletedSourceReservations = async ({ userId, campaignId, sourceUsage }) => {
+  if (!campaignId) return 0;
+  const sourceMediaIds = [...new Set([
+    sourceUsage?.firstVideoId,
+    sourceUsage?.secondVideoId,
+    sourceUsage?.musicId,
+  ].map((value) => String(value || '')).filter(Boolean))];
+  if (sourceMediaIds.length === 0) return 0;
+  const reservationQuery = {
+    userId,
+    campaignId,
+    sourceMediaId: { $in: sourceMediaIds },
+    expiresAt: { $gt: new Date() },
+  };
+  const reservations = await BulkMediaReservation.find(reservationQuery)
+    .select('_id planId sourceMediaId')
+    .lean();
+  const candidatePlanIds = [...new Set(reservations.map((reservation) => String(reservation.planId)))];
+  const plans = candidatePlanIds.length > 0
+    ? await BulkAgentPlan.find({ _id: { $in: candidatePlanIds } }).select('assignments').lean()
+    : [];
+  const plansById = new Map(plans.map((plan) => [String(plan._id), plan]));
+  const releasableReservations = reservations.filter((reservation) => {
+    const plan = plansById.get(String(reservation.planId));
+    return !plan || countPlanSourceOccurrences(plan, reservation.sourceMediaId) <= 1;
+  });
+  if (releasableReservations.length === 0) return 0;
+  const result = await BulkMediaReservation.deleteMany({
+    _id: { $in: releasableReservations.map((reservation) => reservation._id) },
+  });
+  const planIds = [...new Set(releasableReservations.map((reservation) => String(reservation.planId)))];
+  for (const planId of planIds) {
+    const remainingCount = await BulkMediaReservation.countDocuments({ planId });
+    if (remainingCount === 0) {
+      await BulkAgentPlan.updateOne(
+        { _id: planId, userId, campaignId, status: 'applied' },
+        {
+          $set: {
+            status: 'released',
+            expiresAt: new Date(Date.now() + (5 * 60 * 1000)),
+          },
+        },
+      );
+    }
+  }
+  return Number(result.deletedCount || 0);
 };
 
 const getMediaTypeFromMime = (mimeType = '') => {
@@ -1135,6 +1186,18 @@ router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.si
       tags: tagList,
       size: req.file.size,
     });
+
+    // Media.sourceUsage is durable before reservations are released, so the
+    // cooldown index still prevents reuse even if the reservation cleanup fails.
+    try {
+      await releaseCompletedSourceReservations({
+        userId: req.user._id,
+        campaignId: scopeContext.campaignId,
+        sourceUsage: parsedSourceUsage,
+      });
+    } catch (reservationError) {
+      console.error('Generated media saved, but source reservation cleanup failed:', reservationError);
+    }
 
     const populated = await Media.findById(media._id)
       .populate('socialAccountIds', 'name username platform avatarUrl isConnected');

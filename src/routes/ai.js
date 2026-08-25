@@ -1,8 +1,12 @@
 import express from 'express';
 import { protect } from '../middleware/auth.js';
 import SavedCaption from '../models/SavedCaption.js';
+<<<<<<< HEAD
 import Campaign from '../models/Campaign.js';
 import { analyzeProductUrl } from '../services/productAnalysisService.js';
+=======
+import { formatGeminiAttemptFailures, getGeminiModelCandidates } from '../services/geminiModels.js';
+>>>>>>> be14aa619369299c6ffc21cb96334d6b207855a8
 
 const router = express.Router();
 
@@ -77,10 +81,17 @@ router.post('/generate-text', protect, async (req, res) => {
   }
 
   try {
+<<<<<<< HEAD
     const campaign = await getCampaignForRequest(req);
     const campaignProfile = getCampaignProfileText(campaign);
     const modelsToTry = ['gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-1.5-flash'];
     let errorMsg = '';
+=======
+    const modelsToTry = getGeminiModelCandidates({
+      preferred: [process.env.GEMINI_TEXT_MODEL, process.env.GEMINI_MODEL],
+    });
+    const modelFailures = [];
+>>>>>>> be14aa619369299c6ffc21cb96334d6b207855a8
     let responseText = '';
 
     const prompt = `You are an expert short-form social-media marketing copywriter.
@@ -150,12 +161,12 @@ JSON format:
         }
       } catch (err) {
         console.error(`Gemini REST API failed for model ${modelName}:`, err);
-        errorMsg = err.message || 'Generation failed';
+        modelFailures.push({ model: modelName, error: err });
       }
     }
 
     if (!responseText) {
-      throw new Error(`All model attempts failed. Last error: ${errorMsg}`);
+      throw new Error(`All model attempts failed. ${formatGeminiAttemptFailures(modelFailures)}`);
     }
 
     // Parse output JSON to ensure valid list of items
@@ -188,10 +199,17 @@ router.post('/generate-caption', protect, async (req, res) => {
   }
 
   try {
+<<<<<<< HEAD
     const campaign = await getCampaignForRequest(req);
     const campaignProfile = getCampaignProfileText(campaign);
     const modelsToTry = ['gemini-2.5-flash', 'gemini-1.5-flash'];
     let errorMsg = '';
+=======
+    const modelsToTry = getGeminiModelCandidates({
+      preferred: [process.env.GEMINI_CAPTION_MODEL, process.env.GEMINI_MODEL],
+    });
+    const modelFailures = [];
+>>>>>>> be14aa619369299c6ffc21cb96334d6b207855a8
     let responseText = '';
 
     const prompt = `You are an expert short-form social-media marketing copywriter.
@@ -251,12 +269,12 @@ Output ONLY the final caption text. Do not include markdown codeblocks or explan
         }
       } catch (err) {
         console.error(`Gemini failed for model ${modelName}:`, err);
-        errorMsg = err.message || 'Generation failed';
+        modelFailures.push({ model: modelName, error: err });
       }
     }
 
     if (!responseText) {
-      throw new Error(`All model attempts failed. Last error: ${errorMsg}`);
+      throw new Error(`All model attempts failed. ${formatGeminiAttemptFailures(modelFailures)}`);
     }
 
     let captionText = responseText.trim();
