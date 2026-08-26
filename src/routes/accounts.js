@@ -486,7 +486,17 @@ router.post('/campaigns', protect, async (req, res) => {
       productUrl = '',
       productWebsite = '',
       productDescription = '',
+      category = '',
+      iconUrl = '',
       targetAudience = '',
+      keyBenefit = '',
+      coreFunction = '',
+      useCases = [],
+      targetAudienceList = [],
+      marketingStrategies = [],
+      keyMessaging = [],
+      positioningStatement = '',
+      screenshots = [],
       primaryGoal = '',
     } = req.body;
 
@@ -502,7 +512,17 @@ router.post('/campaigns', protect, async (req, res) => {
       productUrl,
       productWebsite: productWebsite || (productSource === 'website' ? productUrl : ''),
       productDescription,
+      category,
+      iconUrl,
       targetAudience,
+      keyBenefit,
+      coreFunction,
+      useCases: Array.isArray(useCases) ? useCases : [],
+      targetAudienceList: Array.isArray(targetAudienceList) ? targetAudienceList : [],
+      marketingStrategies: Array.isArray(marketingStrategies) ? marketingStrategies : [],
+      keyMessaging: Array.isArray(keyMessaging) ? keyMessaging : [],
+      positioningStatement,
+      screenshots: Array.isArray(screenshots) ? screenshots : [],
       primaryGoal,
       mainEmail: (req.user.email || '').trim().toLowerCase(),
       status: 'active',
@@ -517,6 +537,101 @@ router.post('/campaigns', protect, async (req, res) => {
       .lean();
 
     res.status(201).json(populated);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Update a campaign workspace for the signed-in user
+// @route   PATCH /api/accounts/campaigns/:id
+// @access  Private
+router.patch('/campaigns/:id', protect, async (req, res) => {
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      return res.status(503).json({ message: 'Database disconnected.' });
+    }
+
+    const userEmail = (req.user.email || '').trim().toLowerCase();
+    const isPrivileged = req.user.role === 'owner' || req.user.role === 'admin';
+
+    const campaign = await Campaign.findOne({
+      _id: req.params.id,
+      ...(isPrivileged
+        ? {}
+        : {
+            $or: [
+              { mainEmail: userEmail },
+              { mainEmail: { $in: ['', null] }, createdBy: req.user._id },
+              { createdBy: req.user._id },
+            ],
+          }),
+    });
+
+    if (!campaign) {
+      return res.status(404).json({ message: 'Product workspace not found or access denied.' });
+    }
+
+    const {
+      name,
+      description,
+      productName,
+      productDescription,
+      productSource,
+      productUrl,
+      productWebsite,
+      category,
+      iconUrl,
+      targetAudience,
+      keyBenefit,
+      coreFunction,
+      useCases,
+      targetAudienceList,
+      marketingStrategies,
+      keyMessaging,
+      positioningStatement,
+      screenshots,
+      primaryGoal,
+      mainEmail,
+    } = req.body;
+
+    if (name !== undefined) {
+      if (!name.trim()) {
+        return res.status(400).json({ message: 'Product name is required.' });
+      }
+      campaign.name = name.trim();
+    }
+    if (description !== undefined) campaign.description = description;
+    if (productName !== undefined) campaign.productName = productName;
+    if (productDescription !== undefined) campaign.productDescription = productDescription;
+    if (category !== undefined) campaign.category = category;
+    if (iconUrl !== undefined) campaign.iconUrl = iconUrl;
+    if (productSource !== undefined && ['website', 'app_store', 'play_store'].includes(productSource)) {
+      campaign.productSource = productSource;
+    }
+    if (productUrl !== undefined) campaign.productUrl = productUrl;
+    if (productWebsite !== undefined) campaign.productWebsite = productWebsite;
+    if (targetAudience !== undefined) campaign.targetAudience = targetAudience;
+    if (keyBenefit !== undefined) campaign.keyBenefit = keyBenefit;
+    if (coreFunction !== undefined) campaign.coreFunction = coreFunction;
+    if (useCases !== undefined && Array.isArray(useCases)) campaign.useCases = useCases;
+    if (targetAudienceList !== undefined && Array.isArray(targetAudienceList)) campaign.targetAudienceList = targetAudienceList;
+    if (marketingStrategies !== undefined && Array.isArray(marketingStrategies)) campaign.marketingStrategies = marketingStrategies;
+    if (keyMessaging !== undefined && Array.isArray(keyMessaging)) campaign.keyMessaging = keyMessaging;
+    if (positioningStatement !== undefined) campaign.positioningStatement = positioningStatement;
+    if (screenshots !== undefined && Array.isArray(screenshots)) campaign.screenshots = screenshots;
+    if (primaryGoal !== undefined) campaign.primaryGoal = primaryGoal;
+    if (mainEmail !== undefined && isPrivileged) {
+      campaign.mainEmail = mainEmail.trim().toLowerCase();
+    }
+
+    await campaign.save();
+
+    const populated = await Campaign.findById(campaign._id)
+      .populate('createdBy', 'name email')
+      .lean();
+
+    res.status(200).json(populated);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

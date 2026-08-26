@@ -36,11 +36,56 @@ const CampaignSchema = new mongoose.Schema({
     default: '',
     trim: true,
   },
+  category: {
+    type: String,
+    default: '',
+    trim: true,
+  },
+  iconUrl: {
+    type: String,
+    default: '',
+    trim: true,
+  },
   targetAudience: {
     type: String,
     default: '',
     trim: true,
   },
+  keyBenefit: {
+    type: String,
+    default: '',
+    trim: true,
+  },
+  coreFunction: {
+    type: String,
+    default: '',
+    trim: true,
+  },
+  useCases: [{
+    type: String,
+    trim: true,
+  }],
+  targetAudienceList: [{
+    type: String,
+    trim: true,
+  }],
+  marketingStrategies: [{
+    type: String,
+    trim: true,
+  }],
+  keyMessaging: [{
+    type: String,
+    trim: true,
+  }],
+  positioningStatement: {
+    type: String,
+    default: '',
+    trim: true,
+  },
+  screenshots: [{
+    type: String,
+    trim: true,
+  }],
   primaryGoal: {
     type: String,
     default: '',
