@@ -2,10 +2,8 @@ import express from 'express';
 import { protect } from '../middleware/auth.js';
 import Campaign from '../models/Campaign.js';
 import SavedCaption from '../models/SavedCaption.js';
-import Campaign from '../models/Campaign.js';
 import { analyzeProductUrl } from '../services/productAnalysisService.js';
 import { formatGeminiAttemptFailures, getGeminiModelCandidates } from '../services/geminiModels.js';
-import { analyzeProductUrl } from '../services/productAnalysisService.js';
 
 const router = express.Router();
 
