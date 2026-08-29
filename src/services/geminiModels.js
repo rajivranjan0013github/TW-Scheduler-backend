@@ -1,7 +1,8 @@
 const CURRENT_FLASH_MODELS = Object.freeze([
-  'gemini-3.7-flash',
-  'gemini-3.6-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-flash-latest',
   'gemini-2.5-flash',
+  'gemini-3.7-flash',
 ]);
 
 const normalizeModelName = (value) => String(value || '')
