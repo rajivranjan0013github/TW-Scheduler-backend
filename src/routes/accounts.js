@@ -271,7 +271,7 @@ const getScopedAccountQuery = async (req, extra = {}) => {
 const getLinkableCampaignId = async (req, campaignId, accountPayload) => {
   if (!campaignId) return undefined;
   if (hasAdminAccess(req.user)) return campaignId;
-  return await canAccountVerifyCampaign(campaignId, accountPayload) ? campaignId : undefined;
+  return await canAccountVerifyCampaign(campaignId, accountPayload, req.user) ? campaignId : undefined;
 };
 
 const linkAccountToCampaign = async (campaignId, socialAccountId, platform, username, name, accountId, userId = null, userEmail = '') => {
@@ -975,7 +975,9 @@ router.post('/youtube-callback', protect, resolveHandlerPreview, async (req, res
     }
     const linkableCampaignId = await getLinkableCampaignId(req, campaignId, accountPayload);
     if (campaignId && !linkableCampaignId && !hasAdminAccess(req.user)) {
-      return res.status(403).json({ message: 'This YouTube channel does not match the campaign handle.' });
+      return res.status(403).json({
+        message: `YouTube channel "${accountPayload.name}" (@${accountPayload.username || accountPayload.accountId}) is not assigned to ${req.user.email || 'your account'} in this campaign.`,
+      });
     }
 
     const account = await saveConnectedAccount({
@@ -1430,7 +1432,7 @@ router.post('/instagram-callback', protect, resolveHandlerPreview, async (req, r
       username,
     });
     if (campaignId && !linkableCampaignId && !hasAdminAccess(req.user)) {
-      return res.status(403).json({ message: `@${username} does not match a pending Instagram handle in this campaign.` });
+      return res.status(403).json({ message: `Instagram account @${username} is not assigned to ${req.user.email || 'your account'} in this campaign.` });
     }
 
     const accountPayload = {

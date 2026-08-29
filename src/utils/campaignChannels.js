@@ -3,9 +3,22 @@ import CampaignChannel from '../models/CampaignChannel.js';
 import SocialAccount from '../models/SocialAccount.js';
 import User from '../models/User.js';
 
-export const normalizeChannelHandle = (value = '') => (
-  String(value).trim().replace(/^@/, '').toLowerCase()
-);
+export const normalizeChannelHandle = (value = '') => {
+  let str = String(value || '').trim().toLowerCase();
+  // Strip URL protocol and domain prefixes for YouTube, Instagram, Facebook, TikTok, Twitter/X
+  str = str.replace(/^https?:\/\/(www\.)?(youtube\.com|youtu\.be|instagram\.com|facebook\.com|tiktok\.com|twitter\.com|x\.com)\//i, '');
+  // Strip channel, c, user, or @ prefixes
+  str = str.replace(/^(channel\/|c\/|user\/|@)/i, '');
+  // Strip query parameters and trailing slashes
+  str = str.split('?')[0].replace(/\/+$/, '');
+  // Transliterate German umlauts & special characters
+  str = str.replace(/ä/g, 'ae').replace(/ö/g, 'oe').replace(/ü/g, 'ue').replace(/ß/g, 'ss');
+  return str;
+};
+
+export const toFuzzyHandleKey = (value = '') => {
+  return normalizeChannelHandle(value).replace(/[^a-z0-9]/g, '');
+};
 
 const idToString = (value) => value?._id?.toString?.() || value?.toString?.() || '';
 
@@ -13,14 +26,30 @@ const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const makeExactHandleRegex = (handle) => new RegExp(`^@?${escapeRegExp(handle)}$`, 'i');
 
-const accountMatchesHandle = (account, platform, normalizedHandle) => (
-  account?.platform === platform &&
-  [
-    normalizeChannelHandle(account.username),
-    normalizeChannelHandle(account.name),
-    normalizeChannelHandle(account.accountId),
-  ].includes(normalizedHandle)
-);
+export const accountMatchesHandle = (account, platform, normalizedHandle) => {
+  if (!account || account?.platform !== platform || !normalizedHandle) return false;
+
+  const targetNorm = normalizeChannelHandle(normalizedHandle);
+  const targetFuzzy = toFuzzyHandleKey(normalizedHandle);
+
+  const candidateValues = [
+    account.username,
+    account.name,
+    account.accountId,
+    account.displayName,
+  ].filter(Boolean);
+
+  return candidateValues.some((cand) => {
+    const candNorm = normalizeChannelHandle(cand);
+    const candFuzzy = toFuzzyHandleKey(cand);
+    if (!candNorm) return false;
+    return (
+      candNorm === targetNorm ||
+      (candFuzzy && candFuzzy === targetFuzzy) ||
+      (candNorm.length >= 4 && targetNorm.length >= 4 && (candNorm.includes(targetNorm) || targetNorm.includes(candNorm)))
+    );
+  });
+};
 
 const findMatchingAccount = (channel, accounts = []) => {
   const normalizedHandle = channel.normalizedHandle || normalizeChannelHandle(channel.requestedHandle || channel.handle);
@@ -333,38 +362,82 @@ export const resolveCampaignPublishingChannels = async (
   return resolvedChannels;
 };
 
-export const canAccountVerifyCampaign = async (campaignId, accountPayload) => {
+export const canAccountVerifyCampaign = async (campaignId, accountPayload, user = null) => {
   if (!campaignId || !accountPayload?.platform) return false;
 
   const campaign = await Campaign.findById(campaignId).select('channels status').lean();
   if (!campaign || campaign.status === 'archived') return false;
 
   const channels = await loadCampaignChannels(campaign, { persist: true });
-  return channels.some((channel) => (
+  const platformChannels = channels.filter((ch) => ch.platform === accountPayload.platform);
+  if (platformChannels.length === 0) return false;
+
+  // 1. Direct or fuzzy handle match
+  const hasHandleMatch = platformChannels.some((channel) => (
     accountMatchesHandle(
       accountPayload,
       channel.platform,
       channel.normalizedHandle || normalizeChannelHandle(channel.requestedHandle)
     )
   ));
+  if (hasHandleMatch) return true;
+
+  // 2. Assigned handler match (user connecting is explicitly assigned to a channel of this platform in this campaign)
+  if (user) {
+    const userEmail = String(user.email || '').trim().toLowerCase();
+    const userIdStr = idToString(user._id);
+    const isAssigned = platformChannels.some((channel) => {
+      const handlerEmail = String(channel.assignedHandlerEmail || '').trim().toLowerCase();
+      const handlerUserId = idToString(channel.assignedHandlerUserId);
+      return (userEmail && handlerEmail === userEmail) || (userIdStr && handlerUserId === userIdStr);
+    });
+    if (isAssigned) return true;
+  }
+
+  return false;
 };
 
 export const linkSocialAccountToCampaignChannels = async (campaignId, accountPayload) => {
   if (!campaignId || !accountPayload?._id || !accountPayload?.platform) return [];
 
   const channels = await CampaignChannel.find({ campaignId, platform: accountPayload.platform });
-  const matched = channels.filter((channel) => (
+
+  // 1. Try matching channels by existing linked socialAccountId or handle
+  let matched = channels.filter((channel) => (
+    (channel.socialAccountId && idToString(channel.socialAccountId) === idToString(accountPayload._id)) ||
     accountMatchesHandle(accountPayload, channel.platform, channel.normalizedHandle)
   ));
+
+  // 2. If no direct handle match was found, look for pending channels assigned to the connecting user
+  if (matched.length === 0 && (accountPayload.userId || accountPayload.userEmail)) {
+    const userEmail = String(accountPayload.userEmail || '').trim().toLowerCase();
+    const userIdStr = idToString(accountPayload.userId);
+
+    const assignedPending = channels.filter((channel) => {
+      const handlerEmail = String(channel.assignedHandlerEmail || '').trim().toLowerCase();
+      const handlerUserId = idToString(channel.assignedHandlerUserId);
+      const isPending = channel.status !== 'verified' || !channel.socialAccountId;
+      return isPending && ((userEmail && handlerEmail === userEmail) || (userIdStr && handlerUserId === userIdStr));
+    });
+
+    if (assignedPending.length > 0) {
+      matched = assignedPending;
+    }
+  }
 
   for (const channel of matched) {
     channel.socialAccountId = accountPayload._id;
     channel.status = accountPayload.isConnected === false ? 'disconnected' : 'verified';
     channel.verifiedAt = channel.status === 'verified' ? new Date() : null;
-    channel.verifiedByUserId = channel.status === 'verified' ? accountPayload.userId : null;
+    channel.verifiedByUserId = channel.status === 'verified' ? (accountPayload.userId || channel.verifiedByUserId || null) : null;
     if (channel.status === 'verified') {
-      channel.assignedHandlerUserId = accountPayload.userId || null;
+      channel.assignedHandlerUserId = accountPayload.userId || channel.assignedHandlerUserId || null;
       channel.assignedHandlerEmail = accountPayload.userEmail || channel.assignedHandlerEmail || '';
+      if (accountPayload.username || accountPayload.name) {
+        channel.displayName = accountPayload.name || channel.displayName || '';
+        channel.requestedHandle = accountPayload.username || accountPayload.name || channel.requestedHandle;
+        channel.normalizedHandle = normalizeChannelHandle(channel.requestedHandle);
+      }
     }
     await channel.save();
   }
