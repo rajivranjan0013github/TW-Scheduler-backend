@@ -15,7 +15,9 @@ import {
   createAssignments,
   deriveFallbackIntent,
   enrichCandidatesWithVisualContext,
+  extractQuotedCaptionTexts,
   findAmbiguousFolderNames,
+  generateCaptionsWithGemini,
   isDeterministicTaskPlan,
   mapStructuredMentionRoles,
   normalizeCurrentBoard,
@@ -620,11 +622,12 @@ router.post('/plan', planRateLimit, async (req, res) => {
       message: trimmedMessage,
       fallbackIntent,
     });
-
     let intent;
     if (isFastPath) {
       intent = {
         ...fallbackIntent,
+        status: 'ready',
+        clarifyingQuestion: '',
         assistantMessage: 'I prepared this plan according to your instruction.',
         planner: 'deterministic-fast-path',
       };
@@ -642,6 +645,16 @@ router.post('/plan', planRateLimit, async (req, res) => {
         signal: requestAbort.signal,
       });
       if (requestAbort.signal.aborted) return;
+    }
+
+    if (intent.status === 'needs_clarification' && intent.clarifyingQuestion) {
+      return res.status(200).json({
+        plan: null,
+        clarification: {
+          question: intent.clarifyingQuestion,
+          planner: intent.planner || 'gemini',
+        },
+      });
     }
 
     // Structured @ mentions are authoritative; Gemini may interpret prose but cannot redirect folders.
@@ -685,11 +698,29 @@ router.post('/plan', planRateLimit, async (req, res) => {
         && !intent.changedFields.includes('caption')
         ? { requested: false, captions: [], warning: '' }
         : resolveRequestedCaptions({
-            message: trimmedMessage,
-            captions: intent.captions,
-            changedFields: intent.changedFields,
-            targetCount: captionTargetCount,
-          });
+          message: trimmedMessage,
+          captions: intent.captions,
+          changedFields: intent.changedFields,
+          targetCount: captionTargetCount,
+        });
+      if (captionResolution.requested && extractQuotedCaptionTexts(trimmedMessage).length === 0) {
+        const creativeCaptions = await generateCaptionsWithGemini({
+          apiKey: process.env.GEMINI_API_KEY,
+          message: trimmedMessage,
+          targetCount: captionTargetCount,
+          conversation,
+          signal: requestAbort.signal,
+        });
+        if (requestAbort.signal.aborted) return;
+        if (creativeCaptions.captions.length > 0) {
+          captionResolution.captions = creativeCaptions.captions;
+          captionResolution.usedFallback = false;
+          captionResolution.warning = '';
+          intent.captionWriter = creativeCaptions.model;
+        } else if (creativeCaptions.warning) {
+          captionResolution.warning = creativeCaptions.warning;
+        }
+      }
       if (captionResolution.requested) {
         intent.captions = captionResolution.captions;
         intent.captionWarning = captionResolution.warning;
