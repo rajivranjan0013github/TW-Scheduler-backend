@@ -26,6 +26,8 @@ import {
   planWithGemini,
   resolveAudioFolderSelection,
   resolveDefaultAudioFolder,
+  resolveDefaultPrimaryFolder,
+  resolveDefaultSecondaryFolder,
   resolveRequestedCaptions,
   shouldGenerateCreativeCaptions,
 } from '../src/services/bulkAgentService.js';
@@ -690,11 +692,11 @@ test('an empty-board folder prompt compiles creation before new-frame media task
   });
 
   assert.deepEqual(tasks.map((task) => task.type), [
-    'createFrames', 'setFirstVideo', 'setSecondVideo',
+    'createFrames', 'setFirstVideo', 'setSecondVideo', 'addTextOverlay',
   ]);
   assert.equal(tasks[0].params.count, 10);
   assert.deepEqual(tasks.slice(1).map((task) => task.target), [
-    { scope: 'newFrames' }, { scope: 'newFrames' },
+    { scope: 'newFrames' }, { scope: 'newFrames' }, { scope: 'newFrames' },
   ]);
   assert.ok(tasks.slice(1).every((task) => task.dependsOn.includes(tasks[0].id)));
 });
@@ -1331,3 +1333,214 @@ test('creative caption writer rejects duplicate or incomplete model output', asy
   assert.deepEqual(result.captions, []);
   assert.match(result.warning, /Creative caption fallback/);
 });
+
+test('creative caption writer integrates campaign product and showcase feature context', async () => {
+  let capturedData;
+  const campaignContext = {
+    productName: 'Penguin App',
+    productSummary: 'AI design and social media scheduler',
+    showcaseLearning: {
+      featuresShown: ['Auto-schedule viral posts', 'Canva template remixer'],
+      strongestMoments: ['One-click bulk export'],
+    },
+    creativeBlueprints: [
+      { hook: 'Stop wasting hours creating reels manually', appFeature: 'Auto scheduler' },
+    ],
+  };
+
+  const result = await generateCaptionsWithGemini({
+    apiKey: 'test-key',
+    message: 'in the hook + app show case format generate me variation for the app promo',
+    targetCount: 2,
+    campaignContext,
+    fetchImpl: async (_url, options) => {
+      const body = JSON.parse(options.body);
+      capturedData = JSON.parse(body.contents[0].parts[0].text);
+      return {
+        ok: true,
+        json: async () => ({
+          candidates: [{ content: { parts: [{ text: JSON.stringify({
+            captions: ['Stop creating reels manually', 'Remix Canva templates in seconds'],
+          }) }] } }],
+        }),
+      };
+    },
+  });
+
+  assert.equal(result.captions.length, 2);
+  assert.equal(capturedData.campaignProduct?.productName, 'Penguin App');
+  assert.deepEqual(capturedData.campaignProduct?.showcaseFeatures, ['Auto-schedule viral posts', 'Canva template remixer']);
+  assert.equal(capturedData.campaignProduct?.blueprints?.[0]?.hookDirection, 'Stop wasting hours creating reels manually');
+});
+
+test('resolveDefaultPrimaryFolder resolves Hooks folder and prefers root folder for recursive nested subfolders', () => {
+  const nestedCampaignFolders = [
+    { _id: 'folder-gen', name: 'Generated', tags: ['generated'], typeCounts: { video: 5 } },
+    { _id: 'folder-hooks-root', name: 'Hooks', tags: ['hooks'], parentFolderId: null, typeCounts: { video: 20 } },
+    { _id: 'folder-hooks-sub1', name: 'rayanahh first', tags: ['hooks'], parentFolderId: 'folder-hooks-root', typeCounts: { video: 10 } },
+    { _id: 'folder-showcase', name: 'App Showcase', tags: ['app-showcase', 'promo'], typeCounts: { video: 6 } },
+  ];
+
+  const primary = resolveDefaultPrimaryFolder(nestedCampaignFolders);
+  assert.equal(primary._id, 'folder-hooks-root');
+});
+
+test('resolveDefaultSecondaryFolder resolves App Showcase folder for video2 in dual mode', () => {
+  const campaignFolders = [
+    { _id: 'folder-hooks-root', name: 'Hooks', tags: ['hooks'], typeCounts: { video: 20 } },
+    { _id: 'folder-showcase', name: 'App Showcase', tags: ['app-showcase', 'promo'], typeCounts: { video: 6 } },
+    { _id: 'folder-audio', name: 'Trending songs', tags: ['audio', 'trending'], typeCounts: { audio: 10 } },
+  ];
+
+  const secondary = resolveDefaultSecondaryFolder(campaignFolders, 'folder-hooks-root');
+  assert.equal(secondary._id, 'folder-showcase');
+});
+
+test('compileDeterministicTasks automatically assigns Hooks and App Showcase when creating frames without explicit folder mentions', () => {
+  const campaignFolders = [
+    { _id: 'folder-hooks', name: 'Hooks', tags: ['hooks'], typeCounts: { video: 20 } },
+    { _id: 'folder-showcase', name: 'App Showcase', tags: ['app-showcase', 'promo'], typeCounts: { video: 6 } },
+    { _id: 'folder-audio', name: 'Trending songs', tags: ['audio', 'trending'], scope: 'global', typeCounts: { audio: 10 } },
+  ];
+
+  const tasks = compileDeterministicTasks({
+    message: 'create 5 videos with upbeat music',
+    folders: campaignFolders,
+    isDualVideo: true,
+    currentBoard: { rows: [] },
+  });
+
+  assert.deepEqual(tasks.map((t) => ({ type: t.type, folderId: t.params?.folderId, count: t.params?.count })), [
+    { type: 'createFrames', folderId: undefined, count: 5 },
+    { type: 'setFirstVideo', folderId: 'folder-hooks', count: undefined },
+    { type: 'setSecondVideo', folderId: 'folder-showcase', count: undefined },
+    { type: 'setAudio', folderId: 'folder-audio', count: undefined },
+    { type: 'addTextOverlay', folderId: undefined, count: undefined },
+  ]);
+});
+
+test('compileDeterministicTasks handles typo-heavy variation prompts on a board with 1 empty draft row and defaults to 10 frames with Hooks in V1 and App Showcase in V2', () => {
+  const campaignFolders = [
+    { _id: 'folder-hooks', name: 'Hooks', tags: ['hooks'], typeCounts: { video: 20 } },
+    { _id: 'folder-showcase', name: 'App Showcase', tags: ['app-showcase', 'promo'], typeCounts: { video: 6 } },
+  ];
+
+  const tasks = compileDeterministicTasks({
+    message: 'in the hook + app show case format genrate me vairaion for the app promo',
+    folders: campaignFolders,
+    isDualVideo: true,
+    currentBoard: { rows: [{ rowId: 'row-1', video1MediaId: '', video2MediaId: '', caption: '' }] },
+  });
+
+  assert.deepEqual(tasks.map((t) => ({ type: t.type, folderId: t.params?.folderId, count: t.params?.count })), [
+    { type: 'createFrames', folderId: undefined, count: 10 },
+    { type: 'setFirstVideo', folderId: 'folder-hooks', count: undefined },
+    { type: 'setSecondVideo', folderId: 'folder-showcase', count: undefined },
+    { type: 'addTextOverlay', folderId: undefined, count: undefined },
+  ]);
+});
+
+test('compileDeterministicTasks handles caption-only update prompt on populated board without creating frames or touching video slots', () => {
+  const campaignFolders = [
+    { _id: 'folder-hooks', name: 'Hooks', tags: ['hooks'], typeCounts: { video: 20 } },
+    { _id: 'folder-showcase', name: 'App Showcase', tags: ['app-showcase', 'promo'], typeCounts: { video: 6 } },
+  ];
+
+  const populatedBoard = {
+    rows: Array.from({ length: 10 }, (_, i) => ({
+      rowId: `row-${i + 1}`,
+      video1MediaId: `v1-${i + 1}`,
+      video2MediaId: `v2-${i + 1}`,
+      caption: `Old caption ${i + 1}`,
+    })),
+  };
+
+  const tasks = compileDeterministicTasks({
+    message: 'find better and big captions ok no app name shocase ok',
+    folders: campaignFolders,
+    isDualVideo: true,
+    currentBoard: populatedBoard,
+  });
+
+  // Must only update text overlays on existing frames, not create frames or re-source videos!
+  assert.deepEqual(tasks.map((t) => ({ type: t.type, scope: t.target?.scope })), [
+    { type: 'addTextOverlay', scope: 'allCaptions' },
+  ]);
+});
+
+test('deriveTextOverlayIntent keeps caption centered when prompts contain words like "right now" or "all right"', () => {
+  const intent1 = deriveTextOverlayIntent('write viral captions watch right now');
+  assert.equal(intent1.overlays[0].position.preset, 'center');
+
+  const intent2 = deriveTextOverlayIntent('find better captions ok no app name showcase ok right away');
+  assert.equal(intent2.overlays[0].position.preset, 'center');
+
+  // Only explicit placement phrases should change preset
+  const intent3 = deriveTextOverlayIntent('place text on the right side');
+  assert.equal(intent3.overlays[0].position.preset, 'right');
+});
+
+test('compileDeterministicTasks correctly recognizes "genrate another variaiton of the captions i dont like this" as an in-place caption update', () => {
+  const campaignFolders = [
+    { _id: 'folder-hooks', name: 'Hooks', tags: ['hooks'], typeCounts: { video: 20 } },
+    { _id: 'folder-showcase', name: 'App Showcase', tags: ['app-showcase', 'promo'], typeCounts: { video: 6 } },
+  ];
+
+  const populatedBoard = {
+    rows: Array.from({ length: 10 }, (_, i) => ({
+      rowId: `row-${i + 1}`,
+      video1MediaId: `v1-${i + 1}`,
+      video2MediaId: `v2-${i + 1}`,
+      caption: `Old caption ${i + 1}`,
+    })),
+  };
+
+  const tasks = compileDeterministicTasks({
+    message: 'genrate another variaiton of the captions i dont like this',
+    folders: campaignFolders,
+    isDualVideo: true,
+    currentBoard: populatedBoard,
+  });
+
+  assert.deepEqual(tasks.map((t) => ({ type: t.type, scope: t.target?.scope })), [
+    { type: 'addTextOverlay', scope: 'allCaptions' },
+  ]);
+});
+
+test('createAssignments correctly updates existing row captions when given fresh captions array and addTextOverlay task', () => {
+  const targetRows = [
+    { rowId: 'row-1', caption: 'Old caption 1', textOverlays: [{ id: 'o-1', text: 'Old caption 1' }] },
+    { rowId: 'row-2', caption: 'Old caption 2', textOverlays: [{ id: 'o-2', text: 'Old caption 2' }] },
+  ];
+
+  const freshCaptions = [
+    'Brand new story hook variation 1',
+    'Brand new story hook variation 2',
+  ];
+
+  const tasks = [
+    {
+      id: 'task-1',
+      type: 'addTextOverlay',
+      target: { scope: 'allCaptions' },
+      params: { text: '', overlays: [] },
+    },
+  ];
+
+  const result = createAssignments({
+    frameCount: 2,
+    captions: freshCaptions,
+    operation: 'update',
+    changedFields: ['caption', 'textOverlays'],
+    targetRows,
+    tasks,
+  });
+
+  assert.equal(result.assignments[0].caption, 'Brand new story hook variation 1');
+  assert.equal(result.assignments[0].textOverlays[0].text, 'Brand new story hook variation 1');
+  assert.equal(result.assignments[1].caption, 'Brand new story hook variation 2');
+  assert.equal(result.assignments[1].textOverlays[0].text, 'Brand new story hook variation 2');
+});
+
+
+

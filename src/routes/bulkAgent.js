@@ -25,6 +25,8 @@ import {
   normalizeStructuredMentions,
   planWithGemini,
   resolveAudioFolderSelection,
+  resolveDefaultPrimaryFolder,
+  resolveDefaultSecondaryFolder,
   resolveRequestedCaptions,
   summarizeAssignments,
 } from '../services/bulkAgentService.js';
@@ -112,7 +114,7 @@ const requireAccessibleCampaign = async ({ req, campaignId, isConnected }) => {
   const campaign = await Campaign.findOne({
     _id: campaignId,
     ...getCampaignAccessQuery(req.user),
-  }).select('_id name').lean();
+  }).select('_id name productName productSummary productDescription coreFunction useCases targetAudienceList showcaseLearning creativeBlueprints').lean();
   if (!campaign) {
     const error = new Error('Campaign not found or you do not have access to it.');
     error.statusCode = 404;
@@ -704,10 +706,24 @@ router.post('/plan', planRateLimit, async (req, res) => {
           targetCount: captionTargetCount,
         });
       if (captionResolution.requested && extractQuotedCaptionTexts(trimmedMessage).length === 0) {
+        const showcaseEvidence = isConnected
+          ? await Media.find({
+              campaignId: campaign._id,
+              type: 'video',
+              aiStatus: 'completed',
+            })
+            .select('name aiAnalysis')
+            .limit(10)
+            .lean()
+          : [];
         const creativeCaptions = await generateCaptionsWithGemini({
           apiKey: process.env.GEMINI_API_KEY,
           message: trimmedMessage,
           targetCount: captionTargetCount,
+          campaignContext: {
+            ...campaign,
+            showcaseEvidence,
+          },
           conversation,
           signal: requestAbort.signal,
         });
@@ -786,11 +802,16 @@ router.post('/plan', planRateLimit, async (req, res) => {
       });
     }
 
+    const defaultPrimary = resolveDefaultPrimaryFolder(foldersForPlanner || folders);
+    const defaultPrimaryId = normalizeId(defaultPrimary);
+    const defaultSecondary = resolveDefaultSecondaryFolder(foldersForPlanner || folders, mentionRoles.primaryFolderId || intent.primaryFolderId || defaultPrimaryId);
+    const defaultSecondaryId = normalizeId(defaultSecondary);
+
     const primaryResult = needsPrimary
       ? await resolveStrictFolderMedia({
           candidateIds: preferFallbackName
-            ? [fallbackIntent.primaryFolderId]
-            : [mentionRoles.primaryFolderId, intent.primaryFolderId],
+            ? [fallbackIntent.primaryFolderId, defaultPrimaryId]
+            : [mentionRoles.primaryFolderId, intent.primaryFolderId, fallbackIntent.primaryFolderId, defaultPrimaryId],
           allowedFolderIds: restrictedIds,
           folders,
           campaignId: campaign._id,
@@ -806,8 +827,8 @@ router.post('/plan', planRateLimit, async (req, res) => {
     const secondaryResult = needsSecondary
       ? await resolveStrictFolderMedia({
           candidateIds: preferFallbackName
-            ? [fallbackIntent.secondaryFolderId, fallbackIntent.primaryFolderId]
-            : [mentionRoles.secondaryFolderId, mentionRoles.primaryFolderId, intent.secondaryFolderId],
+            ? [fallbackIntent.secondaryFolderId, defaultSecondaryId, fallbackIntent.primaryFolderId, defaultPrimaryId]
+            : [mentionRoles.secondaryFolderId, intent.secondaryFolderId, fallbackIntent.secondaryFolderId, defaultSecondaryId, mentionRoles.primaryFolderId, intent.primaryFolderId, fallbackIntent.primaryFolderId, defaultPrimaryId],
           allowedFolderIds: restrictedIds,
           folders,
           campaignId: campaign._id,

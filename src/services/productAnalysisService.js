@@ -232,7 +232,7 @@ export const extractAppStoreData = async (url) => {
 
   // Fallback to web page scrape for App Store
   const fetched = await fetchProductPage(url, 'app_store');
-  const details = extractPageDetails(fetched.html, fetched.finalUrl);
+  const details = extractPageDetails(fetched.html, fetched.finalUrl, { preferSocialImage: true });
   return {
     productSource: 'app_store',
     productUrl: fetched.finalUrl,
@@ -256,24 +256,34 @@ export const extractPlayStoreData = async (url) => {
   const html = fetched.html;
   let jsonLdData = null;
 
-  // Try to parse Schema.org JSON-LD
-  const jsonLdMatch = html.match(/<script type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/i);
-  if (jsonLdMatch) {
+  // Google can expose the application as a standalone JSON-LD object, an
+  // array entry, or a node inside @graph. Inspect every JSON-LD block.
+  const jsonLdMatches = [...html.matchAll(/<script type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+  for (const jsonLdMatch of jsonLdMatches) {
     try {
       const parsed = JSON.parse(jsonLdMatch[1]);
-      if (parsed && (parsed['@type'] === 'SoftwareApplication' || parsed.name)) {
-        jsonLdData = parsed;
+      const candidates = [
+        ...(Array.isArray(parsed) ? parsed : [parsed]),
+        ...(Array.isArray(parsed?.['@graph']) ? parsed['@graph'] : []),
+      ].filter(Boolean);
+      const application = candidates.find((item) => {
+        const types = Array.isArray(item?.['@type']) ? item['@type'] : [item?.['@type']];
+        return types.some((type) => /SoftwareApplication|MobileApplication/i.test(String(type || '')));
+      }) || candidates.find((item) => item?.name && item?.image);
+      if (application) {
+        jsonLdData = application;
+        break;
       }
-    } catch (e) {
+    } catch {
       // ignore json parse error
     }
   }
 
-  const details = extractPageDetails(html, fetched.finalUrl);
+  const details = extractPageDetails(html, fetched.finalUrl, { preferSocialImage: true });
   const productName = normalizeWhitespace(jsonLdData?.name || details.productName || '')
     .replace(/\s+[-–|]\s+(Apps on Google Play|Google Play).*$/i, '');
   const productDescription = normalizeWhitespace(jsonLdData?.description || details.description || '');
-  const iconUrl = jsonLdData?.image || details.iconUrl || '';
+  const iconUrl = normalizeProductImageUrl(jsonLdData?.image || details.iconUrl, fetched.finalUrl);
   const category = jsonLdData?.applicationCategory || 'Mobile App';
 
   return {
@@ -308,12 +318,51 @@ const getMetaContent = (html, keys) => {
   return '';
 };
 
-const extractPageDetails = (html, finalUrl) => {
+const getLinkHref = (html, relNames) => {
+  for (const relName of relNames) {
+    const escaped = relName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const patterns = [
+      new RegExp(`<link[^>]+rel=["'][^"']*${escaped}[^"']*["'][^>]+href="([^"]+)"[^>]*>`, 'i'),
+      new RegExp(`<link[^>]+rel=["'][^"']*${escaped}[^"']*["'][^>]+href='([^']+)'[^>]*>`, 'i'),
+      new RegExp(`<link[^>]+href="([^"]+)"[^>]+rel=["'][^"']*${escaped}[^"']*["'][^>]*>`, 'i'),
+      new RegExp(`<link[^>]+href='([^']+)'[^>]+rel=["'][^"']*${escaped}[^"']*["'][^>]*>`, 'i'),
+    ];
+    for (const pattern of patterns) {
+      const match = html.match(pattern);
+      if (match?.[1]) return normalizeWhitespace(match[1]);
+    }
+  }
+  return '';
+};
+
+export const normalizeProductImageUrl = (value, baseUrl = '') => {
+  let candidate = value;
+  if (Array.isArray(candidate)) candidate = candidate.find(Boolean);
+  if (candidate && typeof candidate === 'object') {
+    candidate = candidate.url || candidate.contentUrl || candidate.thumbnailUrl || '';
+  }
+  candidate = normalizeWhitespace(candidate || '');
+  if (!candidate) return '';
+
+  try {
+    const resolved = new URL(candidate, baseUrl || undefined);
+    return ['http:', 'https:'].includes(resolved.protocol) ? resolved.toString() : '';
+  } catch {
+    return '';
+  }
+};
+
+const extractPageDetails = (html, finalUrl, { preferSocialImage = false } = {}) => {
   const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   const rawTitle = getMetaContent(html, ['og:title', 'twitter:title'])
     || normalizeWhitespace(titleMatch?.[1] || '');
   const description = getMetaContent(html, ['og:description', 'description', 'twitter:description']);
-  const iconUrl = getMetaContent(html, ['og:image', 'twitter:image', 'apple-touch-icon']);
+  const linkedIcon = getLinkHref(html, ['apple-touch-icon', 'icon']);
+  const socialImage = getMetaContent(html, ['og:image', 'twitter:image', 'image']);
+  const iconCandidate = preferSocialImage
+    ? (socialImage || linkedIcon)
+    : (linkedIcon || socialImage);
+  const iconUrl = normalizeProductImageUrl(iconCandidate, finalUrl);
   const productName = rawTitle
     .replace(/\s+[-–|]\s+(App Store|Apps on Google Play|Google Play).*$/i, '')
     .replace(/\s+on the App Store.*$/i, '')
@@ -493,11 +542,11 @@ ${(rawData.productDescription || rawData.pageText || '').slice(0, 4000)}
 
 CRITICAL INSTRUCTIONS:
 1. Deeply understand the EXACT category and real-world utility of this app (e.g. Medical Diagnosis, Couples Relationship, Language Learning, Productivity, Fitness, Gaming, etc.).
-2. Under "marketingStrategies", talk SPECIFICALLY about 4 short-form video formats and carousel formats tailored to this exact app. Do NOT provide generic PR, email newsletter, or influencer partnership advice.
+2. Under "marketingStrategies", talk SPECIFICALLY about short-form video formats tailored to this exact app, prioritizing high-converting hook + app showcase formulas:
+   - [Influencer Reaction + Showcase]: 0-2s creator shocked/relatable facecam reaction hook -> 3-7s live screen recording demonstrating the killer app feature -> clear CTA.
    - [Split-Screen Video]: Name the exact app screen / UI action to show on Top 60% with satisfying kinetic/gameplay footage on Bottom 40%.
+   - [7s Feature Teardown]: Specific 7-second fast cut showcasing the standout feature with trending sound.
    - [5-Slide Swipe Carousel]: Specific multi-slide breakdown (Slide 1 Hook meme -> Slides 2-4 App solution screenshots -> Slide 5 Download CTA).
-   - [7s Feature Teardown]: Specific 7-second cut naming the standout feature with trending sound.
-   - [Relatable POV Reel]: Realistic category-specific POV text hook and UI walkthrough.
 3. Under "useCases", provide 4 practical, authentic everyday situations where people use this app. Do NOT use generic "Goal-based" filler.
 
 Return JSON in this exact shape:
@@ -515,10 +564,10 @@ Return JSON in this exact shape:
     "4 specific personas/demographics who download this app"
   ],
   "marketingStrategies": [
+    "[Influencer Reaction + Showcase] 0-2s shocked creator reaction hook -> 3-7s live screen demo of [exact killer feature] -> App Store CTA",
     "[Split-Screen Video] Top 60% [exact app UI action] + Bottom 40% satisfying kinetic gameplay",
-    "[5-Slide Carousel] Slide 1: [Pain-point hook] -> Slides 2-4: [App solution screenshots] -> Slide 5: App Store CTA",
     "[7s Feature Teardown] 7-second fast cut showcasing [exact killer feature] with trending audio",
-    "[Relatable POV Reel] Hook: 'POV: You finally found an app made for [specific outcome]' with UI flow"
+    "[5-Slide Carousel] Slide 1: [Pain-point hook] -> Slides 2-4: [App solution screenshots] -> Slide 5: App Store CTA"
   ],
   "keyMessaging": [
     "4 punchy, viral 3-second hook quotes (enclosed in quotation marks)"

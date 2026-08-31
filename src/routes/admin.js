@@ -1596,6 +1596,16 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
       promoFolderId,
       accountIds,
       channels,
+      category,
+      iconUrl,
+      keyBenefit,
+      coreFunction,
+      useCases,
+      targetAudienceList,
+      marketingStrategies,
+      keyMessaging,
+      positioningStatement,
+      screenshots,
     } = req.body;
 
     if (name !== undefined) {
@@ -1612,6 +1622,16 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
     if (productWebsite !== undefined) campaign.productWebsite = productWebsite;
     else if (productUrl !== undefined && (productSource || campaign.productSource) === 'website') campaign.productWebsite = productUrl;
     if (productDescription !== undefined) campaign.productDescription = productDescription;
+    if (category !== undefined) campaign.category = category;
+    if (iconUrl !== undefined) campaign.iconUrl = iconUrl;
+    if (keyBenefit !== undefined) campaign.keyBenefit = keyBenefit;
+    if (coreFunction !== undefined) campaign.coreFunction = coreFunction;
+    if (Array.isArray(useCases)) campaign.useCases = useCases;
+    if (Array.isArray(targetAudienceList)) campaign.targetAudienceList = targetAudienceList;
+    if (Array.isArray(marketingStrategies)) campaign.marketingStrategies = marketingStrategies;
+    if (Array.isArray(keyMessaging)) campaign.keyMessaging = keyMessaging;
+    if (positioningStatement !== undefined) campaign.positioningStatement = positioningStatement;
+    if (Array.isArray(screenshots)) campaign.screenshots = screenshots;
     if (targetAudience !== undefined) campaign.targetAudience = targetAudience;
     if (primaryGoal !== undefined) campaign.primaryGoal = primaryGoal;
     if (mainEmail !== undefined) campaign.mainEmail = mainEmail.trim().toLowerCase();

@@ -591,6 +591,7 @@ router.patch('/campaigns/:id', protect, async (req, res) => {
       keyMessaging,
       positioningStatement,
       screenshots,
+      showcaseMediaIds,
       primaryGoal,
       mainEmail,
     } = req.body;
@@ -620,6 +621,23 @@ router.patch('/campaigns/:id', protect, async (req, res) => {
     if (keyMessaging !== undefined && Array.isArray(keyMessaging)) campaign.keyMessaging = keyMessaging;
     if (positioningStatement !== undefined) campaign.positioningStatement = positioningStatement;
     if (screenshots !== undefined && Array.isArray(screenshots)) campaign.screenshots = screenshots;
+    if (showcaseMediaIds !== undefined && Array.isArray(showcaseMediaIds)) {
+      campaign.showcaseMediaIds = showcaseMediaIds;
+      if (showcaseMediaIds.length > 0) {
+        const folderMap = await ensureDefaultCampaignFolders(campaign._id, req.user?._id);
+        const showcaseFolderId = campaign.promoFolderId || folderMap?.['App Showcase']?._id;
+        if (showcaseFolderId) {
+          await Media.updateMany(
+            {
+              _id: { $in: showcaseMediaIds },
+              campaignId: campaign._id,
+              folderId: null,
+            },
+            { $set: { folderId: showcaseFolderId } }
+          );
+        }
+      }
+    }
     if (primaryGoal !== undefined) campaign.primaryGoal = primaryGoal;
     if (mainEmail !== undefined && isPrivileged) {
       campaign.mainEmail = mainEmail.trim().toLowerCase();

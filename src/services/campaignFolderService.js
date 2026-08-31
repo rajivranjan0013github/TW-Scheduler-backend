@@ -1,5 +1,6 @@
 import Folder from '../models/Folder.js';
 import Campaign from '../models/Campaign.js';
+import Media from '../models/Media.js';
 
 export const DEFAULT_CAMPAIGN_FOLDERS = [
   {
@@ -99,6 +100,28 @@ export const ensureDefaultCampaignFolders = async (campaignId, userId = null, op
     if (!campaign.promoFolderId && folderMap['App Showcase']) {
       campaign.promoFolderId = folderMap['App Showcase']._id;
       await campaign.save();
+    }
+
+    // Auto-organize unassigned showcase media into App Showcase folder
+    if (folderMap['App Showcase']) {
+      const showcaseFolderId = folderMap['App Showcase']._id;
+      const showcaseMediaIds = Array.isArray(campaign.showcaseMediaIds)
+        ? campaign.showcaseMediaIds.filter(Boolean)
+        : [];
+      const orphanOrConditions = [
+        { tags: { $in: ['app-showcase', 'showcase'] } },
+      ];
+      if (showcaseMediaIds.length > 0) {
+        orphanOrConditions.push({ _id: { $in: showcaseMediaIds } });
+      }
+      await Media.updateMany(
+        {
+          campaignId: campaign._id,
+          folderId: null,
+          $or: orphanOrConditions,
+        },
+        { $set: { folderId: showcaseFolderId } }
+      );
     }
 
     return folderMap;

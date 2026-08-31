@@ -1,5 +1,28 @@
 import mongoose from 'mongoose';
 
+const CreativeBlueprintSchema = new mongoose.Schema({
+  title: { type: String, default: '', trim: true },
+  hook: {
+    visual: { type: String, default: '', trim: true },
+    direction: { type: String, default: '', trim: true },
+    duration: { type: String, default: '0-2s', trim: true },
+  },
+  overlay: {
+    text: { type: String, default: '', trim: true },
+    duration: { type: String, default: '0-3s', trim: true },
+    placement: { type: String, default: 'upper-third', trim: true },
+  },
+  showcase: {
+    mediaId: { type: mongoose.Schema.Types.ObjectId, ref: 'Media', default: null },
+    feature: { type: String, default: '', trim: true },
+    direction: { type: String, default: '', trim: true },
+    startTime: { type: String, default: '', trim: true },
+    endTime: { type: String, default: '', trim: true },
+  },
+  cta: { type: String, default: '', trim: true },
+  rationale: { type: String, default: '', trim: true },
+}, { _id: true });
+
 const CampaignSchema = new mongoose.Schema({
   name: {
     type: String,
@@ -86,6 +109,32 @@ const CampaignSchema = new mongoose.Schema({
     type: String,
     trim: true,
   }],
+  showcaseMediaIds: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Media',
+  }],
+  showcaseLearning: {
+    summary: { type: String, default: '', trim: true },
+    featuresShown: [{ type: String, trim: true }],
+    strongestMoments: [{ type: String, trim: true }],
+    audienceFit: { type: String, default: '', trim: true },
+    coverageGaps: [{ type: String, trim: true }],
+    generatedAt: { type: Date, default: null },
+  },
+  creativeBlueprints: {
+    type: [CreativeBlueprintSchema],
+    default: [],
+  },
+  strategyStatus: {
+    type: String,
+    enum: ['none', 'generating', 'completed', 'failed'],
+    default: 'none',
+  },
+  strategyError: {
+    type: String,
+    default: '',
+    trim: true,
+  },
   primaryGoal: {
     type: String,
     default: '',
