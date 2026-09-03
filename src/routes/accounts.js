@@ -3,6 +3,7 @@ import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import SocialAccount from '../models/SocialAccount.js';
 import Campaign from '../models/Campaign.js';
+import User from '../models/User.js';
 import Insight from '../models/Insight.js';
 import PublishedPost from '../models/PublishedPost.js';
 import PostInsight from '../models/PostInsight.js';
@@ -26,6 +27,7 @@ import CampaignChannel from '../models/CampaignChannel.js';
 import MetricSyncStatus from '../models/MetricSyncStatus.js';
 import { requestAccountSync } from '../queues/publisherQueue.js';
 import { ensureDefaultCampaignFolders } from '../services/campaignFolderService.js';
+import { getCreatorAnalytics } from '../services/creatorAnalyticsService.js';
 
 const router = express.Router();
 const insightSkipCache = new Map();
@@ -488,6 +490,159 @@ router.get('/publishing-channels', protect, resolveHandlerPreview, async (req, r
     res.status(200).json(channels);
   } catch (error) {
     res.status(error.statusCode || 500).json({ message: error.message });
+  }
+});
+
+// @desc    Add or assign a channel to a campaign
+// @route   POST /api/accounts/campaign-channels
+// @access  Private
+router.post('/campaign-channels', protect, resolveHandlerPreview, async (req, res) => {
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      return res.status(503).json({ message: 'Database disconnected.' });
+    }
+    const { campaignId, platform, requestedHandle, assignedHandlerEmail = '' } = req.body;
+    if (!campaignId || !platform || !requestedHandle) {
+      return res.status(400).json({ message: 'campaignId, platform, and requestedHandle are required.' });
+    }
+    const allowed = await canAccessCampaign(req, campaignId);
+    if (!allowed) {
+      return res.status(403).json({ message: 'Campaign access denied.' });
+    }
+    const campaign = await Campaign.findById(campaignId);
+    if (!campaign || campaign.status === 'archived') {
+      return res.status(404).json({ message: 'Campaign not found.' });
+    }
+    const normalized = normalizeChannelHandle(requestedHandle);
+    let assignedUser = null;
+    if (assignedHandlerEmail) {
+      assignedUser = await User.findOne({ email: assignedHandlerEmail.trim().toLowerCase() }).select('_id').lean();
+    }
+    const matchingAccount = await SocialAccount.findOne({
+      platform,
+      isConnected: { $ne: false },
+      $or: [
+        { username: new RegExp(`^@?${normalized}$`, 'i') },
+        { name: new RegExp(`^@?${normalized}$`, 'i') },
+        { accountId: new RegExp(`^@?${normalized}$`, 'i') },
+      ],
+    }).lean();
+
+    const channel = await CampaignChannel.findOneAndUpdate(
+      { campaignId, platform, normalizedHandle: normalized },
+      {
+        campaignId,
+        platform,
+        requestedHandle: requestedHandle.trim(),
+        normalizedHandle: normalized,
+        displayName: matchingAccount?.name || '',
+        socialAccountId: matchingAccount?._id || null,
+        status: matchingAccount ? 'verified' : 'pending_verification',
+        assignedHandlerEmail: assignedHandlerEmail.trim().toLowerCase(),
+        assignedHandlerUserId: assignedUser?._id || null,
+        addedByUserId: req.user._id,
+        verifiedAt: matchingAccount ? new Date() : null,
+        verifiedByUserId: matchingAccount ? req.user._id : null,
+      },
+      { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
+    );
+
+    const channels = await resolveCampaignPublishingChannels(campaign, { persist: true });
+    return res.status(200).json({ channel, channels });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ message: error.message });
+  }
+});
+
+// @desc    Remove an assigned channel from a campaign
+// @route   DELETE /api/accounts/campaign-channels/:id
+// @access  Private
+router.delete('/campaign-channels/:id', protect, resolveHandlerPreview, async (req, res) => {
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      return res.status(503).json({ message: 'Database disconnected.' });
+    }
+    let channel = await CampaignChannel.findById(req.params.id);
+    if (!channel) {
+      channel = await CampaignChannel.findOne({ socialAccountId: req.params.id });
+    }
+    if (!channel) {
+      return res.status(404).json({ message: 'Channel not found.' });
+    }
+    const allowed = await canAccessCampaign(req, channel.campaignId);
+    if (!allowed) {
+      return res.status(403).json({ message: 'Campaign access denied.' });
+    }
+    await CampaignChannel.deleteOne({ _id: channel._id });
+    const campaign = await Campaign.findById(channel.campaignId);
+    const channels = await resolveCampaignPublishingChannels(campaign, { persist: true });
+    return res.status(200).json({ success: true, channels });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ message: error.message });
+  }
+});
+
+// @desc    Link or unlink an existing SocialAccount to/from a campaign
+// @route   POST /api/accounts/toggle-campaign-link
+// @access  Private
+router.post('/toggle-campaign-link', protect, resolveHandlerPreview, async (req, res) => {
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      return res.status(503).json({ message: 'Database disconnected.' });
+    }
+    const { campaignId, socialAccountId } = req.body;
+    if (!campaignId || !socialAccountId) {
+      return res.status(400).json({ message: 'campaignId and socialAccountId are required.' });
+    }
+    const allowed = await canAccessCampaign(req, campaignId);
+    if (!allowed) {
+      return res.status(403).json({ message: 'Campaign access denied.' });
+    }
+    const campaign = await Campaign.findById(campaignId);
+    if (!campaign || campaign.status === 'archived') {
+      return res.status(404).json({ message: 'Campaign not found.' });
+    }
+    const account = await SocialAccount.findById(socialAccountId);
+    if (!account) {
+      return res.status(404).json({ message: 'Social account not found.' });
+    }
+
+    const normHandle = normalizeChannelHandle(account.username || account.name || account.accountId);
+    const existing = await CampaignChannel.findOne({
+      campaignId,
+      $or: [
+        { socialAccountId: account._id },
+        { platform: account.platform, normalizedHandle: normHandle }
+      ]
+    });
+
+    if (existing) {
+      await CampaignChannel.deleteOne({ _id: existing._id });
+    } else {
+      const handle = account.username || account.name || account.accountId || 'channel';
+      await CampaignChannel.create({
+        campaignId,
+        platform: account.platform,
+        requestedHandle: handle,
+        normalizedHandle: normHandle,
+        displayName: account.name || account.displayName || '',
+        socialAccountId: account._id,
+        status: account.isConnected !== false ? 'verified' : 'disconnected',
+        addedByUserId: req.user._id,
+        assignedHandlerUserId: account.userId || req.user._id,
+        assignedHandlerEmail: req.user.email || '',
+        verifiedAt: new Date(),
+        verifiedByUserId: req.user._id,
+      });
+    }
+
+    const channels = await resolveCampaignPublishingChannels(campaign, { persist: true });
+    return res.status(200).json({ success: true, channels });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ message: error.message });
   }
 });
 
@@ -1966,6 +2121,29 @@ router.get('/:id/posts/:metaPostId/insights', protect, async (req, res) => {
   }
 });
 
+// @desc    Get analytics metrics for the authenticated creator/handler
+// @route   GET /api/accounts/creator/analytics
+// @access  Private (Creator/Handler)
+router.get('/creator/analytics', protect, resolveHandlerPreview, async (req, res) => {
+  try {
+    if (!getDBStatus()) {
+      return res.status(503).json({ message: 'Database disconnected. Analytics are unavailable.' });
+    }
+
+    const { campaignId, timeZone } = req.query;
+    const result = await getCreatorAnalytics({
+      user: req.user,
+      campaignId,
+      timeZone,
+    });
+
+    res.status(200).json(result);
+  } catch (error) {
+    console.error('Error fetching creator analytics:', error);
+    res.status(500).json({ message: error.message || 'Failed to fetch creator analytics.' });
+  }
+});
+
 // @desc    Get all campaigns where this creator's connected accounts match the campaign channels
 router.get('/creator/campaigns', protect, resolveHandlerPreview, async (req, res) => {
   try {
@@ -2023,6 +2201,27 @@ router.get('/creator/campaigns', protect, resolveHandlerPreview, async (req, res
       linkedSocialAccounts.map((account) => [String(account._id), account])
     );
 
+    const channelLookups = matchedChannelDocs
+      .map((channel) => ({
+        platform: channel.platform,
+        handle: normalizeChannelHandle(channel.requestedHandle || channel.handle),
+      }))
+      .filter(({ handle }) => Boolean(handle));
+
+    const handleMatchConditions = channelLookups.map(({ platform, handle }) => ({
+      platform,
+      $or: [
+        { username: { $regex: new RegExp(`^@?${handle}$`, 'i') } },
+        { name: { $regex: new RegExp(`^@?${handle}$`, 'i') } },
+      ],
+    }));
+
+    const fallbackSocialAccounts = handleMatchConditions.length > 0
+      ? await SocialAccount.find({ $or: handleMatchConditions })
+          .select('_id platform username name avatarUrl isConnected')
+          .lean()
+      : [];
+
     const matchedCampaignIds = [...new Set(matchedChannelDocs.map((channel) => String(channel.campaignId)))];
     const matchedCampaigns = await Campaign.find({
       _id: { $in: matchedCampaignIds },
@@ -2050,10 +2249,15 @@ router.get('/creator/campaigns', protect, resolveHandlerPreview, async (req, res
             ? linkedSocialAccountsById.get(linkedAccountId)
             : null;
           const normalizedHandle = channel.normalizedHandle || normalizeChannelHandle(channel.requestedHandle || channel.handle);
+          const fallbackAcc = fallbackSocialAccounts.find((account) => (
+            account.platform === channel.platform &&
+            (normalizeChannelHandle(account.username) === normalizedHandle ||
+             normalizeChannelHandle(account.name) === normalizedHandle)
+          ));
           const matchedAcc = linkedCreatorAccount || linkedCampaignAccount || creatorAccounts.find((account) => (
             account.platform === channel.platform &&
             getAccountMatchHandles(account).includes(normalizedHandle)
-          ));
+          )) || fallbackAcc;
           const isAssignedToCreator = Boolean(
             String(channel.assignedHandlerUserId || '') === String(req.user._id)
             || (handlerEmail && channel.assignedHandlerEmail === handlerEmail)

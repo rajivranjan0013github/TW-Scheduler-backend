@@ -1217,6 +1217,35 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
           }
         }
       }
+
+      // Auto-assign schedule uploads or handler device uploads to campaign's Generated folder if folderId is not specified
+      if (!scopeContext.folderId && scopeContext.campaignId) {
+        const isScheduleUpload = req.user?.userType === 'account_handler'
+          || parsedSourceUsage === 'schedule'
+          || tagList.some((t) => t === 'schedule' || t === 'generated');
+
+        if (isScheduleUpload) {
+          if (isConnected) {
+            const folderMap = await ensureDefaultCampaignFolders(scopeContext.campaignId, req.user?._id);
+            const generatedFolder = folderMap?.['Generated'] || await Folder.findOne({
+              campaignId: scopeContext.campaignId,
+              scope: 'campaign',
+              $or: [{ name: /^generated$/i }, { tags: 'generated' }, { tags: 'schedule' }],
+            });
+            if (generatedFolder?._id) {
+              scopeContext.folderId = generatedFolder._id;
+            }
+          } else {
+            const mockFolder = mockStore.folders.find((f) => (
+              String(f.campaignId || '') === String(scopeContext.campaignId) &&
+              (/generated/i.test(f.name) || (f.tags || []).includes('generated') || (f.tags || []).includes('schedule'))
+            ));
+            if (mockFolder?._id) {
+              scopeContext.folderId = mockFolder._id;
+            }
+          }
+        }
+      }
       let socialAccountIds = requestedAccountIds;
 
       if (isConnected) {
