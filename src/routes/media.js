@@ -850,6 +850,79 @@ router.delete('/folders/:id', protect, authorize('owner', 'admin'), async (req, 
 
 // ================= Media Routes =================
 
+// @desc    Get all showcase media assets for a campaign
+// @route   GET /api/media/showcase
+// @access  Private
+router.get('/showcase', protect, async (req, res) => {
+  try {
+    const isConnected = getDBStatus();
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+
+    if (!isConnected) {
+      const filtered = mockStore.media.filter((m) => (
+        String(m.campaignId || '') === String(campaignId) &&
+        (m.tags?.includes('app-showcase') || m.tags?.includes('showcase') || m.tags?.includes('promo') || m.folderId === 'f_showcase')
+      ));
+      return res.status(200).json(filtered);
+    }
+
+    const campaign = await Campaign.findById(campaignId).lean();
+    if (!campaign) {
+      return res.status(404).json({ message: 'Campaign not found' });
+    }
+
+    const showcaseFolders = await Folder.find({
+      campaignId,
+      scope: 'campaign',
+      $or: [
+        ...(campaign.promoFolderId ? [{ _id: campaign.promoFolderId }] : []),
+        { name: /^app showcase$/i },
+        { tags: 'app-showcase' },
+        { tags: 'promo' },
+      ],
+    }).select('_id').lean();
+
+    const folderIds = showcaseFolders.map((f) => f._id);
+    const explicitIds = Array.isArray(campaign.showcaseMediaIds) ? campaign.showcaseMediaIds.filter(Boolean) : [];
+
+    const orConditions = [
+      { tags: { $in: ['app-showcase', 'showcase', 'promo'] } },
+      { 'aiAnalysis.appShowcase.detected': true },
+    ];
+    if (folderIds.length > 0) {
+      orConditions.push({ folderId: { $in: folderIds } });
+    }
+    if (explicitIds.length > 0) {
+      orConditions.push({ _id: { $in: explicitIds } });
+    }
+
+    const mediaList = await Media.find({
+      campaignId,
+      type: 'video',
+      $or: orConditions,
+    })
+      .populate('socialAccountIds', 'name username platform avatarUrl isConnected')
+      .sort({ uploadBatchCreatedAt: -1, uploadOrder: 1, createdAt: -1 });
+
+    // Trigger analysis in background for any unanalyzed showcase videos
+    mediaList.forEach((media) => {
+      if (media.aiStatus === 'none' || media.aiStatus === 'pending') {
+        media.aiStatus = 'processing';
+        media.save().catch(() => {});
+        analyzeMediaVideo(media._id, { mode: 'app_showcase', campaignId }).catch((err) => {
+          console.error(`[media.js] Error auto-analyzing showcase video ${media._id}:`, err);
+        });
+      }
+    });
+
+    return res.status(200).json(mediaList);
+  } catch (error) {
+    console.error('Error fetching showcase media:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // @desc    Get all media assets
 // @route   GET /api/media
 // @access  Private
@@ -1451,7 +1524,7 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
       const explicitMode = req.body?.mode === 'app_showcase' || req.body?.mode === 'reaction'
         ? req.body.mode
         : undefined;
-      analyzeMediaVideo(media._id, { mode: explicitMode }).catch((err) => {
+      analyzeMediaVideo(media._id, { mode: explicitMode, campaignId }).catch((err) => {
         console.error(`[media.js] Manual AI analysis failed for ${media._id}:`, err);
       });
 

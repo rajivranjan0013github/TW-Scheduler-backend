@@ -119,37 +119,18 @@ const loadCampaignChannels = async (campaign, { persist = false, addedByUserId =
   const campaignId = campaign?._id || campaign;
   if (!campaignId) return [];
 
-  let channelDocs = await CampaignChannel.find({ campaignId }).sort({ createdAt: 1 }).lean();
-
-  const legacyChannels = cleanChannelInputs((campaign?.toObject ? campaign.toObject() : campaign)?.channels || []);
-  if (channelDocs.length === 0 && legacyChannels.length > 0) {
-    const docs = legacyChannels.map((channel) => ({
-      campaignId,
-      platform: channel.platform,
-      requestedHandle: channel.requestedHandle,
-      normalizedHandle: channel.normalizedHandle,
-      displayName: channel.displayName,
-      socialAccountId: channel.socialAccountId || null,
-      assignedHandlerEmail: channel.assignedHandlerEmail || '',
-      assignedHandlerUserId: channel.assignedHandlerUserId || null,
-      addedByUserId,
-      createdAt: channel.addedAt,
-      updatedAt: channel.addedAt,
-    }));
-
-    if (persist) {
-      await CampaignChannel.insertMany(docs, { ordered: false }).catch(() => {});
-      channelDocs = await CampaignChannel.find({ campaignId }).sort({ createdAt: 1 }).lean();
-    } else {
-      channelDocs = docs;
-    }
-  }
-
+  const channelDocs = await CampaignChannel.find({ campaignId }).sort({ createdAt: 1 }).lean();
   return channelDocs;
 };
 
 export const syncCampaignChannelList = async (campaignId, channels = [], { userId = null } = {}) => {
   const cleanChannels = cleanChannelInputs(channels);
+  if (cleanChannels.length === 0) {
+    await CampaignChannel.deleteMany({ campaignId });
+    const campaign = await Campaign.findById(campaignId);
+    return resolveCampaignPublishingChannels(campaign, { persist: true });
+  }
+
   const existing = await CampaignChannel.find({ campaignId }).lean();
   const existingByKey = new Map(
     existing.map((channel) => [`${channel.platform}:${channel.normalizedHandle}`, channel])

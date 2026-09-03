@@ -5,6 +5,7 @@ import Media from '../models/Media.js';
 import SavedCaption from '../models/SavedCaption.js';
 import { analyzeProductUrl } from '../services/productAnalysisService.js';
 import { formatGeminiAttemptFailures, getGeminiModelCandidates } from '../services/geminiModels.js';
+import { filterProductFeatures } from '../services/videoAiService.js';
 
 const router = express.Router();
 
@@ -158,12 +159,14 @@ Rules:
 - Prefer a 0-2s hook, overlay continuing to 3-4s, then the app proof.
 - Explain why each pairing works for this exact audience.
 - No generic advice such as "show the app".
+- featuresShown MUST ONLY be substantial, high-value product features (e.g. "Live Home Screen Widget", "Handwritten Couple Notes", "Interactive Drawing Canvas").
+- STRICTLY FORBIDDEN in featuresShown: NO minor UI controls or buttons (NO "color selection", "brush size", "undo/redo", "eraser", "delete action", "send message", "tap button").
 
 Return valid JSON only:
 {
   "showcaseLearning": {
     "summary": "What the available demos collectively prove",
-    "featuresShown": ["Only visibly demonstrated features"],
+    "featuresShown": ["Substantial, high-value product features only"],
     "strongestMoments": ["Best descriptive visual proof moments"],
     "audienceFit": "Who these demos will persuade and why",
     "coverageGaps": ["Important missing screen recordings to capture next"]
@@ -266,7 +269,7 @@ Return valid JSON only:
     if (!useListingOnly) campaign.showcaseMediaIds = media.map((item) => item._id);
     campaign.showcaseLearning = {
       summary: String(learning.summary || '').trim(),
-      featuresShown: cleanStringList(learning.featuresShown, 12),
+      featuresShown: filterProductFeatures(learning.featuresShown, 8),
       strongestMoments: cleanStringList(learning.strongestMoments, 10),
       audienceFit: String(learning.audienceFit || '').trim(),
       coverageGaps: cleanStringList(learning.coverageGaps, 8),
