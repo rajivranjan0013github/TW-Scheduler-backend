@@ -2189,30 +2189,36 @@ router.get('/creator/posts', protect, resolveHandlerPreview, async (req, res) =>
     // 1. Find social accounts and manual channel assignments controlled by this handler
     const creatorAccounts = await SocialAccount.find({ userId: req.user._id }).select('_id').lean();
     const creatorAccountIds = creatorAccounts.map(acc => acc._id);
-    const creatorAccountIdSet = new Set(creatorAccountIds.map((id) => String(id)));
     const handlerEmail = (req.user.email || '').trim().toLowerCase();
     const assignedChannels = await CampaignChannel.find({
       $or: [
         { assignedHandlerUserId: req.user._id },
         ...(handlerEmail ? [{ assignedHandlerEmail: handlerEmail }] : []),
       ],
-    }).select('_id').lean();
+    }).select('_id socialAccountId').lean();
     const assignedChannelIds = assignedChannels.map((channel) => channel._id);
+    const assignedSocialAccountIds = assignedChannels.map((c) => c.socialAccountId).filter(Boolean);
+
+    const allCreatorAccountIds = [...creatorAccountIds, ...assignedSocialAccountIds];
+    const allCreatorAccountIdSet = new Set(allCreatorAccountIds.map((id) => String(id)));
     const assignedChannelIdSet = new Set(assignedChannelIds.map((id) => String(id)));
 
-    if (creatorAccountIds.length === 0 && assignedChannelIds.length === 0) {
+    if (allCreatorAccountIds.length === 0 && assignedChannelIds.length === 0) {
       return res.status(200).json([]);
     }
 
     // 2. Find scheduled posts containing these accounts/channels, but only expose this handler's targets
     const posts = await ScheduledPost.find({
       $or: [
-        { socialAccountIds: { $in: creatorAccountIds } },
+        { socialAccountIds: { $in: allCreatorAccountIds } },
         { campaignChannelIds: { $in: assignedChannelIds } },
       ],
     })
       .populate('socialAccountIds')
-      .populate('campaignChannelIds')
+      .populate({
+        path: 'campaignChannelIds',
+        populate: { path: 'socialAccountId' },
+      })
       .populate('mediaIds')
       .sort({ scheduledAt: 1 })
       .lean();
@@ -2220,7 +2226,7 @@ router.get('/creator/posts', protect, resolveHandlerPreview, async (req, res) =>
     res.status(200).json(posts.map((post) => ({
       ...post,
       socialAccountIds: (post.socialAccountIds || []).filter((account) => (
-        creatorAccountIdSet.has(String(account?._id || account))
+        allCreatorAccountIdSet.has(String(account?._id || account))
       )),
       campaignChannelIds: (post.campaignChannelIds || []).filter((channel) => (
         assignedChannelIdSet.has(String(channel?._id || channel))

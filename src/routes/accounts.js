@@ -122,9 +122,22 @@ const getAccountMatchHandles = (account = {}) => (
   ].filter(Boolean)
 );
 
-const getAccountAccessFilter = (req, id) => {
+const getAccountAccessFilter = async (req, id) => {
   if (hasAdminAccess(req.user)) {
     return { _id: id };
+  }
+  if (req.user?.userType === 'account_handler') {
+    const handlerEmail = (req.user.email || '').trim().toLowerCase();
+    const isAssigned = await CampaignChannel.exists({
+      socialAccountId: id,
+      $or: [
+        { assignedHandlerUserId: req.user._id },
+        ...(handlerEmail ? [{ assignedHandlerEmail: handlerEmail }] : []),
+      ],
+    });
+    if (isAssigned) {
+      return { _id: id };
+    }
   }
   return { _id: id, userId: req.user._id };
 };
@@ -265,6 +278,28 @@ const getScopedAccountQuery = async (req, extra = {}) => {
     return { campaignId, ...extra };
   }
 
+  if (req.user?.userType === 'account_handler') {
+    const handlerEmail = (req.user.email || '').trim().toLowerCase();
+    const assignedChannels = await CampaignChannel.find({
+      $or: [
+        { assignedHandlerUserId: req.user._id },
+        ...(handlerEmail ? [{ assignedHandlerEmail: handlerEmail }] : []),
+      ],
+    }).select('socialAccountId').lean();
+
+    const assignedSocialAccountIds = assignedChannels
+      .map((c) => c.socialAccountId)
+      .filter(Boolean);
+
+    return {
+      $or: [
+        { userId: getScopedUserId(req) },
+        { _id: { $in: assignedSocialAccountIds } },
+      ],
+      ...extra,
+    };
+  }
+
   return { userId: getScopedUserId(req), ...extra };
 };
 
@@ -312,7 +347,23 @@ router.get('/', protect, resolveHandlerPreview, async (req, res) => {
       const accountIds = await getVerifiedCampaignSocialAccountIds(campaignId);
       let query = { _id: { $in: accountIds }, isConnected: true };
       if (req.user?.userType === 'account_handler') {
-        query.userId = req.user._id;
+        const handlerEmail = (req.user.email || '').trim().toLowerCase();
+        const assignedChannels = await CampaignChannel.find({
+          campaignId,
+          $or: [
+            { assignedHandlerUserId: req.user._id },
+            ...(handlerEmail ? [{ assignedHandlerEmail: handlerEmail }] : []),
+          ],
+        }).select('socialAccountId').lean();
+        const assignedAccountIds = assignedChannels.map((c) => c.socialAccountId).filter(Boolean);
+        query = {
+          _id: { $in: accountIds },
+          $or: [
+            { userId: req.user._id },
+            { _id: { $in: assignedAccountIds } },
+          ],
+          isConnected: true,
+        };
       }
       const accounts = accountIds.length > 0
         ? await SocialAccount.find(query)
@@ -1037,12 +1088,12 @@ router.delete('/:id', protect, resolveHandlerPreview, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected.' });
     }
 
-    const account = await SocialAccount.findOne(getAccountAccessFilter(req, id));
+    const account = await SocialAccount.findOne(await getAccountAccessFilter(req, id));
     if (!account) {
       return res.status(404).json({ message: 'Account not found' });
     }
 
-    await SocialAccount.deleteOne(getAccountAccessFilter(req, id));
+    await SocialAccount.deleteOne(await getAccountAccessFilter(req, id));
     res.status(200).json({ message: 'Account disconnected successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -1554,7 +1605,7 @@ router.get('/posts/recent', protect, async (req, res) => {
 router.post('/:id/sync', protect, async (req, res) => {
   try {
     if (!getDBStatus()) return res.status(503).json({ message: 'Database disconnected.' });
-    const account = await SocialAccount.findOne(getAccountAccessFilter(req, req.params.id)).select('_id');
+    const account = await SocialAccount.findOne(await getAccountAccessFilter(req, req.params.id)).select('_id');
     if (!account) return res.status(404).json({ message: 'Account not found.' });
     const result = await requestAccountSync(account._id);
     return res.status(202).json({ status: 'queued', ...result });
@@ -1566,7 +1617,7 @@ router.post('/:id/sync', protect, async (req, res) => {
 router.get('/:id/sync-status', protect, async (req, res) => {
   try {
     if (!getDBStatus()) return res.status(503).json({ message: 'Database disconnected.' });
-    const account = await SocialAccount.findOne(getAccountAccessFilter(req, req.params.id)).select('_id');
+    const account = await SocialAccount.findOne(await getAccountAccessFilter(req, req.params.id)).select('_id');
     if (!account) return res.status(404).json({ message: 'Account not found.' });
     await healStaleSyncStatuses(10).catch(() => {});
     const status = await MetricSyncStatus.findOne({ accountId: account._id, tier: 'manual' }).lean();
@@ -1589,7 +1640,7 @@ router.get('/:id/posts', protect, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected. Feed is disabled.' });
     }
 
-    const account = await SocialAccount.findOne(getAccountAccessFilter(req, id));
+    const account = await SocialAccount.findOne(await getAccountAccessFilter(req, id));
     if (!account) {
       return res.status(404).json({ message: 'Account not found' });
     }
@@ -1849,7 +1900,7 @@ router.get('/:id/posts/:metaPostId/insights', protect, async (req, res) => {
     }
 
     // Verify account belongs to user
-    const account = await SocialAccount.findOne(getAccountAccessFilter(req, id));
+    const account = await SocialAccount.findOne(await getAccountAccessFilter(req, id));
     if (!account) {
       return res.status(404).json({ message: 'Account not found' });
     }
