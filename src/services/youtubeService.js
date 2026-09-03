@@ -17,7 +17,7 @@ const getYoutubeOAuthClient = () => {
   return new OAuth2Client(clientId, clientSecret, redirectUri);
 };
 
-export const getYoutubeAuthUrl = () => {
+export const getYoutubeAuthUrl = ({ state = '', redirectUri = null } = {}) => {
   const client = getYoutubeOAuthClient();
 
   return client.generateAuthUrl({
@@ -25,6 +25,8 @@ export const getYoutubeAuthUrl = () => {
     prompt: 'consent',
     include_granted_scopes: true,
     scope: [YOUTUBE_UPLOAD_SCOPE, YOUTUBE_READONLY_SCOPE],
+    ...(state ? { state } : {}),
+    ...(redirectUri ? { redirect_uri: redirectUri } : {}),
   });
 };
 

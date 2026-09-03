@@ -1163,10 +1163,131 @@ router.post('/connect', protect, resolveHandlerPreview, async (req, res) => {
 // @access  Private (Owner, Admin)
 router.get('/youtube/auth-url', protect, resolveHandlerPreview, async (req, res) => {
   try {
-    const url = getYoutubeAuthUrl();
+    const state = JSON.stringify({
+      campaignId: req.query.campaignId || '',
+      reauthorizeAccountId: req.query.reauthorizeAccountId || '',
+    });
+    const redirectUri = req.query.redirectUri || process.env.YOUTUBE_REDIRECT_URI || undefined;
+    const url = getYoutubeAuthUrl({ state, redirectUri });
     res.status(200).json({ url });
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Get Facebook OAuth URL
+// @route   GET /api/accounts/facebook/auth-url
+// @access  Private (Owner, Admin)
+router.get('/facebook/auth-url', protect, resolveHandlerPreview, async (req, res) => {
+  try {
+    const appId = process.env.META_APP_ID;
+    const redirectUri = req.query.redirectUri || process.env.META_REDIRECT_URI || 'https://theeasypost.com/auth/facebook/callback';
+    if (!appId) {
+      return res.status(500).json({ message: 'Meta App credentials are not configured on the backend.' });
+    }
+    const state = JSON.stringify({
+      campaignId: req.query.campaignId || '',
+      reauthorizeAccountId: req.query.reauthorizeAccountId || '',
+    });
+    const params = new URLSearchParams({
+      client_id: appId,
+      redirect_uri: redirectUri,
+      scope: 'pages_show_list,pages_read_engagement,pages_read_user_content,pages_manage_posts',
+      response_type: 'code',
+      auth_type: 'rerequest',
+      state,
+    });
+    const url = `https://www.facebook.com/v20.0/dialog/oauth?${params.toString()}`;
+    res.status(200).json({ url });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Get Instagram OAuth URL
+// @route   GET /api/accounts/instagram/auth-url
+// @access  Private (Owner, Admin)
+router.get('/instagram/auth-url', protect, resolveHandlerPreview, async (req, res) => {
+  try {
+    const appId = process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID;
+    const redirectUri = req.query.redirectUri || process.env.INSTAGRAM_REDIRECT_URI || 'https://theeasypost.com/auth/instagram/callback';
+    if (!appId) {
+      return res.status(500).json({ message: 'Instagram App credentials are not configured on the backend.' });
+    }
+    const state = JSON.stringify({
+      campaignId: req.query.campaignId || '',
+      reauthorizeAccountId: req.query.reauthorizeAccountId || '',
+    });
+    const params = new URLSearchParams({
+      client_id: appId,
+      redirect_uri: redirectUri,
+      scope: 'instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments,instagram_business_content_publish,instagram_business_manage_insights',
+      response_type: 'code',
+      state,
+    });
+    const url = `https://www.instagram.com/oauth/authorize?${params.toString()}`;
+    res.status(200).json({ url });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Fallback direct browser connect redirects
+router.get('/connect/youtube', async (req, res) => {
+  try {
+    const state = JSON.stringify({
+      campaignId: req.query.campaignId || '',
+      reauthorizeAccountId: req.query.reauthorizeAccountId || req.query.socialAccountId || '',
+    });
+    const url = getYoutubeAuthUrl({ state });
+    return res.redirect(url);
+  } catch (err) {
+    return res.status(500).send(`YouTube connection error: ${err.message}`);
+  }
+});
+
+router.get('/connect/facebook', async (req, res) => {
+  try {
+    const appId = process.env.META_APP_ID;
+    const redirectUri = process.env.META_REDIRECT_URI || 'https://theeasypost.com/auth/facebook/callback';
+    if (!appId) return res.status(500).send('Meta App ID not configured.');
+    const state = JSON.stringify({
+      campaignId: req.query.campaignId || '',
+      reauthorizeAccountId: req.query.reauthorizeAccountId || req.query.socialAccountId || '',
+    });
+    const params = new URLSearchParams({
+      client_id: appId,
+      redirect_uri: redirectUri,
+      scope: 'pages_show_list,pages_read_engagement,pages_read_user_content,pages_manage_posts',
+      response_type: 'code',
+      auth_type: 'rerequest',
+      state,
+    });
+    return res.redirect(`https://www.facebook.com/v20.0/dialog/oauth?${params.toString()}`);
+  } catch (err) {
+    return res.status(500).send(`Facebook connection error: ${err.message}`);
+  }
+});
+
+router.get('/connect/instagram', async (req, res) => {
+  try {
+    const appId = process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID;
+    const redirectUri = process.env.INSTAGRAM_REDIRECT_URI || 'https://theeasypost.com/auth/instagram/callback';
+    if (!appId) return res.status(500).send('Instagram App ID not configured.');
+    const state = JSON.stringify({
+      campaignId: req.query.campaignId || '',
+      reauthorizeAccountId: req.query.reauthorizeAccountId || req.query.socialAccountId || '',
+    });
+    const params = new URLSearchParams({
+      client_id: appId,
+      redirect_uri: redirectUri,
+      scope: 'instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments,instagram_business_content_publish,instagram_business_manage_insights',
+      response_type: 'code',
+      state,
+    });
+    return res.redirect(`https://www.instagram.com/oauth/authorize?${params.toString()}`);
+  } catch (err) {
+    return res.status(500).send(`Instagram connection error: ${err.message}`);
   }
 });
 
