@@ -73,7 +73,7 @@ export const exchangeYoutubeCodeForAccount = async (code, userId) => {
     platform: 'youtube',
     accountId: channel.id,
     name: snippet.title || 'YouTube Channel',
-    username: snippet.customUrl || snippet.title || 'youtube_channel',
+    username: (snippet.customUrl || snippet.title || 'youtube_channel').replace(/^@+/, ''),
     accessToken: tokens.access_token,
     refreshToken: tokens.refresh_token,
     authProvider: 'youtube',

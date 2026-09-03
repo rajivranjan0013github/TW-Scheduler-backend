@@ -797,9 +797,54 @@ router.get('/', protect, async (req, res) => {
       return res.status(200).json(sorted);
     }
 
-    const campaignId = requireCampaignId(req, res);
-    if (!campaignId) return;
+    let campaignId = getActiveCampaignId(req);
     const requestedAccountIds = splitQueryList(req.query.accountIds);
+
+    // If campaignId was not provided, attempt to resolve it from the requested accounts
+    if (!campaignId && requestedAccountIds.length > 0) {
+      const requestedAccounts = await SocialAccount.find({ _id: { $in: requestedAccountIds } })
+        .select('platform username name accountId')
+        .lean();
+      const handleClauses = requestedAccounts.flatMap((account) => (
+        [account.username, account.name, account.accountId]
+          .map(normalizeChannelHandle)
+          .filter(Boolean)
+          .map((normalizedHandle) => ({ platform: account.platform, normalizedHandle }))
+      ));
+      const channelMatch = {
+        $or: [
+          { _id: { $in: requestedAccountIds } },
+          { socialAccountId: { $in: requestedAccountIds } },
+          ...handleClauses,
+        ],
+      };
+      const matchedChannel = await CampaignChannel.findOne(channelMatch).select('campaignId').lean();
+      if (matchedChannel?.campaignId) {
+        campaignId = String(matchedChannel.campaignId);
+      }
+    }
+
+    // If still missing and user is an account_handler, resolve from their assigned channels
+    if (!campaignId && req.user?.userType === 'account_handler') {
+      const userEmail = (req.user.email || '').trim().toLowerCase();
+      const creatorAccounts = await SocialAccount.find({ userId: req.user._id }).select('_id').lean();
+      const creatorAccountIds = creatorAccounts.map((a) => a._id);
+      const creatorChannel = await CampaignChannel.findOne({
+        $or: [
+          { assignedHandlerUserId: req.user._id },
+          ...(userEmail ? [{ assignedHandlerEmail: userEmail }] : []),
+          ...(creatorAccountIds.length > 0 ? [{ socialAccountId: { $in: creatorAccountIds } }] : []),
+        ],
+      }).select('campaignId').lean();
+      if (creatorChannel?.campaignId) {
+        campaignId = String(creatorChannel.campaignId);
+      }
+    }
+
+    if (!campaignId) {
+      return res.status(400).json({ message: 'Campaign is required.' });
+    }
+
     let matchingCampaignChannelIds = [];
 
     if (requestedAccountIds.length > 0) {
@@ -821,6 +866,28 @@ router.get('/', protect, async (req, res) => {
         ],
       };
       matchingCampaignChannelIds = await CampaignChannel.find(channelMatch).distinct('_id');
+    }
+
+    if (req.user?.userType === 'account_handler') {
+      const userEmail = (req.user.email || '').trim().toLowerCase();
+      const creatorAccounts = await SocialAccount.find({ userId: req.user._id }).select('_id').lean();
+      const creatorAccountIds = creatorAccounts.map((a) => a._id);
+
+      const creatorChannels = await CampaignChannel.find({
+        campaignId,
+        $or: [
+          { assignedHandlerUserId: req.user._id },
+          ...(userEmail ? [{ assignedHandlerEmail: userEmail }] : []),
+          ...(creatorAccountIds.length > 0 ? [{ socialAccountId: { $in: creatorAccountIds } }] : []),
+        ],
+      }).distinct('_id');
+
+      const creatorChannelIdStrings = new Set(creatorChannels.map((id) => String(id)));
+      if (matchingCampaignChannelIds.length > 0) {
+        matchingCampaignChannelIds = matchingCampaignChannelIds.filter((id) => creatorChannelIdStrings.has(String(id)));
+      } else {
+        matchingCampaignChannelIds = creatorChannels;
+      }
     }
 
     const posts = await populateSchedulerPostList(
@@ -2007,9 +2074,7 @@ router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req
   const { id } = req.params;
 
   try {
-    const isConnected = getDBStatus();
-    const campaignId = requireCampaignId(req, res);
-    if (!campaignId) return;
+    let campaignId = getActiveCampaignId(req);
 
     if (!isConnected) {
       const index = mockStore.scheduledPosts.findIndex(p => p._id === id);
@@ -2023,10 +2088,14 @@ router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req
       return res.status(200).json({ message: 'Scheduled post removed successfully' });
     }
 
-    const post = await ScheduledPost.findOne({ _id: id, campaignId });
+    const post = campaignId
+      ? await ScheduledPost.findOne({ _id: id, campaignId })
+      : await ScheduledPost.findById(id);
+
     if (!post) {
       return res.status(404).json({ message: 'Post not found' });
     }
+    campaignId = String(post.campaignId);
     if (!cancellablePostStatuses.has(post.status)) {
       return res.status(409).json({ message: 'Only pending, paused, or manually posted queue records can be deleted.' });
     }
