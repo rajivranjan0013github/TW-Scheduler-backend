@@ -20,6 +20,7 @@ import aiRoutes from './src/routes/ai.js';
 import bulkAgentRoutes from './src/routes/bulkAgent.js';
 import { protect } from './src/middleware/auth.js';
 import ScheduledPost from './src/models/ScheduledPost.js';
+import { createAppServer } from './src/config/ssl.js';
 
 // Configure __dirname for ES Modules
 const __filename = fileURLToPath(import.meta.url);
@@ -110,8 +111,11 @@ const startServer = async () => {
   startCreatorAutoCheckInterval();
 
   // 4. Listen on PORT
-  app.listen(PORT, () => {
+  const { server, protocol } = createAppServer(app);
+  server.listen(PORT, () => {
+    console.log(`🚀 TW-Scheduler API running on ${protocol}://localhost:${PORT}`);
   });
 };
 
 startServer();
+

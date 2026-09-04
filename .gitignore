@@ -12,6 +12,10 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# SSL certificates
+certs/
+*.pem
+
 # Editor/System files
 .DS_Store
 .idea/

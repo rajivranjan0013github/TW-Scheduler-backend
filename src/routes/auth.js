@@ -1,10 +1,19 @@
 import express from 'express';
+import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { OAuth2Client } from 'google-auth-library';
 import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import User from '../models/User.js';
 import SocialAccount from '../models/SocialAccount.js';
+import ScheduledPost from '../models/ScheduledPost.js';
+import PublishedPost from '../models/PublishedPost.js';
+import PostMetricSnapshot from '../models/PostMetricSnapshot.js';
+import PostMetricDailySnapshot from '../models/PostMetricDailySnapshot.js';
+import PostInsight from '../models/PostInsight.js';
+import Insight from '../models/Insight.js';
+import Media from '../models/Media.js';
+import CampaignChannel from '../models/CampaignChannel.js';
 import { protect } from '../middleware/auth.js';
 import { storeRemoteAvatarForUser } from '../services/avatarStorageService.js';
 
@@ -236,7 +245,25 @@ router.put('/me', protect, async (req, res) => {
   }
 });
 
-// @desc    Delete user account and all connected resources
+// Helper to parse and verify Meta signed_request
+const parseMetaSignedRequest = (signedRequest, appSecret) => {
+  if (!signedRequest || typeof signedRequest !== 'string') return null;
+  const parts = signedRequest.split('.');
+  if (parts.length !== 2) return null;
+
+  const [encodedSig, encodedPayload] = parts;
+  const sig = Buffer.from(encodedSig.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('hex');
+  const expectedSig = crypto.createHmac('sha256', appSecret).update(encodedPayload).digest('hex');
+
+  if (sig !== expectedSig) {
+    return null;
+  }
+
+  const payloadJson = Buffer.from(encodedPayload.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+  return JSON.parse(payloadJson);
+};
+
+// @desc    Delete user account and all connected resources (Cascade Deletion)
 // @route   DELETE /api/auth/me
 // @access  Private
 router.delete('/me', protect, async (req, res) => {
@@ -248,15 +275,81 @@ router.delete('/me', protect, async (req, res) => {
 
     const userId = req.user._id;
 
-    // Wipe connected social integrations and the user profile
+    // Find all social accounts to cascade metric & post deletion
+    const userAccounts = await SocialAccount.find({ userId }).select('_id');
+    const accountIds = userAccounts.map(a => a._id);
+
+    // Wipe all platform data, posts, metrics, media, channels, and profile
     await Promise.all([
+      ScheduledPost.deleteMany({ userId }),
+      PublishedPost.deleteMany({ $or: [{ userId }, { accountId: { $in: accountIds } }] }),
+      PostMetricSnapshot.deleteMany({ accountId: { $in: accountIds } }),
+      PostMetricDailySnapshot.deleteMany({ accountId: { $in: accountIds } }),
+      PostInsight.deleteMany({ accountId: { $in: accountIds } }),
+      Insight.deleteMany({ accountId: { $in: accountIds } }),
+      Media.deleteMany({ userId }),
+      CampaignChannel.deleteMany({ userId }),
       SocialAccount.deleteMany({ userId }),
-      User.deleteOne({ _id: userId })
+      User.deleteOne({ _id: userId }),
     ]);
 
-    res.status(200).json({ message: 'Account and connected integrations deleted successfully.' });
+    res.status(200).json({ message: 'Account and all connected data deleted successfully.' });
   } catch (error) {
+    console.error('Account deletion error:', error.message);
     res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Meta Data Deletion Callback (signed_request from Facebook Settings)
+// @route   POST /api/auth/meta-data-deletion
+// @access  Public
+router.post('/meta-data-deletion', async (req, res) => {
+  try {
+    const signedRequest = req.body?.signed_request;
+    const appSecret = process.env.META_APP_SECRET;
+
+    if (!signedRequest || !appSecret) {
+      return res.status(400).json({ message: 'Missing signed_request or app secret configuration.' });
+    }
+
+    const data = parseMetaSignedRequest(signedRequest, appSecret);
+    if (!data || !data.user_id) {
+      return res.status(400).json({ message: 'Invalid signed_request signature or payload.' });
+    }
+
+    const fbUserId = String(data.user_id);
+    const confirmationCode = `del_${fbUserId}_${Date.now()}`;
+
+    // Find user and associated accounts linked to this Facebook ID
+    const user = await User.findOne({ facebookId: fbUserId });
+    const socialAccounts = await SocialAccount.find({
+      $or: [
+        { accountId: fbUserId },
+        ...(user ? [{ userId: user._id }] : []),
+      ],
+    });
+    const accountIds = socialAccounts.map((a) => a._id);
+
+    // Cascade wipe all platform data
+    await Promise.all([
+      SocialAccount.deleteMany({ _id: { $in: accountIds } }),
+      PublishedPost.deleteMany({ accountId: { $in: accountIds } }),
+      ScheduledPost.deleteMany({ socialAccountIds: { $in: accountIds } }),
+      PostMetricSnapshot.deleteMany({ accountId: { $in: accountIds } }),
+      PostMetricDailySnapshot.deleteMany({ accountId: { $in: accountIds } }),
+      PostInsight.deleteMany({ accountId: { $in: accountIds } }),
+      Insight.deleteMany({ accountId: { $in: accountIds } }),
+      ...(user ? [User.deleteOne({ _id: user._id }), Media.deleteMany({ userId: user._id })] : []),
+    ]);
+
+    const statusUrl = `https://theeasypost.com/data-deletion?code=${confirmationCode}`;
+    return res.status(200).json({
+      url: statusUrl,
+      confirmation_code: confirmationCode,
+    });
+  } catch (err) {
+    console.error('❌ Meta data deletion error:', err.message);
+    return res.status(500).json({ message: 'Failed to process data deletion request.' });
   }
 });
 

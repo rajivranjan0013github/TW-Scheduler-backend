@@ -236,6 +236,15 @@ const persistMetrics = async (account, posts, metricMap, syncTime) => {
     const source = fresh.viewsSource || post.viewsSource || '';
     const campaignId = post.campaignId || account.campaignId || null;
 
+    const isYouTube = post.platform === 'youtube' || account.platform === 'youtube';
+    // YouTube Developer Policy Section III.E.4: Do not store numeric metrics for >30 calendar days
+    const postDailyExpiry = isYouTube
+      ? new Date(syncTime.getTime() + 30 * DAY_MS)
+      : dailyExpiry;
+    const postHourlyExpiry = isYouTube
+      ? new Date(syncTime.getTime() + 30 * DAY_MS)
+      : hourlyExpiry;
+
     postWrites.push({
       updateOne: {
         filter: { _id: post._id },
@@ -262,7 +271,7 @@ const persistMetrics = async (account, posts, metricMap, syncTime) => {
           likeDelta: previous ? Math.max(0, current.likes - Number(previous.likes || 0)) : 0,
           commentDelta: previous ? Math.max(0, current.comments - Number(previous.comments || 0)) : 0,
           viewsSource: source,
-          expiresAt: hourlyExpiry,
+          expiresAt: postHourlyExpiry,
         } },
         upsert: true,
       },
@@ -270,7 +279,7 @@ const persistMetrics = async (account, posts, metricMap, syncTime) => {
     dailyWrites.push({
       updateOne: {
         filter: { postId: post._id, dateStr: today },
-        update: { $set: { campaignId, accountId: account._id, ...current, viewsSource: source, expiresAt: dailyExpiry } },
+        update: { $set: { campaignId, accountId: account._id, ...current, viewsSource: source, expiresAt: postDailyExpiry } },
         upsert: true,
       },
     });
