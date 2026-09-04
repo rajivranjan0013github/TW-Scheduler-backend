@@ -6,14 +6,12 @@ import Media from '../models/Media.js';
 
 async function fixAudio() {
   await mongoose.connect(process.env.MONGODB_URI);
-  console.log('Connected to MongoDB.');
 
   // 1. Find Global Audio Folder
   const globalAudio = await Folder.findOne({ name: 'Audio', parentFolderId: null, scope: 'global' });
   if (!globalAudio) {
     throw new Error('Global Audio folder not found!');
   }
-  console.log('Global Audio folder ID:', globalAudio._id);
 
   // 2. Ensure Global Trending songs and My own audios exist
   let trendingGlobal = await Folder.findOne({
@@ -48,8 +46,6 @@ async function fixAudio() {
     });
   }
 
-  console.log('Global Trending songs ID:', trendingGlobal._id);
-  console.log('Global My own audios ID:', myOwnGlobal._id);
 
   // 3. Move all platform songs (including 1.mp3) into Global Trending songs
   const trendingFileNames = [
@@ -84,19 +80,16 @@ async function fixAudio() {
     parentFolderId: null
   });
 
-  console.log(`Found ${duplicateAudioFolders.length} duplicate campaign-scoped Audio folders to clean up.`);
   for (const dup of duplicateAudioFolders) {
     // delete its subfolders
     await Folder.deleteMany({ parentFolderId: dup._id });
     await Folder.deleteOne({ _id: dup._id });
-    console.log(`Cleaned up duplicate Audio folder ${dup._id} for campaign ${dup.campaignId}`);
   }
 
   // 5. Final counts
   const trendingCount = await Media.countDocuments({ folderId: trendingGlobal._id });
   const myOwnCount = await Media.countDocuments({ folderId: myOwnGlobal._id });
-  console.log(`\n✓ Total tracks in 'Global Audio > Trending songs': ${trendingCount}`);
-  console.log(`✓ Total tracks in 'Global Audio > My own audios': ${myOwnCount}`);
+
 
   await mongoose.disconnect();
 }

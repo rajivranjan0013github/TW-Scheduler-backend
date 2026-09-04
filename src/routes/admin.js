@@ -1606,6 +1606,7 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
       keyMessaging,
       positioningStatement,
       screenshots,
+      showcaseMediaIds,
     } = req.body;
 
     if (name !== undefined) {
@@ -1632,6 +1633,7 @@ router.patch('/campaigns/:id', protect, authorize('owner', 'admin'), async (req,
     if (Array.isArray(keyMessaging)) campaign.keyMessaging = keyMessaging;
     if (positioningStatement !== undefined) campaign.positioningStatement = positioningStatement;
     if (Array.isArray(screenshots)) campaign.screenshots = screenshots;
+    if (Array.isArray(showcaseMediaIds)) campaign.showcaseMediaIds = showcaseMediaIds;
     if (targetAudience !== undefined) campaign.targetAudience = targetAudience;
     if (primaryGoal !== undefined) campaign.primaryGoal = primaryGoal;
     if (mainEmail !== undefined) campaign.mainEmail = mainEmail.trim().toLowerCase();

@@ -11,6 +11,38 @@ const __dirname = path.dirname(__filename);
 
 const MODELS_TO_TRY = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
 
+const TRIVIAL_UI_REGEX = /^(color|colour|brush|undo|redo|delete|eraser?|clear|zoom|palette|slider|picker|size|send\s*message|tap\s*button|click\s*button|keyboard|scroll|navigation|close\s*modal)\b/i;
+
+export const cleanProductFeature = (feature = '') => {
+  let cleaned = String(feature || '')
+    .trim()
+    .replace(/\b(display|functionality|action|mechanic|interface|screen)\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned || cleaned.length < 3) return '';
+  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+};
+
+export const filterProductFeatures = (features = [], limit = 6) => {
+  if (!Array.isArray(features)) return [];
+  const seen = new Set();
+  const result = [];
+
+  for (const raw of features) {
+    const trimmed = String(raw || '').trim();
+    if (!trimmed || TRIVIAL_UI_REGEX.test(trimmed)) continue;
+    const cleaned = cleanProductFeature(trimmed);
+    if (!cleaned || TRIVIAL_UI_REGEX.test(cleaned)) continue;
+    const lower = cleaned.toLowerCase();
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    result.push(cleaned);
+    if (result.length >= limit) break;
+  }
+
+  return result;
+};
+
 /**
  * Automatically determines whether a media asset should be analyzed as an
  * App Showcase (screen recording/product demo) or a Hook (creator facial reaction).
@@ -229,7 +261,7 @@ async function getVideoBuffer(media) {
  * @param {'app_showcase'|'reaction'} [options.mode]
  * @returns {Promise<Object>} Updated media document
  */
-export const analyzeMediaVideo = async (mediaId, { mode: explicitMode = null } = {}) => {
+export const analyzeMediaVideo = async (mediaId, { mode: explicitMode = null, campaignId: overrideCampaignId = null } = {}) => {
   const apiKey = process.env.GEMINI_API_KEY;
   const media = await Media.findById(mediaId);
   if (!media) {
@@ -257,11 +289,12 @@ export const analyzeMediaVideo = async (mediaId, { mode: explicitMode = null } =
   media.aiError = '';
   await media.save();
 
+  let tempVideoPath = null;
   let geminiFile = null;
 
   try {
-    const videoBuffer = await getVideoBuffer(media);
-    const mimeType = media.name?.toLowerCase().endsWith('.mov') ? 'video/quicktime' : 'video/mp4';
+    const { buffer: videoBuffer, mimeType } = await getMediaFileBuffer(media);
+    const mode = await determineMediaAiMode(media, explicitMode);
 
     // 1. Upload to Gemini File API
     geminiFile = await uploadToGeminiFileApi(
@@ -271,35 +304,45 @@ export const analyzeMediaVideo = async (mediaId, { mode: explicitMode = null } =
       apiKey
     );
 
-    const campaign = media.campaignId
-      ? await Campaign.findById(media.campaignId)
-        .select('name productName productDescription category targetAudience keyBenefit coreFunction')
+    const resolvedCampaignId = media.campaignId || overrideCampaignId;
+    const campaign = resolvedCampaignId
+      ? await Campaign.findById(resolvedCampaignId)
+        .select('name productName productDescription description category targetAudience keyBenefit coreFunction useCases positioningStatement keyMessaging targetAudienceList')
         .lean()
       : null;
 
-    // 2. Use a purpose-built prompt. Screen recordings need feature and UI flow
+    // 2. Use a purpose-built prompt. Screen recordings need high-level feature and value flow
     // analysis; creator clips need emotion and reaction analysis.
     const prompt = mode === 'app_showcase'
-      ? `You are an expert short-form app demo editor and product analyst.
-Analyze this mobile app or website showcase recording frame by frame. Focus entirely on what the interface demonstrates, product capability, and UI interactions. Do not analyze human emotions or facial reactions.
+      ? `You are an expert mobile product marketer and short-form video creative director.
+Analyze this mobile app showcase recording frame by frame. Focus entirely on the core product capabilities, value delivered to the user, and visual proof of what the app does.
 
-Product context:
-- Name: ${campaign?.productName || campaign?.name || 'Unknown product'}
-- Category: ${campaign?.category || 'Unknown'}
-- Description: ${campaign?.productDescription || ''}
-- Target audience: ${campaign?.targetAudience || ''}
-- Core benefit: ${campaign?.keyBenefit || campaign?.coreFunction || ''}
+Product Context (Use this as your primary product reference):
+- App / Product Name: ${campaign?.productName || campaign?.name || 'Unknown product'}
+- Category: ${campaign?.category || 'General App / Product'}
+- Full Product Description: ${campaign?.productDescription || campaign?.description || 'N/A'}
+- Core Function & Value: ${campaign?.coreFunction || campaign?.keyBenefit || 'N/A'}
+- Key Benefits: ${campaign?.keyBenefit || 'N/A'}
+- Target Audience: ${campaign?.targetAudience || 'General Users'}
+- Use Cases: ${(campaign?.useCases || []).join(', ') || 'N/A'}
+- Positioning Statement: ${campaign?.positioningStatement || 'N/A'}
+- Key Messaging: ${(campaign?.keyMessaging || []).join(', ') || 'N/A'}
 
-Extract:
-1. summary: A concise 1-2 sentence factual summary of what this screen recording demonstrates.
-2. featuresShown: The exact product features visibly shown (e.g. "lock screen widget", "relationship quiz", "mood tracker"). Do not invent features that are not visible.
-3. userFlow: Ordered list describing the UI interactions or user flow shown (e.g. "User taps widget", "Opens question card", "Submits answer").
-4. strongestMoments: Clear descriptive visual proof moments for an ad (e.g. "Partner answer reveal animation", "Live lockscreen interactive widget update"). Do NOT include timestamp numbers or time ranges.
-5. suggestedOverlays: 3 to 5 short on-screen overlay text lines (max 8 words each) that accurately match the visible screen action.
+Extraction Rules:
+1. summary: A concise 1-2 sentence factual summary of what this app recording demonstrates and the value shown.
+2. featuresShown (STRICT RULES — HIGH-LEVEL PRODUCT CAPABILITIES ONLY, 2 TO 4 ITEMS MAX):
+   - Extract only substantial, marketable product features (e.g. "Live Home Screen Drawing Widget", "Handwritten Couple Notes", "Interactive Doodling Canvas", "Real-Time Relationship Tracker").
+   - STRICTLY FORBIDDEN (DO NOT INCLUDE):
+     * NO minor UI controls, tools, or settings (STRICTLY NO: "color selection", "color picker", "brush size", "undo/redo", "eraser", "delete action", "zoom", "palette", "brush size adjustment").
+     * NO generic OS/utility mechanics (STRICTLY NO: "send message", "send message functionality", "tap button", "keyboard input", "scroll view", "widget display", "message display").
+   - Always group micro-tools into their overarching product capability (e.g. instead of color picker + brush size + undo -> "Interactive Drawing Canvas").
+3. userFlow: 3 to 6 ordered milestones describing the user experience (e.g. ["Draws a doodle on the canvas", "Sends to partner's lockscreen", "Widget updates live on home screen"]). DO NOT list low-level button clicks like "selects blue color" or "adjusts slider".
+4. strongestMoments: 2 to 4 clear, punchy visual proof moments for an ad (e.g. "Live lockscreen interactive widget update", "Instant doodle reveal on partner's phone"). Do NOT include timestamp numbers.
+5. suggestedOverlays: 3 to 5 short on-screen overlay text lines (max 7 words each) that match the visible screen action.
 6. confidence: "high", "medium", or "low".
-7. tags (STRICT RULES: ONLY SPECIFIC PRODUCT/FEATURE TAGS, 3 TO 6 TAGS TOTAL):
-   - Choose 3 to 6 compact feature/function tags (e.g. ["lockscreen-widget", "daily-quiz", "mood-tracker", "countdown"]).
-   - STRICTLY DO NOT include emotion or reaction tags (NO "shocked", "laughing", "crying", "angry", "confused", etc.).
+7. tags (STRICT RULES: ONLY SPECIFIC HIGH-LEVEL PRODUCT/FEATURE TAGS, 3 TO 5 TAGS TOTAL):
+   - Choose 3 to 5 compact feature/function tags (e.g. ["lockscreen-widget", "drawing-canvas", "couple-notes"]).
+   - STRICTLY DO NOT include emotion or reaction tags (NO "shocked", "laughing", "crying", etc.).
    - DO NOT include generic format words (NO "video", "clip", "screen", "recording", "ugc", "hook", "showcase", "demo").
 
 Output valid JSON only:
@@ -307,7 +350,7 @@ Output valid JSON only:
   "summary": "...",
   "appShowcase": {
     "detected": true,
-    "featuresShown": ["..."],
+    "featuresShown": ["Live Home Screen Widget", "Handwritten Couple Notes"],
     "screenDetails": "...",
     "userFlow": ["..."],
     "strongestMoments": ["..."],
@@ -451,11 +494,11 @@ Output must strictly follow this JSON schema:
           hook: { detected: false, hookConcept: '', description: '', openingDialogue: '' },
           appShowcase: {
             detected: showcase.detected !== false,
-            featuresShown: Array.isArray(showcase.featuresShown) ? showcase.featuresShown.slice(0, 10) : [],
+            featuresShown: filterProductFeatures(showcase.featuresShown, 5),
             screenDetails: showcase.screenDetails || '',
-            userFlow: Array.isArray(showcase.userFlow) ? showcase.userFlow.slice(0, 12) : [],
-            strongestMoments: Array.isArray(showcase.strongestMoments) ? showcase.strongestMoments.slice(0, 8) : [],
-            suggestedOverlays: Array.isArray(showcase.suggestedOverlays) ? showcase.suggestedOverlays.slice(0, 8) : [],
+            userFlow: Array.isArray(showcase.userFlow) ? showcase.userFlow.slice(0, 8) : [],
+            strongestMoments: Array.isArray(showcase.strongestMoments) ? showcase.strongestMoments.slice(0, 6) : [],
+            suggestedOverlays: Array.isArray(showcase.suggestedOverlays) ? showcase.suggestedOverlays.slice(0, 6) : [],
             confidence: ['high', 'medium', 'low'].includes(showcase.confidence) ? showcase.confidence : 'medium',
           },
           autoTags: extractedTags,
@@ -486,7 +529,6 @@ Output must strictly follow this JSON schema:
         };
 
     await media.save();
-    console.log(`[videoAiService] Successfully analyzed video ${media._id}: Mode=${mode}, Tags=[${extractedTags.join(', ')}]`);
     return media;
   } catch (error) {
     console.error(`[videoAiService] Error analyzing video media ${mediaId}:`, error.message);

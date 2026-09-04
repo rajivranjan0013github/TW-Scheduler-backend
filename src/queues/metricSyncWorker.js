@@ -28,7 +28,7 @@ const ACCOUNT_CONCURRENCY = 3;
 const FACEBOOK_POST_CONCURRENCY = 3;
 const leaseDurations = { hot: 25 * 60 * 1000, warm: 110 * 60 * 1000, daily: 6 * HOUR_MS };
 const logSyncEvent = (level, event, details = {}) => {
-  const logger = console[level] || console.log;
+  const logger = console[level] || console.info;
   logger(`[Metric Sync] ${event}`, {
     timestamp: new Date().toISOString(),
     ...details,

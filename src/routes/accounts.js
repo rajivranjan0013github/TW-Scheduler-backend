@@ -1,8 +1,10 @@
 import express from 'express';
+import mongoose from 'mongoose';
 import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import SocialAccount from '../models/SocialAccount.js';
 import Campaign from '../models/Campaign.js';
+import Media from '../models/Media.js';
 import User from '../models/User.js';
 import Insight from '../models/Insight.js';
 import PublishedPost from '../models/PublishedPost.js';
@@ -536,7 +538,7 @@ router.post('/campaign-channels', protect, resolveHandlerPreview, async (req, re
         platform,
         requestedHandle: requestedHandle.trim(),
         normalizedHandle: normalized,
-        displayName: matchingAccount?.name || '',
+        displayName: matchingAccount?.name || requestedHandle.replace(/^@/, '').trim(),
         socialAccountId: matchingAccount?._id || null,
         status: matchingAccount ? 'verified' : 'pending_verification',
         assignedHandlerEmail: assignedHandlerEmail.trim().toLowerCase(),
@@ -564,19 +566,69 @@ router.delete('/campaign-channels/:id', protect, resolveHandlerPreview, async (r
     if (!isConnected) {
       return res.status(503).json({ message: 'Database disconnected.' });
     }
-    let channel = await CampaignChannel.findById(req.params.id);
-    if (!channel) {
-      channel = await CampaignChannel.findOne({ socialAccountId: req.params.id });
+    const campaignId = req.query.campaignId || req.body?.campaignId;
+    let channel = null;
+
+    if (mongoose.Types.ObjectId.isValid(req.params.id)) {
+      channel = await CampaignChannel.findById(req.params.id);
+      if (!channel && campaignId) {
+        channel = await CampaignChannel.findOne({ campaignId, socialAccountId: req.params.id });
+      }
+      if (!channel) {
+        channel = await CampaignChannel.findOne({ socialAccountId: req.params.id });
+      }
     }
+
+    // Fallback: If not in CampaignChannel doc but campaignId is specified, check Campaign
+    if (!channel && campaignId && mongoose.Types.ObjectId.isValid(campaignId)) {
+      const targetCampaign = await Campaign.findById(campaignId);
+      if (targetCampaign) {
+        const allowed = await canAccessCampaign(req, campaignId);
+        if (!allowed) {
+          return res.status(403).json({ message: 'Campaign access denied.' });
+        }
+        await Campaign.findByIdAndUpdate(campaignId, {
+          $pull: {
+            channels: {
+              $or: [
+                { _id: req.params.id },
+                { socialAccountId: req.params.id }
+              ]
+            },
+            accountIds: req.params.id
+          }
+        });
+        const channels = await resolveCampaignPublishingChannels(targetCampaign, { persist: true });
+        return res.status(200).json({ success: true, channels });
+      }
+    }
+
     if (!channel) {
       return res.status(404).json({ message: 'Channel not found.' });
     }
-    const allowed = await canAccessCampaign(req, channel.campaignId);
+
+    const targetCampaignId = channel.campaignId;
+    const allowed = await canAccessCampaign(req, targetCampaignId);
     if (!allowed) {
       return res.status(403).json({ message: 'Campaign access denied.' });
     }
+
     await CampaignChannel.deleteOne({ _id: channel._id });
-    const campaign = await Campaign.findById(channel.campaignId);
+
+    await Campaign.findByIdAndUpdate(targetCampaignId, {
+      $pull: {
+        channels: {
+          $or: [
+            { _id: channel._id },
+            { socialAccountId: channel.socialAccountId },
+            { platform: channel.platform, handle: channel.requestedHandle }
+          ]
+        },
+        accountIds: channel.socialAccountId
+      }
+    });
+
+    const campaign = await Campaign.findById(targetCampaignId);
     const channels = await resolveCampaignPublishingChannels(campaign, { persist: true });
     return res.status(200).json({ success: true, channels });
   } catch (error) {
@@ -621,6 +673,18 @@ router.post('/toggle-campaign-link', protect, resolveHandlerPreview, async (req,
 
     if (existing) {
       await CampaignChannel.deleteOne({ _id: existing._id });
+      await Campaign.findByIdAndUpdate(campaignId, {
+        $pull: {
+          channels: {
+            $or: [
+              { _id: existing._id },
+              { socialAccountId: existing.socialAccountId },
+              { platform: existing.platform, handle: existing.requestedHandle }
+            ]
+          },
+          accountIds: existing.socialAccountId
+        }
+      });
     } else {
       const handle = account.username || account.name || account.accountId || 'channel';
       await CampaignChannel.create({
@@ -1370,6 +1434,11 @@ router.delete('/:id', protect, resolveHandlerPreview, async (req, res) => {
     }
 
     await SocialAccount.deleteOne(await getAccountAccessFilter(req, id));
+    await CampaignChannel.deleteMany({ socialAccountId: id });
+    await Campaign.updateMany(
+      { accountIds: id },
+      { $pull: { accountIds: id, channels: { socialAccountId: id } } }
+    );
     res.status(200).json({ message: 'Account disconnected successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -1380,14 +1449,14 @@ router.delete('/:id', protect, resolveHandlerPreview, async (req, res) => {
 // @route   POST /api/accounts/facebook-callback
 // @access  Private (Owner, Admin)
 router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, res) => {
-  const { code, campaignId, reauthorizeAccountId } = req.body;
+  const { code, redirectUri: requestRedirectUri, campaignId, reauthorizeAccountId } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
   }
 
   const appId = process.env.META_APP_ID;
   const appSecret = process.env.META_APP_SECRET;
-  const redirectUri = process.env.META_REDIRECT_URI || 'https://theeasypost.com/auth/facebook/callback';
+  const redirectUri = requestRedirectUri || process.env.META_REDIRECT_URI || 'https://theeasypost.com/auth/facebook/callback';
 
   if (!appId || !appSecret) {
     return res.status(500).json({ message: 'Meta App credentials are not configured on the backend.' });
@@ -1696,8 +1765,8 @@ router.post('/instagram-callback', protect, resolveHandlerPreview, async (req, r
     return res.status(400).json({ message: 'Authorization code is required' });
   }
 
-  const appId = process.env.INSTAGRAM_APP_ID;
-  const appSecret = process.env.INSTAGRAM_APP_SECRET;
+  const appId = process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID;
+  const appSecret = process.env.INSTAGRAM_APP_SECRET || process.env.META_APP_SECRET;
   const redirectUri = requestRedirectUri || process.env.INSTAGRAM_REDIRECT_URI || 'https://theeasypost.com/auth/instagram/callback';
 
   if (!appId || !appSecret) {
