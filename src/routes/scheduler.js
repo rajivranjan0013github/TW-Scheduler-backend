@@ -1040,12 +1040,21 @@ router.get('/', protect, async (req, res) => {
         const totalLikes = matchingPubs.reduce((sum, p) => sum + (p.latestLikes || 0), 0);
         const totalComments = matchingPubs.reduce((sum, p) => sum + (p.latestComments || 0), 0);
         const primaryPub = matchingPubs[0];
+        const platformBreakdown = matchingPubs.map((p) => ({
+          platform: p.platform,
+          accountId: p.accountId,
+          views: p.latestViews || 0,
+          likes: p.latestLikes || 0,
+          comments: p.latestComments || 0,
+          permalink: p.permalink,
+        }));
         
         return {
           ...post,
           latestViews: totalViews,
           latestLikes: totalLikes,
           latestComments: totalComments,
+          platformBreakdown,
           lastSyncedAt: primaryPub.lastSyncedAt,
           permalink: primaryPub.permalink,
           viewsSource: primaryPub.viewsSource,
@@ -2074,6 +2083,7 @@ router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req
   const { id } = req.params;
 
   try {
+    const isConnected = getDBStatus();
     let campaignId = getActiveCampaignId(req);
 
     if (!isConnected) {
@@ -2095,13 +2105,12 @@ router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req
     if (!post) {
       return res.status(404).json({ message: 'Post not found' });
     }
-    campaignId = String(post.campaignId);
     if (!cancellablePostStatuses.has(post.status)) {
       return res.status(409).json({ message: 'Only pending, paused, or manually posted queue records can be deleted.' });
     }
 
     await removePostFromQueue(post._id);
-    await ScheduledPost.deleteOne({ _id: id, campaignId });
+    await ScheduledPost.deleteOne({ _id: post._id });
     res.status(200).json({ message: 'Scheduled post removed successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });

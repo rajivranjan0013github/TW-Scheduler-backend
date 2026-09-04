@@ -247,16 +247,30 @@ export const getCreatorAnalytics = async ({ user, campaignId = '', timeZone: raw
   let thisMonthLikes = 0;
   let thisMonthComments = 0;
 
+  const byPlatform = {
+    youtube: { posts: 0, views: 0, likes: 0, comments: 0 },
+    facebook: { posts: 0, views: 0, likes: 0, comments: 0 },
+    instagram: { posts: 0, views: 0, likes: 0, comments: 0 },
+  };
+
   posts.forEach((post) => {
     const views = Number(post.latestViews || 0);
     const likes = Number(post.latestLikes || 0);
     const comments = Number(post.latestComments || 0);
     const publishedAt = post.publishedAt ? new Date(post.publishedAt) : null;
     const postAccount = accountRowsMap.get(String(post.accountId));
+    const platform = post.platform || postAccount?.platform;
 
     lifetimeViews += views;
     latestLikes += likes;
     latestComments += comments;
+
+    if (platform && byPlatform[platform]) {
+      byPlatform[platform].posts += 1;
+      byPlatform[platform].views += views;
+      byPlatform[platform].likes += likes;
+      byPlatform[platform].comments += comments;
+    }
 
     if (postAccount) {
       postAccount.posts += 1;
@@ -363,6 +377,7 @@ export const getCreatorAnalytics = async ({ user, campaignId = '', timeZone: raw
       thisMonthComments,
       last30DaysPostedViews: Array.from(last30DaysPostedViewsMap.values()),
       accountRows,
+      byPlatform,
     },
   };
 };

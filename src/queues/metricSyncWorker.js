@@ -178,7 +178,7 @@ const fetchFacebookMetrics = async (account, posts) => {
         ? 'permission_missing'
         : hasSuccessfulEngagement ? 'healthy' : 'unavailable',
       analyticsError: permissionMissing
-        ? 'Facebook denied Page engagement access. Reconnect and grant pages_read_user_content.'
+        ? 'Facebook denied Page engagement access. Reconnect and grant pages_read_engagement.'
         : hasSuccessfulEngagement ? '' : 'Facebook analytics are temporarily unavailable.',
       analyticsLastCheckedAt: new Date(),
     } }

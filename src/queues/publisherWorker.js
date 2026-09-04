@@ -21,6 +21,7 @@ let accountSyncWorker = null;
 let tokenHealthWorker = null;
 
 export const initWorker = () => {
+  console.log(`📡 Publisher Engine: ${isLivePublishingEnabled() ? 'LIVE (Real social API publishing)' : 'SIMULATION (Dev fallback mode)'}`);
   const connection = getRedisConnection();
 
   if (connection) {

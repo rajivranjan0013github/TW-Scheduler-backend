@@ -81,8 +81,27 @@ const SocialAccountSchema = new mongoose.Schema({
   },
 }, { timestamps: true });
 
+SocialAccountSchema.set('toJSON', {
+  transform: (doc, ret) => {
+    delete ret.accessToken;
+    delete ret.refreshToken;
+    return ret;
+  },
+});
+
 // Same platform account can be connected by different users, but not duplicated for the same user
 SocialAccountSchema.index({ userId: 1, accountId: 1 }, { unique: true });
 SocialAccountSchema.index({ campaignId: 1, userId: 1, isConnected: 1 });
+
+export const sanitizeSocialAccount = (account) => {
+  if (!account) return account;
+  if (Array.isArray(account)) {
+    return account.map(sanitizeSocialAccount);
+  }
+  const plain = typeof account.toObject === 'function' ? account.toObject() : { ...account };
+  delete plain.accessToken;
+  delete plain.refreshToken;
+  return plain;
+};
 
 export default mongoose.models.SocialAccount || mongoose.model('SocialAccount', SocialAccountSchema);

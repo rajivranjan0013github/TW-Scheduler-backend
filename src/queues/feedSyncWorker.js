@@ -198,6 +198,9 @@ export const runAccountFeedSync = async (accountOrId, { windowDays = 30, acquire
 
     posts = posts.filter((post) => new Date(post.publishedAt || post.createdAt).getTime() >= cutoff);
     const syncTime = new Date();
+    const youtubeDataExpiresAt = freshAccount.platform === 'youtube'
+      ? new Date(syncTime.getTime() + 30 * 24 * 60 * 60 * 1000)
+      : undefined;
     if (posts.length > 0) {
       await PublishedPost.bulkWrite(posts.map((postData) => ({
       updateOne: {
@@ -212,6 +215,7 @@ export const runAccountFeedSync = async (accountOrId, { windowDays = 30, acquire
           permalink: postData.permalink || '',
           publishedAt: new Date(postData.publishedAt || postData.createdAt),
           lastSyncedAt: syncTime,
+          ...(youtubeDataExpiresAt ? { youtubeDataExpiresAt } : {}),
           ...(postData.mediaUrl !== undefined ? { mediaUrl: postData.mediaUrl || '' } : {}),
           ...(postData.videoUrl !== undefined ? { videoUrl: postData.videoUrl || '' } : {}),
           ...(postData.mediaType !== undefined ? { mediaType: postData.mediaType || '' } : {}),
@@ -236,6 +240,24 @@ export const runAccountFeedSync = async (accountOrId, { windowDays = 30, acquire
 };
 
 /**
+ * Purges YouTube posts that have not been synced/refreshed within 30 days.
+ * Complies with YouTube Developer Policy III.E.4.a (30-day cache limitation).
+ */
+export const purgeExpiredYoutubeCache = async () => {
+  const isConnected = getDBStatus();
+  if (!isConnected) return 0;
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const result = await PublishedPost.deleteMany({
+    platform: 'youtube',
+    $or: [
+      { lastSyncedAt: { $lt: thirtyDaysAgo } },
+      { youtubeDataExpiresAt: { $lt: new Date() } },
+    ],
+  });
+  return result.deletedCount || 0;
+};
+
+/**
  * Syncs the latest published posts for all connected accounts into the PublishedPost cache.
  */
 export const runFeedSync = async () => {
@@ -245,6 +267,11 @@ export const runFeedSync = async () => {
   }
 
   try {
+    // Purge expired YouTube cached data older than 30 days
+    await purgeExpiredYoutubeCache().catch((err) => {
+      console.warn('⚠️ [Feed Sync] Failed to purge expired YouTube cache:', err.message);
+    });
+
     const accounts = await SocialAccount.find({ isConnected: true });
     let accountsProcessed = 0;
     let accountsFailed = 0;

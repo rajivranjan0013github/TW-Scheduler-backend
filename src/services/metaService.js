@@ -517,3 +517,16 @@ export const publishToFacebook = async (accessToken, pageId, mediaUrl, mediaType
   const publishedId = data.post_id || data.id;
   return publishedId;
 };
+
+export const revokeMetaPermissions = async (accessToken) => {
+  if (!accessToken) return;
+  try {
+    const res = await fetch(`https://graph.facebook.com/v20.0/me/permissions?access_token=${encodeURIComponent(accessToken)}`, {
+      method: 'DELETE',
+    });
+    const data = await res.json();
+    return data;
+  } catch (err) {
+    console.warn('⚠️ [Meta OAuth] Failed to revoke permissions on disconnect:', err.message);
+  }
+};

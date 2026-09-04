@@ -22,8 +22,7 @@ import path from 'path';
 import { Readable } from 'node:stream';
 
 const router = express.Router();
-const ADMIN_ROLES = ['owner', 'admin'];
-const MEDIA_PUBLIC_HOST = 'media.theeasypost.com';
+const MEDIA_PUBLIC_HOST = 'media.thousandpost.com';
 
 const isTrustedMediaUrl = (url) => {
   try {
@@ -32,6 +31,8 @@ const isTrustedMediaUrl = (url) => {
     const host = parsed.hostname.toLowerCase();
     return (
       host === MEDIA_PUBLIC_HOST
+      || host === 'media.theeasypost.com'
+      || host.endsWith('.thousandpost.com')
       || host.endsWith('.theeasypost.com')
       || host.endsWith('.r2.dev')
       || host.endsWith('.r2.cloudflarestorage.com')

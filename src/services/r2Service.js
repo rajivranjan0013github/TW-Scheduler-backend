@@ -14,7 +14,7 @@ const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY?.trim();
 
 const useR2 = accessKeyId && secretAccessKey && accountId;
 const bucketName = (process.env.R2_BUCKET_NAME || 'tw-creator-suite').trim();
-const publicBaseUrl = () => (process.env.R2_PUBLIC_URL || 'https://media.theeasypost.com').trim().replace(/\/$/, '');
+const publicBaseUrl = () => (process.env.R2_PUBLIC_URL || 'https://media.thousandpost.com').trim().replace(/\/$/, '');
 
 if (useR2) {
   try {
@@ -73,7 +73,7 @@ export const uploadFile = async (fileInfo) => {
     fs.mkdirSync(path.dirname(localFilePath), { recursive: true });
     fs.writeFileSync(localFilePath, fileInfo.buffer);
 
-    const backendUrl = process.env.BACKEND_URL || 'https://theeasypost.com';
+    const backendUrl = process.env.BACKEND_URL || 'https://thousandpost.com';
     const url = `${backendUrl}/uploads/${fileKey}`;
 
     return {
@@ -169,7 +169,7 @@ export const copyFile = async ({ fromKey, toKey, contentType }) => {
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
   fs.copyFileSync(sourcePath, targetPath);
 
-  const backendUrl = process.env.BACKEND_URL || 'https://theeasypost.com';
+  const backendUrl = process.env.BACKEND_URL || 'https://thousandpost.com';
   return {
     url: `${backendUrl}/uploads/${toKey}`,
     storageKey: toKey,
@@ -182,6 +182,6 @@ export const getStorageUrl = (storageKey) => {
     return `${publicBaseUrl()}/${storageKey}`;
   }
 
-  const backendUrl = process.env.BACKEND_URL || 'https://theeasypost.com';
+  const backendUrl = process.env.BACKEND_URL || 'https://thousandpost.com';
   return `${backendUrl}/uploads/${storageKey}`;
 };

@@ -1,6 +1,7 @@
 import express from 'express';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
 import { OAuth2Client } from 'google-auth-library';
 import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
@@ -27,17 +28,61 @@ const generateToken = (id) => {
 
 const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-// @desc    Auth user / Google Login Simulation & Verification
+// @desc    Auth user / Google Login or Reviewer Credentials
 // @route   POST /api/auth/login
 // @access  Public
 router.post('/login', async (req, res) => {
-  const { credential, accessToken } = req.body;
+  const { credential, accessToken, email: inputEmail, password: inputPassword } = req.body;
 
-  if (!credential && !accessToken) {
-    return res.status(400).json({ message: 'Missing Google credential token or access token' });
+  if (!credential && !accessToken && (!inputEmail || !inputPassword)) {
+    return res.status(400).json({ message: 'Missing login credentials. Provide Google token or email and password.' });
   }
 
   try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      return res.status(503).json({ message: 'Database disconnected. Sandbox login is disabled.' });
+    }
+
+    // Direct Email / Reviewer Credentials Authentication
+    if (inputEmail && inputPassword) {
+      const reviewerEmail = (process.env.REVIEWER_EMAIL || 'reviewer@thousandpost.com').toLowerCase().trim();
+      const reviewerPassword = process.env.REVIEWER_PASSWORD || 'Reviewer2026!';
+
+      let user = await User.findOne({ email: normalizedEmail });
+
+      const isReviewer = (normalizedEmail === reviewerEmail || normalizedEmail === 'reviewer@theeasypost.com') && inputPassword === reviewerPassword;
+      if (isReviewer) {
+        if (!user) {
+          const hashedPassword = await bcrypt.hash(reviewerPassword, 10);
+          user = await User.create({
+            email: normalizedEmail,
+            name: 'Meta App Reviewer',
+            role: 'owner',
+            userType: 'account_handler',
+            password: hashedPassword,
+          });
+        } else if (user.userType !== 'account_handler') {
+          user.userType = 'account_handler';
+          await user.save();
+        }
+        const token = generateToken(user._id);
+        return res.status(200).json({ user, token });
+      }
+
+      if (!user || !user.password) {
+        return res.status(401).json({ message: 'Invalid email or password.' });
+      }
+
+      const isMatch = await bcrypt.compare(inputPassword, user.password);
+      if (!isMatch) {
+        return res.status(401).json({ message: 'Invalid email or password.' });
+      }
+
+      const token = generateToken(user._id);
+      return res.status(200).json({ user, token });
+    }
+
     let email, name, avatar, googleId;
 
     if (credential) {
@@ -74,12 +119,6 @@ router.post('/login', async (req, res) => {
         console.error('Backend Google Access Token Verification Error:', err.message);
         return res.status(401).json({ message: 'Invalid Google access token' });
       }
-    }
-
-    const isConnected = getDBStatus();
-
-    if (!isConnected) {
-      return res.status(503).json({ message: 'Database disconnected. Sandbox login is disabled.' });
     }
 
     // Connected MongoDB Mode
@@ -150,21 +189,25 @@ router.put('/me', protect, async (req, res) => {
 });
 
 // Helper to parse and verify Meta signed_request
-const parseMetaSignedRequest = (signedRequest, appSecret) => {
-  if (!signedRequest || typeof signedRequest !== 'string') return null;
+export const parseMetaSignedRequest = (signedRequest, appSecret) => {
+  if (!signedRequest || typeof signedRequest !== 'string' || !appSecret) return null;
   const parts = signedRequest.split('.');
   if (parts.length !== 2) return null;
 
   const [encodedSig, encodedPayload] = parts;
-  const sig = Buffer.from(encodedSig.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('hex');
-  const expectedSig = crypto.createHmac('sha256', appSecret).update(encodedPayload).digest('hex');
+  try {
+    const sig = Buffer.from(encodedSig, 'base64url');
+    const expectedSig = crypto.createHmac('sha256', appSecret).update(encodedPayload).digest();
 
-  if (sig !== expectedSig) {
+    if (sig.length !== expectedSig.length || !crypto.timingSafeEqual(sig, expectedSig)) {
+      return null;
+    }
+
+    const payloadJson = Buffer.from(encodedPayload, 'base64url').toString('utf8');
+    return JSON.parse(payloadJson);
+  } catch {
     return null;
   }
-
-  const payloadJson = Buffer.from(encodedPayload.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
-  return JSON.parse(payloadJson);
 };
 
 // @desc    Delete user account and all connected resources (Cascade Deletion)
@@ -229,6 +272,7 @@ router.post('/meta-data-deletion', async (req, res) => {
     const socialAccounts = await SocialAccount.find({
       $or: [
         { accountId: fbUserId },
+        { 'metadata.facebookUserId': fbUserId },
         ...(user ? [{ userId: user._id }] : []),
       ],
     });
@@ -243,10 +287,16 @@ router.post('/meta-data-deletion', async (req, res) => {
       PostMetricDailySnapshot.deleteMany({ accountId: { $in: accountIds } }),
       PostInsight.deleteMany({ accountId: { $in: accountIds } }),
       Insight.deleteMany({ accountId: { $in: accountIds } }),
-      ...(user ? [User.deleteOne({ _id: user._id }), Media.deleteMany({ userId: user._id })] : []),
+      CampaignChannel.deleteMany({ socialAccountId: { $in: accountIds } }),
+      ...(user ? [
+        User.deleteOne({ _id: user._id }),
+        Media.deleteMany({ userId: user._id }),
+        ScheduledPost.deleteMany({ userId: user._id }),
+        CampaignChannel.deleteMany({ userId: user._id }),
+      ] : []),
     ]);
 
-    const statusUrl = `https://theeasypost.com/data-deletion?code=${confirmationCode}`;
+    const statusUrl = `https://thousandpost.com/data-deletion?code=${confirmationCode}`;
     return res.status(200).json({
       url: statusUrl,
       confirmation_code: confirmationCode,
@@ -254,6 +304,50 @@ router.post('/meta-data-deletion', async (req, res) => {
   } catch (err) {
     console.error('❌ Meta data deletion error:', err.message);
     return res.status(500).json({ message: 'Failed to process data deletion request.' });
+  }
+});
+
+// @desc    Meta Deauthorization Callback (signed_request when user removes app in Facebook Settings)
+// @route   POST /api/auth/meta-deauthorize
+// @access  Public
+router.post('/meta-deauthorize', async (req, res) => {
+  try {
+    const signedRequest = req.body?.signed_request;
+    const appSecret = process.env.META_APP_SECRET;
+
+    if (!signedRequest || !appSecret) {
+      return res.status(400).json({ message: 'Missing signed_request or app secret configuration.' });
+    }
+
+    const data = parseMetaSignedRequest(signedRequest, appSecret);
+    if (!data || !data.user_id) {
+      return res.status(400).json({ message: 'Invalid signed_request signature or payload.' });
+    }
+
+    const fbUserId = String(data.user_id);
+    const user = await User.findOne({ facebookId: fbUserId });
+    const socialAccounts = await SocialAccount.find({
+      $or: [
+        { accountId: fbUserId },
+        { 'metadata.facebookUserId': fbUserId },
+        ...(user ? [{ userId: user._id }] : []),
+      ],
+    });
+
+    const accountIds = socialAccounts.map((a) => a._id);
+    if (accountIds.length > 0) {
+      await SocialAccount.deleteMany({ _id: { $in: accountIds } });
+      await CampaignChannel.deleteMany({ socialAccountId: { $in: accountIds } });
+      await Campaign.updateMany(
+        { accountIds: { $in: accountIds } },
+        { $pull: { accountIds: { $in: accountIds }, channels: { socialAccountId: { $in: accountIds } } } }
+      );
+    }
+
+    return res.status(200).json({ message: 'Deauthorization processed successfully.' });
+  } catch (err) {
+    console.error('❌ Meta deauthorize error:', err.message);
+    return res.status(500).json({ message: 'Failed to process deauthorization callback.' });
   }
 });
 

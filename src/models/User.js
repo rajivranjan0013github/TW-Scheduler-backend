@@ -33,6 +33,9 @@ const UserSchema = new mongoose.Schema({
     unique: true,
     sparse: true,
   },
+  password: {
+    type: String,
+  },
 }, { timestamps: true });
 
 export default mongoose.models.User || mongoose.model('User', UserSchema);

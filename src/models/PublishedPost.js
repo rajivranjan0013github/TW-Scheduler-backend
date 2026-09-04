@@ -91,6 +91,11 @@ const PublishedPostSchema = new mongoose.Schema({
       type: Date,
     },
   }],
+  // YouTube Developer Policy III.E.4.a: 30-day data retention TTL
+  youtubeDataExpiresAt: {
+    type: Date,
+    index: true,
+  },
 }, { timestamps: true });
 
 // Prevent duplicate posts per user
@@ -100,5 +105,7 @@ PublishedPostSchema.index({ accountId: 1, publishedAt: -1 });
 PublishedPostSchema.index({ campaignId: 1, publishedAt: -1 });
 PublishedPostSchema.index({ userId: 1, publishedAt: -1 });
 PublishedPostSchema.index({ campaignId: 1, userId: 1 });
+// TTL index for automatic purging of YouTube API data past 30 calendar days
+PublishedPostSchema.index({ youtubeDataExpiresAt: 1 }, { expireAfterSeconds: 0 });
 
 export default mongoose.models.PublishedPost || mongoose.model('PublishedPost', PublishedPostSchema);

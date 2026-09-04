@@ -8,7 +8,7 @@ const YOUTUBE_READONLY_SCOPE = 'https://www.googleapis.com/auth/youtube.readonly
 const getYoutubeOAuthClient = () => {
   const clientId = process.env.YOUTUBE_CLIENT_ID || process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.YOUTUBE_CLIENT_SECRET || process.env.GOOGLE_CLIENT_SECRET;
-  const redirectUri = process.env.YOUTUBE_REDIRECT_URI || 'https://theeasypost.com/auth/youtube/callback';
+  const redirectUri = process.env.YOUTUBE_REDIRECT_URI || 'https://thousandpost.com/auth/youtube/callback';
 
   if (!clientId || !clientSecret) {
     throw new Error('YouTube OAuth credentials are not configured on the backend.');
@@ -288,3 +288,15 @@ export const fetchYoutubeVideos = async (account, { limit = 25 } = {}) => {
     };
   });
 };
+
+export const revokeYoutubeToken = async (account) => {
+  const tokenToRevoke = account?.refreshToken || account?.accessToken;
+  if (!tokenToRevoke) return;
+  try {
+    const client = getYoutubeOAuthClient();
+    await client.revokeToken(tokenToRevoke);
+  } catch (err) {
+    console.warn('⚠️ [YouTube OAuth] Failed to revoke token on disconnect:', err.message);
+  }
+};
+
