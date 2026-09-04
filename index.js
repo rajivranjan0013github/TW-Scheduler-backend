@@ -111,7 +111,6 @@ const startServer = async () => {
 
   // 4. Listen on PORT
   app.listen(PORT, () => {
-    console.log(`🚀 TW-Scheduler API running on http://localhost:${PORT}`);
   });
 };
 

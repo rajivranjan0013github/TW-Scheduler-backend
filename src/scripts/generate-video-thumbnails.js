@@ -103,10 +103,8 @@ async function run() {
   }
 
   const mediaList = await Media.find(query).lean();
-  console.log(`Found ${mediaList.length} videos without thumbnails to process...`);
 
   if (mediaList.length === 0) {
-    console.log('No videos missing thumbnails.');
     await mongoose.disconnect();
     return;
   }
@@ -116,7 +114,6 @@ async function run() {
   let failed = 0;
   const total = mediaList.length;
 
-  console.log(`Starting thumbnail generation (Concurrency: ${concurrency})...`);
 
   for (let i = 0; i < total; i += concurrency) {
     const chunk = mediaList.slice(i, i + concurrency);
@@ -126,18 +123,12 @@ async function run() {
       completed++;
       if (res.success) {
         succeeded++;
-        console.log(`[${completed}/${total}] ✅ Generated thumbnail for: ${res.name} (${res.id})`);
       } else {
         failed++;
         console.error(`[${completed}/${total}] ❌ Failed for: ${res.name} (${res.id}) - ${res.error}`);
       }
     }
   }
-
-  console.log('\n--- Thumbnail Generation Complete ---');
-  console.log(`Total: ${total}`);
-  console.log(`Succeeded: ${succeeded}`);
-  console.log(`Failed: ${failed}`);
 
   await mongoose.disconnect();
 }

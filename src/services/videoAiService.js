@@ -529,7 +529,6 @@ Output must strictly follow this JSON schema:
         };
 
     await media.save();
-    console.log(`[videoAiService] Successfully analyzed video ${media._id}: Mode=${mode}, Tags=[${extractedTags.join(', ')}]`);
     return media;
   } catch (error) {
     console.error(`[videoAiService] Error analyzing video media ${mediaId}:`, error.message);
