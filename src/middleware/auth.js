@@ -13,7 +13,7 @@ export const protect = async (req, res, next) => {
 
 
       // Handle JWT login
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret');
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
       
       const isConnected = getDBStatus();
       if (isConnected) {

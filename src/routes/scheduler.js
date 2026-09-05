@@ -83,13 +83,13 @@ const splitQueryList = (value) => String(value || '')
   .map((item) => item.trim())
   .filter(Boolean);
 
-const getSchedulerPostListQuery = (campaignId, query = {}) => {
+export const getSchedulerPostListQuery = (campaignId, query = {}) => {
   const accountIds = splitQueryList(query.accountIds);
   const campaignChannelIds = splitQueryList(query.campaignChannelIds);
   const statuses = splitQueryList(query.statuses);
   const scheduleRange = getScheduleRangeQuery(query);
   const filters = {
-    campaignId,
+    ...(campaignId ? { campaignId } : {}),
     ...(query.includeManualPostedRange === 'true' ? {} : scheduleRange),
   };
 
@@ -805,7 +805,7 @@ router.get('/dashboard-summary', protect, async (req, res) => {
   }
 });
 
-router.get('/', protect, async (req, res) => {
+router.get('/', protect, resolveHandlerPreview, async (req, res) => {
   try {
     const isConnected = getDBStatus();
     if (!isConnected) {
@@ -881,7 +881,11 @@ router.get('/', protect, async (req, res) => {
       }
     }
 
-    if (!campaignId) {
+    const isCreatorUser = req.user?.userType === 'account_handler';
+    const isAccountScopedRequest = requestedAccountIds.length > 0;
+    const canBypassCampaignRequirement = isCreatorUser || (hasAdminAccess(req.user) && isAccountScopedRequest);
+
+    if (!campaignId && !canBypassCampaignRequirement) {
       return res.status(400).json({ message: 'Campaign is required.' });
     }
 
@@ -898,7 +902,7 @@ router.get('/', protect, async (req, res) => {
           .map((normalizedHandle) => ({ platform: account.platform, normalizedHandle }))
       ));
       const channelMatch = {
-        campaignId,
+        ...(campaignId ? { campaignId } : {}),
         $or: [
           { _id: { $in: requestedAccountIds } },
           { socialAccountId: { $in: requestedAccountIds } },
@@ -908,33 +912,53 @@ router.get('/', protect, async (req, res) => {
       matchingCampaignChannelIds = await CampaignChannel.find(channelMatch).distinct('_id');
     }
 
-    if (req.user?.userType === 'account_handler') {
+    let creatorAccountIds = [];
+    let creatorChannelIdStrings = new Set();
+    if (isCreatorUser) {
       const userEmail = (req.user.email || '').trim().toLowerCase();
       const creatorAccounts = await SocialAccount.find({ userId: req.user._id }).select('_id').lean();
-      const creatorAccountIds = creatorAccounts.map((a) => a._id);
+      creatorAccountIds = creatorAccounts.map((a) => String(a._id));
+      const creatorAccountIdSet = new Set(creatorAccountIds);
 
       const creatorChannels = await CampaignChannel.find({
-        campaignId,
+        ...(campaignId ? { campaignId } : {}),
         $or: [
           { assignedHandlerUserId: req.user._id },
           ...(userEmail ? [{ assignedHandlerEmail: userEmail }] : []),
           ...(creatorAccountIds.length > 0 ? [{ socialAccountId: { $in: creatorAccountIds } }] : []),
         ],
-      }).distinct('_id');
+      }).select('_id socialAccountId').lean();
 
-      const creatorChannelIdStrings = new Set(creatorChannels.map((id) => String(id)));
+      creatorChannelIdStrings = new Set(creatorChannels.map((c) => String(c._id)));
+      const creatorSocialAccountIdStrings = new Set(creatorChannels.map((c) => String(c.socialAccountId)).filter(Boolean));
+
+      // Security check for creator: if specific accounts were requested, ensure they belong to this creator
+      if (requestedAccountIds.length > 0) {
+        const isAuthorized = requestedAccountIds.every((accId) => (
+          creatorAccountIdSet.has(accId) || creatorChannelIdStrings.has(accId) || creatorSocialAccountIdStrings.has(accId)
+        ));
+        if (!isAuthorized) {
+          return res.status(403).json({ message: 'You do not have access to one or more selected accounts.' });
+        }
+      }
+
       if (matchingCampaignChannelIds.length > 0) {
         matchingCampaignChannelIds = matchingCampaignChannelIds.filter((id) => creatorChannelIdStrings.has(String(id)));
-      } else {
-        matchingCampaignChannelIds = creatorChannels;
+      } else if (campaignId && requestedAccountIds.length === 0) {
+        matchingCampaignChannelIds = creatorChannels.map((c) => c._id);
       }
     }
 
+    let effectiveQuery = { ...req.query };
+    if (!campaignId && isCreatorUser && requestedAccountIds.length === 0) {
+      effectiveQuery.accountIds = creatorAccountIds.join(',');
+      effectiveQuery.campaignChannelIds = Array.from(creatorChannelIdStrings).join(',');
+    } else {
+      effectiveQuery.campaignChannelIds = matchingCampaignChannelIds.join(',');
+    }
+
     const posts = await populateSchedulerPostList(
-      ScheduledPost.find(getSchedulerPostListQuery(campaignId, {
-        ...req.query,
-        campaignChannelIds: matchingCampaignChannelIds.join(','),
-      }))
+      ScheduledPost.find(getSchedulerPostListQuery(campaignId, effectiveQuery))
     );
     
     // Enrich with PublishedPost metrics

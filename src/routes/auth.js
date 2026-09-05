@@ -21,7 +21,10 @@ import { storeRemoteAvatarForUser } from '../services/avatarStorageService.js';
 const router = express.Router();
 
 const generateToken = (id) => {
-  return jwt.sign({ id }, process.env.JWT_SECRET || 'fallback_secret', {
+  if (!process.env.JWT_SECRET) {
+    throw new Error('FATAL: JWT_SECRET environment variable is required.');
+  }
+  return jwt.sign({ id }, process.env.JWT_SECRET, {
     expiresIn: '30d',
   });
 };
@@ -47,19 +50,19 @@ router.post('/login', async (req, res) => {
     // Direct Email / Reviewer Credentials Authentication
     if (inputEmail && inputPassword) {
       const normalizedEmail = inputEmail.toLowerCase().trim();
-      const reviewerEmail = (process.env.REVIEWER_EMAIL || 'reviewer@thousandpost.com').toLowerCase().trim();
-      const reviewerPassword = process.env.REVIEWER_PASSWORD || 'Reviewer2026!';
+      const reviewerEmail = (process.env.REVIEWER_EMAIL || '').toLowerCase().trim();
+      const reviewerPassword = process.env.REVIEWER_PASSWORD || '';
 
       let user = await User.findOne({ email: normalizedEmail });
 
-      const isReviewer = (normalizedEmail === reviewerEmail || normalizedEmail === 'reviewer@thousandpost.com') && inputPassword === reviewerPassword;
+      const isReviewer = reviewerEmail && reviewerPassword && normalizedEmail === reviewerEmail && inputPassword === reviewerPassword;
       if (isReviewer) {
         if (!user) {
           const hashedPassword = await bcrypt.hash(reviewerPassword, 10);
           user = await User.create({
             email: normalizedEmail,
             name: 'Meta App Reviewer',
-            role: 'owner',
+            role: 'editor',
             userType: 'account_handler',
             password: hashedPassword,
           });
@@ -132,7 +135,7 @@ router.post('/login', async (req, res) => {
         name,
         avatar,
         role: userCount === 0 ? 'owner' : 'editor',
-        userType: req.body.userType,
+        userType: req.body.userType || 'account_handler',
         googleId,
       });
     }

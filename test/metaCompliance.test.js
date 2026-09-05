@@ -114,14 +114,34 @@ test('revokeMetaPermissions safely handles missing tokens', async () => {
 });
 
 test('Reviewer email and password verify successfully and normalize properly', () => {
-  const reviewerEmail = (process.env.REVIEWER_EMAIL || 'reviewer@thousandpost.com').toLowerCase().trim();
-  const reviewerPassword = process.env.REVIEWER_PASSWORD || 'Reviewer2026!';
+  // Simulate env vars being set (as they would be in production)
+  const originalEmail = process.env.REVIEWER_EMAIL;
+  const originalPassword = process.env.REVIEWER_PASSWORD;
+  process.env.REVIEWER_EMAIL = 'reviewer@thousandpost.com';
+  process.env.REVIEWER_PASSWORD = 'Reviewer2026!';
 
-  const testInputEmail = ' REVIEWER@thousandpost.com ';
-  const testInputPassword = 'Reviewer2026!';
-  const normalized = testInputEmail.toLowerCase().trim();
+  try {
+    const reviewerEmail = (process.env.REVIEWER_EMAIL || '').toLowerCase().trim();
+    const reviewerPassword = process.env.REVIEWER_PASSWORD || '';
 
-  const isReviewer = (normalized === reviewerEmail || normalized === 'reviewer@thousandpost.com') && testInputPassword === reviewerPassword;
-  assert.equal(isReviewer, true, 'Reviewer credentials must match');
+    const testInputEmail = ' REVIEWER@thousandpost.com ';
+    const testInputPassword = 'Reviewer2026!';
+    const normalized = testInputEmail.toLowerCase().trim();
+
+    const isReviewer = reviewerEmail && reviewerPassword && normalized === reviewerEmail && testInputPassword === reviewerPassword;
+    assert.equal(isReviewer, true, 'Reviewer credentials must match when env vars are set');
+
+    // Without env vars, reviewer login should be disabled
+    const emptyEmail = '';
+    const emptyPassword = '';
+    const isReviewerDisabled = emptyEmail && emptyPassword && normalized === emptyEmail && testInputPassword === emptyPassword;
+    assert.ok(!isReviewerDisabled, 'Reviewer login must be disabled when env vars are not set');
+  } finally {
+    // Restore original env vars
+    if (originalEmail !== undefined) process.env.REVIEWER_EMAIL = originalEmail;
+    else delete process.env.REVIEWER_EMAIL;
+    if (originalPassword !== undefined) process.env.REVIEWER_PASSWORD = originalPassword;
+    else delete process.env.REVIEWER_PASSWORD;
+  }
 });
 

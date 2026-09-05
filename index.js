@@ -4,6 +4,12 @@ import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+// Fail fast if critical secrets are missing
+if (!process.env.JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET environment variable is required. Server cannot start without it.');
+  process.exit(1);
+}
+
 // Import configurations and connections
 import { connectDB } from './src/config/db.js';
 import { connectRedis } from './src/config/redis.js';
@@ -20,6 +26,24 @@ import aiRoutes from './src/routes/ai.js';
 import bulkAgentRoutes from './src/routes/bulkAgent.js';
 import { protect } from './src/middleware/auth.js';
 import ScheduledPost from './src/models/ScheduledPost.js';
+import rateLimit from 'express-rate-limit';
+
+// Rate limiters
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many requests, please try again later.' },
+});
+
+const oauthLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many requests, please try again later.' },
+});
 
 // Configure __dirname for ES Modules
 const __filename = fileURLToPath(import.meta.url);
@@ -29,7 +53,22 @@ const app = express();
 const PORT = process.env.PORT || 5001;
 
 // Middleware
-app.use(cors());
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (e.g. server-to-server, mobile apps, curl)
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+}));
 app.use((req, res, next) => {
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
   res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
@@ -47,8 +86,8 @@ app.use('/uploads', express.static(path.join(__dirname, 'public/uploads'), {
 }));
 
 // Routes mapping
-app.use('/api/auth', authRoutes);
-app.use('/api/accounts', accountRoutes);
+app.use('/api/auth', authLimiter, authRoutes);
+app.use('/api/accounts', oauthLimiter, accountRoutes);
 app.use('/api/media', mediaRoutes);
 app.use('/api/scheduler', schedulerRoutes);
 app.use('/api/admin', adminRoutes);

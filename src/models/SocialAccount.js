@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { encryptToken, decryptToken, isEncryptionEnabled } from '../utils/tokenEncryption.js';
 
 const SocialAccountSchema = new mongoose.Schema({
   userId: {
@@ -80,6 +81,29 @@ const SocialAccountSchema = new mongoose.Schema({
     default: true,
   },
 }, { timestamps: true });
+
+// Encrypt tokens before saving to database
+SocialAccountSchema.pre('save', function (next) {
+  if (isEncryptionEnabled()) {
+    if (this.isModified('accessToken') && this.accessToken && !this.accessToken.startsWith('enc:')) {
+      this.accessToken = encryptToken(this.accessToken);
+    }
+    if (this.isModified('refreshToken') && this.refreshToken && !this.refreshToken.startsWith('enc:')) {
+      this.refreshToken = encryptToken(this.refreshToken);
+    }
+  }
+  next();
+});
+
+// Instance method to get decrypted access token
+SocialAccountSchema.methods.getDecryptedAccessToken = function () {
+  return decryptToken(this.accessToken);
+};
+
+// Instance method to get decrypted refresh token
+SocialAccountSchema.methods.getDecryptedRefreshToken = function () {
+  return this.refreshToken ? decryptToken(this.refreshToken) : null;
+};
 
 SocialAccountSchema.set('toJSON', {
   transform: (doc, ret) => {
