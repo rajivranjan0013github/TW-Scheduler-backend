@@ -1323,7 +1323,10 @@ router.get('/facebook/auth-url', protect, resolveHandlerPreview, async (req, res
 router.get('/instagram/auth-url', protect, resolveHandlerPreview, async (req, res) => {
   try {
     const appId = process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID;
-    const redirectUri = req.query.redirectUri || process.env.INSTAGRAM_REDIRECT_URI || 'https://thousandpost.com/auth/instagram/callback';
+    let redirectUri = req.query.redirectUri || process.env.INSTAGRAM_REDIRECT_URI || 'https://thousandpost.com/auth/instagram/callback';
+    if (typeof redirectUri === 'string' && redirectUri.includes('theeasypost.com')) {
+      redirectUri = redirectUri.replace('theeasypost.com', 'thousandpost.com');
+    }
     if (!appId) {
       return res.status(500).json({ message: 'Instagram App credentials are not configured on the backend.' });
     }
@@ -1875,7 +1878,10 @@ router.post('/instagram-callback', protect, resolveHandlerPreview, async (req, r
 
   const appId = process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID;
   const appSecret = process.env.INSTAGRAM_APP_SECRET || process.env.META_APP_SECRET;
-  const redirectUri = requestRedirectUri || process.env.INSTAGRAM_REDIRECT_URI || 'https://thousandpost.com/auth/instagram/callback';
+  let redirectUri = requestRedirectUri || process.env.INSTAGRAM_REDIRECT_URI || 'https://thousandpost.com/auth/instagram/callback';
+  if (typeof redirectUri === 'string' && redirectUri.includes('theeasypost.com')) {
+    redirectUri = redirectUri.replace('theeasypost.com', 'thousandpost.com');
+  }
 
   if (!appId || !appSecret) {
     return res.status(500).json({ message: 'Instagram App credentials are not configured on the backend. Set INSTAGRAM_APP_ID and INSTAGRAM_APP_SECRET from Instagram > API setup with Instagram login.' });
