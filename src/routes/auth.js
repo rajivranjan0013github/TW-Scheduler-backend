@@ -46,12 +46,13 @@ router.post('/login', async (req, res) => {
 
     // Direct Email / Reviewer Credentials Authentication
     if (inputEmail && inputPassword) {
+      const normalizedEmail = inputEmail.toLowerCase().trim();
       const reviewerEmail = (process.env.REVIEWER_EMAIL || 'reviewer@thousandpost.com').toLowerCase().trim();
       const reviewerPassword = process.env.REVIEWER_PASSWORD || 'Reviewer2026!';
 
       let user = await User.findOne({ email: normalizedEmail });
 
-      const isReviewer = (normalizedEmail === reviewerEmail || normalizedEmail === 'reviewer@theeasypost.com') && inputPassword === reviewerPassword;
+      const isReviewer = (normalizedEmail === reviewerEmail || normalizedEmail === 'reviewer@thousandpost.com') && inputPassword === reviewerPassword;
       if (isReviewer) {
         if (!user) {
           const hashedPassword = await bcrypt.hash(reviewerPassword, 10);

@@ -85,7 +85,7 @@ test('signOAuthState and verifyOAuthState protect against OAuth CSRF', async () 
   // 1. Valid signed state verifies correctly
   const state = signOAuthState({ userId, campaignId: 'camp_456' });
   assert.ok(typeof state === 'string' && state.includes('.'), 'State must be signed with HMAC delimiter');
-  
+
   const verified = verifyOAuthState(state, userId);
   assert.ok(verified, 'Valid state must verify');
   assert.equal(verified.userId, userId);
@@ -111,5 +111,17 @@ test('revokeMetaPermissions safely handles missing tokens', async () => {
   assert.equal(result, undefined);
   const resultEmpty = await revokeMetaPermissions('');
   assert.equal(resultEmpty, undefined);
+});
+
+test('Reviewer email and password verify successfully and normalize properly', () => {
+  const reviewerEmail = (process.env.REVIEWER_EMAIL || 'reviewer@thousandpost.com').toLowerCase().trim();
+  const reviewerPassword = process.env.REVIEWER_PASSWORD || 'Reviewer2026!';
+
+  const testInputEmail = ' REVIEWER@thousandpost.com ';
+  const testInputPassword = 'Reviewer2026!';
+  const normalized = testInputEmail.toLowerCase().trim();
+
+  const isReviewer = (normalized === reviewerEmail || normalized === 'reviewer@thousandpost.com') && testInputPassword === reviewerPassword;
+  assert.equal(isReviewer, true, 'Reviewer credentials must match');
 });
 

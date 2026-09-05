@@ -153,6 +153,28 @@ const fetchInstagramMetrics = async (account, posts) => {
   )));
 };
 
+export const resolveFacebookAnalyticsStatus = (rows = []) => {
+  const hasSuccessfulEngagement = rows.some(([, metrics]) => !metrics.engagementErrorType);
+  const permissionMissing = rows.some(([, metrics]) => metrics.engagementErrorType === 'permission_missing');
+
+  // A single stale or inaccessible Facebook post can return error code 10 even
+  // when the Page token can read engagement for the account's other posts.
+  // Only treat this as an account-wide permission problem when no post succeeds.
+  if (hasSuccessfulEngagement) {
+    return { status: 'healthy', error: '' };
+  }
+  if (permissionMissing) {
+    return {
+      status: 'permission_missing',
+      error: 'Facebook denied Page engagement access. Reconnect and grant pages_read_engagement.',
+    };
+  }
+  return {
+    status: 'unavailable',
+    error: 'Facebook analytics are temporarily unavailable.',
+  };
+};
+
 const fetchFacebookMetrics = async (account, posts) => {
   const rows = await mapWithConcurrency(posts, FACEBOOK_POST_CONCURRENCY, async (post) => {
     const [viewResult, engagement] = await Promise.all([
@@ -169,17 +191,12 @@ const fetchFacebookMetrics = async (account, posts) => {
     }];
   });
 
-  const permissionMissing = rows.some(([, metrics]) => metrics.engagementErrorType === 'permission_missing');
-  const hasSuccessfulEngagement = rows.some(([, metrics]) => !metrics.engagementErrorType);
+  const analyticsHealth = resolveFacebookAnalyticsStatus(rows);
   await SocialAccount.updateOne(
     { _id: account._id },
     { $set: {
-      analyticsStatus: permissionMissing
-        ? 'permission_missing'
-        : hasSuccessfulEngagement ? 'healthy' : 'unavailable',
-      analyticsError: permissionMissing
-        ? 'Facebook denied Page engagement access. Reconnect and grant pages_read_engagement.'
-        : hasSuccessfulEngagement ? '' : 'Facebook analytics are temporarily unavailable.',
+      analyticsStatus: analyticsHealth.status,
+      analyticsError: analyticsHealth.error,
       analyticsLastCheckedAt: new Date(),
     } }
   );

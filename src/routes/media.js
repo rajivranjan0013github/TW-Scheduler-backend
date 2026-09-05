@@ -13,10 +13,10 @@ import CampaignChannel from '../models/CampaignChannel.js';
 import Campaign from '../models/Campaign.js';
 import SocialAccount from '../models/SocialAccount.js';
 import { uploadFile, deleteFile, createPresignedUploadUrl, fileExists, getStorageUrl, isR2DirectUploadAvailable } from '../services/r2Service.js';
-import { protect, authorize } from '../middleware/auth.js';
+import { protect, authorize, resolveHandlerPreview } from '../middleware/auth.js';
 import { getOriginalStorageKey, getThumbnailStorageKey } from '../utils/storageKeys.js';
 import { generateThumbnailFromBuffer, ensureMediaThumbnail } from '../services/videoThumbnailService.js';
-import { ensureDefaultCampaignFolders } from '../services/campaignFolderService.js';
+import { ensureDefaultCampaignFolders, ensureCreatorFolder } from '../services/campaignFolderService.js';
 import { analyzeMediaVideo } from '../services/videoAiService.js';
 import path from 'path';
 import { Readable } from 'node:stream';
@@ -31,9 +31,9 @@ const isTrustedMediaUrl = (url) => {
     const host = parsed.hostname.toLowerCase();
     return (
       host === MEDIA_PUBLIC_HOST
-      || host === 'media.theeasypost.com'
+      || host === 'media.thousandpost.com'
       || host.endsWith('.thousandpost.com')
-      || host.endsWith('.theeasypost.com')
+      || host.endsWith('.thousandpost.com')
       || host.endsWith('.r2.dev')
       || host.endsWith('.r2.cloudflarestorage.com')
       || host.endsWith('.blob.core.windows.net')
@@ -60,9 +60,19 @@ const requireCampaignId = (req, res) => {
   return campaignId;
 };
 
-const normalizeScope = (value) => (value === 'global' ? 'global' : 'campaign');
+const normalizeScope = (value) => (
+  ['global', 'personal'].includes(value) ? value : 'campaign'
+);
 const getRequestedScope = (req) => normalizeScope(req.query.scope || req.body?.scope);
 const isAdminRole = (req) => ADMIN_ROLES.includes(req.user?.role);
+
+const requirePersonalScopePermission = (req, res) => {
+  if (req.user?.userType !== 'account_handler') {
+    res.status(403).json({ message: 'Personal media is available to creators only.' });
+    return false;
+  }
+  return true;
+};
 
 const requireGlobalPermission = (req, res) => {
   if (!isAdminRole(req)) {
@@ -72,9 +82,13 @@ const requireGlobalPermission = (req, res) => {
   return true;
 };
 
-const getReadableScopeQuery = (campaignId, requestedScope = 'campaign') => {
+const getReadableScopeQuery = (campaignId, requestedScope = 'campaign', userId = null) => {
   if (requestedScope === 'global') {
     return { scope: 'global' };
+  }
+
+  if (requestedScope === 'personal') {
+    return { scope: 'personal', userId };
   }
 
   return {
@@ -130,6 +144,16 @@ const getDescendantFolderIds = async (rootFolderId, scope, campaignId) => {
 const getUploadScopeContext = async (req, res, folderId) => {
   const requestedScope = getWritableScope(req, res);
   if (!requestedScope) return null;
+
+  if (requestedScope === 'personal') {
+    if (!requirePersonalScopePermission(req, res)) return null;
+    const resolvedFolderId = folderId && folderId !== 'null' ? folderId : null;
+    if (resolvedFolderId) {
+      res.status(400).json({ message: 'Personal media cannot use campaign folders.' });
+      return null;
+    }
+    return { scope: 'personal', campaignId: null, folderId: null };
+  }
 
   const campaignId = requestedScope === 'global' ? null : requireCampaignId(req, res);
   if (requestedScope === 'campaign' && !campaignId) return null;
@@ -345,6 +369,19 @@ const getValidSocialAccountIds = async (accountIds, campaignId) => {
   return channels.map((channel) => channel.socialAccountId);
 };
 
+const getOwnedConnectedSocialAccountIds = async (accountIds, userId) => {
+  const uniqueIds = [...new Set(accountIds.map((id) => String(id)))];
+  if (uniqueIds.length === 0) return [];
+
+  const accounts = await SocialAccount.find({
+    _id: { $in: uniqueIds },
+    userId,
+    isConnected: true,
+  }).select('_id');
+
+  return accounts.map((account) => account._id);
+};
+
 // Multer in-memory storage configuration
 const storage = multer.memoryStorage();
 const upload = multer({
@@ -384,14 +421,14 @@ router.get('/proxy', async (req, res) => {
     }
 
     const response = await fetch(url, { headers });
-    
+
     // Set headers
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type');
     res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges');
-    
+
     const contentType = response.headers.get('content-type');
     if (contentType) res.setHeader('Content-Type', contentType);
 
@@ -496,10 +533,10 @@ router.get('/folders', protect, async (req, res) => {
         ]),
         coverMediaIds.length > 0
           ? Media.find({
-              _id: { $in: coverMediaIds },
-              folderId: { $in: folderIds },
-              type: 'image',
-            }).select('_id name type url thumbnailUrl').lean()
+            _id: { $in: coverMediaIds },
+            folderId: { $in: folderIds },
+            type: 'image',
+          }).select('_id name type url thumbnailUrl').lean()
           : [],
         Folder.aggregate([
           { $match: { parentFolderId: { $in: folderIds } } },
@@ -709,10 +746,10 @@ router.put('/folders/:id', protect, authorize('owner', 'admin', 'editor'), async
       if (hasCoverMediaId) {
         const coverMedia = nextCoverMediaId
           ? mockStore.media.find((item) => (
-              String(item._id) === nextCoverMediaId
-              && String(item.folderId || '') === String(id)
-              && item.type === 'image'
-            ))
+            String(item._id) === nextCoverMediaId
+            && String(item.folderId || '') === String(id)
+            && item.type === 'image'
+          ))
           : null;
         if (nextCoverMediaId && !coverMedia) {
           return res.status(400).json({ message: 'Folder cover must be an image inside this folder.' });
@@ -910,7 +947,7 @@ router.get('/showcase', protect, async (req, res) => {
     mediaList.forEach((media) => {
       if (media.aiStatus === 'none' || media.aiStatus === 'pending') {
         media.aiStatus = 'processing';
-        media.save().catch(() => {});
+        media.save().catch(() => { });
         analyzeMediaVideo(media._id, { mode: 'app_showcase', campaignId }).catch((err) => {
           console.error(`[media.js] Error auto-analyzing showcase video ${media._id}:`, err);
         });
@@ -927,12 +964,14 @@ router.get('/showcase', protect, async (req, res) => {
 // @desc    Get all media assets
 // @route   GET /api/media
 // @access  Private
-router.get('/', protect, async (req, res) => {
-  const { folderId, tag, accountId, page, limit } = req.query;
+router.get('/', protect, resolveHandlerPreview, async (req, res) => {
+  const { folderId, tag, accountId, page, limit, onlyMyUploads, userId, type } = req.query;
 
   try {
     const isConnected = getDBStatus();
-    
+    const requestedScope = getRequestedScope(req);
+    if (requestedScope === 'personal' && !requirePersonalScopePermission(req, res)) return;
+
     let queryLimit = undefined;
     let querySkip = undefined;
     if (page && limit) {
@@ -942,7 +981,21 @@ router.get('/', protect, async (req, res) => {
 
     if (!isConnected) {
       let filtered = [...mockStore.media];
-      
+
+      if (requestedScope === 'personal') {
+        filtered = filtered.filter((media) => (
+          normalizeScope(media.scope) === 'personal'
+          && String(media.userId || '') === String(req.user._id)
+        ));
+      }
+
+      if (onlyMyUploads === 'true' || userId) {
+        const targetUserId = String(userId || req.user?._id);
+        filtered = filtered.filter(m => String(m.userId) === targetUserId);
+      }
+      if (type) {
+        filtered = filtered.filter(m => m.type === type);
+      }
       if (folderId) {
         filtered = filtered.filter(m => m.folderId === folderId || (folderId === 'root' && !m.folderId));
       }
@@ -955,7 +1008,7 @@ router.get('/', protect, async (req, res) => {
           return mediaAccountIds.length === 0 || mediaAccountIds.includes(accountId);
         });
       }
-      
+
       filtered.sort((a, b) => {
         const batchA = new Date(a.uploadBatchCreatedAt || a.createdAt).getTime();
         const batchB = new Date(b.uploadBatchCreatedAt || b.createdAt).getTime();
@@ -965,19 +1018,21 @@ router.get('/', protect, async (req, res) => {
         if (orderA !== orderB) return orderA - orderB;
         return new Date(b.createdAt) - new Date(a.createdAt);
       });
-      
+
       if (querySkip !== undefined && queryLimit !== undefined) {
         filtered = filtered.slice(querySkip, querySkip + queryLimit);
       }
-      
+
       return res.status(200).json(filtered);
     }
     const includeSubfolders = String(req.query.includeSubfolders || '').toLowerCase() === 'true';
     const query = {};
 
-    const campaignId = requireCampaignId(req, res);
-    if (!campaignId && getRequestedScope(req) !== 'global') return;
-    Object.assign(query, getReadableScopeQuery(campaignId, getRequestedScope(req)));
+    const campaignId = ['global', 'personal'].includes(requestedScope)
+      ? null
+      : requireCampaignId(req, res);
+    if (!campaignId && requestedScope === 'campaign') return;
+    Object.assign(query, getReadableScopeQuery(campaignId, requestedScope, req.user._id));
 
     if (folderId) {
       if (folderId === 'root') {
@@ -990,6 +1045,14 @@ router.get('/', protect, async (req, res) => {
       } else {
         query.folderId = folderId;
       }
+    }
+    if (requestedScope === 'personal') {
+      query.userId = req.user._id;
+    } else if (onlyMyUploads === 'true' || userId) {
+      query.userId = userId || req.user._id;
+    }
+    if (type) {
+      query.type = type;
     }
     if (tag) {
       query.tags = tag.toLowerCase();
@@ -1098,35 +1161,276 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
     return res.status(409).json({ message: 'Direct upload requires Cloudflare R2 configuration.' });
   }
 
-    const {
-      mediaId,
-      name,
-      contentType = '',
-      folderId,
-      storageKey,
-      thumbnailStorageKey: passedThumbKey,
-      thumbnailUrl: passedThumbUrl,
-      caption = '',
-      tags,
-      size,
-      aiMode,
-      uploadBatchId = '',
-      uploadBatchCreatedAt,
-      uploadOrder,
-    } = req.body || {};
+  const {
+    mediaId,
+    name,
+    contentType = '',
+    folderId,
+    storageKey,
+    thumbnailStorageKey: passedThumbKey,
+    thumbnailUrl: passedThumbUrl,
+    caption = '',
+    tags,
+    size,
+    aiMode,
+    uploadBatchId = '',
+    uploadBatchCreatedAt,
+    uploadOrder,
+  } = req.body || {};
 
-    if (!mediaId || !name || !storageKey) {
-      return res.status(400).json({ message: 'Media id, file name, and storage key are required.' });
+  if (!mediaId || !name || !storageKey) {
+    return res.status(400).json({ message: 'Media id, file name, and storage key are required.' });
+  }
+
+  try {
+    const scopeContext = await getUploadScopeContext(req, res, folderId);
+    if (!scopeContext) return;
+    const requestedAccountIds = parseIdList(req.body.socialAccountIds);
+    let socialAccountIds = [];
+    if (scopeContext.scope === 'global') {
+      if (requestedAccountIds.length > 0) {
+        return res.status(400).json({ message: 'Global media cannot be restricted to campaign channels.' });
+      }
+    } else if (scopeContext.scope === 'personal') {
+      socialAccountIds = await getOwnedConnectedSocialAccountIds(requestedAccountIds, req.user._id);
+      if (requestedAccountIds.length > 0 && socialAccountIds.length !== [...new Set(requestedAccountIds.map(String))].length) {
+        return res.status(400).json({ message: 'One or more selected publishing channels are not owned by this creator.' });
+      }
+    } else {
+      socialAccountIds = await getValidSocialAccountIds(requestedAccountIds, scopeContext.campaignId);
+      if (requestedAccountIds.length > 0 && socialAccountIds.length !== requestedAccountIds.length) {
+        return res.status(400).json({ message: 'One or more selected publishing channels are not connected.' });
+      }
     }
 
-    try {
-      const scopeContext = await getUploadScopeContext(req, res, folderId);
-      if (!scopeContext) return;
-      const requestedAccountIds = parseIdList(req.body.socialAccountIds);
-      let socialAccountIds = [];
+    const expectedStorageKey = getOriginalStorageKey({
+      userId: req.user._id,
+      folderId: scopeContext.folderId,
+      mediaId,
+      originalName: name,
+    });
+    if (storageKey !== expectedStorageKey) {
+      return res.status(400).json({ message: 'Upload storage key does not match this media asset.' });
+    }
+
+    const existing = await Media.findOne({
+      _id: mediaId,
+      ...(scopeContext.scope === 'global' ? { scope: 'global' } : { campaignId: scopeContext.campaignId }),
+    })
+      .populate('socialAccountIds', 'name username platform avatarUrl isConnected');
+    if (existing) {
+      return res.status(200).json(existing);
+    }
+
+    const exists = await fileExists(storageKey);
+    if (!exists) {
+      return res.status(400).json({ message: 'Uploaded file was not found in R2.' });
+    }
+
+    const mediaType = getMediaTypeFromMime(contentType);
+    let thumbnailStorageKey = '';
+    let thumbnailUrl = '';
+    let thumbnailGeneratedAt = undefined;
+
+    if (mediaType === 'video') {
+      const expectedThumbKey = getThumbnailStorageKey({
+        userId: req.user._id,
+        folderId: scopeContext.folderId,
+        mediaId,
+      });
+
+      if (passedThumbKey && passedThumbKey === expectedThumbKey) {
+        thumbnailStorageKey = passedThumbKey;
+        thumbnailUrl = passedThumbUrl || getStorageUrl(passedThumbKey);
+        thumbnailGeneratedAt = new Date();
+      } else {
+        const thumbExists = await fileExists(expectedThumbKey);
+        if (thumbExists) {
+          thumbnailStorageKey = expectedThumbKey;
+          thumbnailUrl = getStorageUrl(expectedThumbKey);
+          thumbnailGeneratedAt = new Date();
+        }
+      }
+    }
+
+    const media = await Media.create({
+      _id: mediaId,
+      userId: req.user._id,
+      campaignId: scopeContext.campaignId,
+      scope: scopeContext.scope,
+      folderId: scopeContext.folderId,
+      socialAccountIds,
+      name,
+      type: mediaType,
+      url: getStorageUrl(storageKey),
+      storageKey,
+      thumbnailUrl,
+      thumbnailStorageKey,
+      thumbnailGeneratedAt,
+      caption: caption || '',
+      uploadBatchId: String(uploadBatchId || ''),
+      uploadBatchCreatedAt: parseUploadBatchCreatedAt(uploadBatchCreatedAt),
+      uploadOrder: parseUploadOrder(uploadOrder),
+      tags: parseTagList(tags),
+      size: Number(size) || undefined,
+    });
+
+    if (mediaType === 'video') {
+      if (!thumbnailUrl) {
+        // Trigger background fallback to extract frame using ffmpeg
+        ensureMediaThumbnail(media._id).catch(() => { });
+      }
+      media.aiStatus = 'processing';
+      await media.save();
+      // Asynchronously analyze with Gemini (non-blocking)
+      const explicitMode = aiMode === 'app_showcase' || aiMode === 'reaction' ? aiMode : undefined;
+      analyzeMediaVideo(media._id, { mode: explicitMode }).catch((err) => {
+        console.error(`[media.js] Failed to analyze video ${media._id}:`, err);
+      });
+    }
+
+    const populated = await Media.findById(media._id)
+      .populate('socialAccountIds', 'name username platform avatarUrl isConnected');
+
+    res.status(201).json(populated);
+  } catch (error) {
+    console.error('Direct upload complete error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Upload media file
+// @route   POST /api/media/upload
+// @access  Private (Owner, Admin, Editor)
+router.post('/upload', protect, resolveHandlerPreview, authorize('owner', 'admin', 'editor'), upload.single('file'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ message: 'No file uploaded' });
+  }
+
+  const {
+    folderId,
+    tags,
+    caption,
+    sourceUsage,
+    aiMode,
+    uploadBatchId = '',
+    uploadBatchCreatedAt,
+    uploadOrder,
+  } = req.body;
+  const requestedAccountIds = parseIdList(req.body.socialAccountIds);
+  const mimeType = req.file.mimetype;
+  const mediaType = getMediaTypeFromMime(mimeType);
+
+  try {
+    const tagList = parseTagList(tags);
+    const parsedSourceUsage = parseSourceUsage(sourceUsage);
+    const isConnected = getDBStatus();
+    const scopeContext = isConnected
+      ? await getUploadScopeContext(req, res, folderId)
+      : {
+        scope: getRequestedScope(req),
+        campaignId: getRequestedScope(req) === 'global' ? null : getActiveCampaignId(req),
+        folderId: folderId && folderId !== 'null' ? folderId : null,
+      };
+    if (!scopeContext) return;
+    if (!isConnected && scopeContext.scope === 'personal' && !requirePersonalScopePermission(req, res)) return;
+
+    // Auto-assign showcase uploads to campaign's App Showcase folder if folderId is not specified
+    if (!scopeContext.folderId && scopeContext.campaignId) {
+      const isShowcaseUpload = aiMode === 'app_showcase' || tagList.some((t) => t === 'app-showcase' || t === 'showcase' || t === 'promo');
+      if (isShowcaseUpload) {
+        if (isConnected) {
+          const folderMap = await ensureDefaultCampaignFolders(scopeContext.campaignId, req.user?._id);
+          const showcaseFolder = folderMap?.['App Showcase'] || await Folder.findOne({
+            campaignId: scopeContext.campaignId,
+            scope: 'campaign',
+            $or: [{ name: /^app showcase$/i }, { tags: 'app-showcase' }, { tags: 'promo' }],
+          });
+          if (showcaseFolder?._id) {
+            scopeContext.folderId = showcaseFolder._id;
+          }
+        } else {
+          const mockFolder = mockStore.folders.find((f) => (
+            String(f.campaignId || '') === String(scopeContext.campaignId) &&
+            (/app showcase/i.test(f.name) || (f.tags || []).includes('app-showcase'))
+          ));
+          if (mockFolder?._id) {
+            scopeContext.folderId = mockFolder._id;
+          }
+        }
+      }
+    }
+
+    // Auto-assign creator uploads to their personal campaign folder if folderId is not specified
+    if (!scopeContext.folderId && scopeContext.campaignId && req.user?.userType === 'account_handler') {
+      if (isConnected) {
+        const creatorFolder = await ensureCreatorFolder(scopeContext.campaignId, req.user);
+        if (creatorFolder?._id) {
+          scopeContext.folderId = creatorFolder._id;
+        }
+      } else {
+        const creatorName = (req.user.name || 'Creator').trim();
+        let mockFolder = mockStore.folders.find((f) => (
+          String(f.campaignId || '') === String(scopeContext.campaignId) &&
+          (String(f.userId || '') === String(req.user._id) || f.name.toLowerCase() === creatorName.toLowerCase())
+        ));
+        if (!mockFolder) {
+          mockFolder = {
+            _id: `f_${Date.now()}`,
+            userId: req.user._id,
+            campaignId: scopeContext.campaignId,
+            scope: 'campaign',
+            name: creatorName,
+            parentFolderId: null,
+            kind: 'folder',
+            tags: ['creator-uploads', `creator:${req.user._id}`, 'schedule'],
+            createdAt: new Date(),
+          };
+          mockStore.folders.push(mockFolder);
+        }
+        scopeContext.folderId = mockFolder._id;
+      }
+    }
+
+    // Auto-assign schedule uploads or handler device uploads to campaign's Generated folder if folderId is not specified
+    if (!scopeContext.folderId && scopeContext.campaignId) {
+      const isScheduleUpload = parsedSourceUsage === 'schedule'
+        || tagList.some((t) => t === 'schedule' || t === 'generated');
+
+      if (isScheduleUpload) {
+        if (isConnected) {
+          const folderMap = await ensureDefaultCampaignFolders(scopeContext.campaignId, req.user?._id);
+          const generatedFolder = folderMap?.['Generated'] || await Folder.findOne({
+            campaignId: scopeContext.campaignId,
+            scope: 'campaign',
+            $or: [{ name: /^generated$/i }, { tags: 'generated' }, { tags: 'schedule' }],
+          });
+          if (generatedFolder?._id) {
+            scopeContext.folderId = generatedFolder._id;
+          }
+        } else {
+          const mockFolder = mockStore.folders.find((f) => (
+            String(f.campaignId || '') === String(scopeContext.campaignId) &&
+            (/generated/i.test(f.name) || (f.tags || []).includes('generated') || (f.tags || []).includes('schedule'))
+          ));
+          if (mockFolder?._id) {
+            scopeContext.folderId = mockFolder._id;
+          }
+        }
+      }
+    }
+    let socialAccountIds = requestedAccountIds;
+
+    if (isConnected) {
       if (scopeContext.scope === 'global') {
         if (requestedAccountIds.length > 0) {
           return res.status(400).json({ message: 'Global media cannot be restricted to campaign channels.' });
+        }
+        socialAccountIds = [];
+      } else if (scopeContext.scope === 'personal') {
+        socialAccountIds = await getOwnedConnectedSocialAccountIds(requestedAccountIds, req.user._id);
+        if (requestedAccountIds.length > 0 && socialAccountIds.length !== [...new Set(requestedAccountIds.map(String))].length) {
+          return res.status(400).json({ message: 'One or more selected publishing channels are not owned by this creator.' });
         }
       } else {
         socialAccountIds = await getValidSocialAccountIds(requestedAccountIds, scopeContext.campaignId);
@@ -1134,407 +1438,208 @@ router.post('/direct-upload/complete', protect, authorize('owner', 'admin', 'edi
           return res.status(400).json({ message: 'One or more selected publishing channels are not connected.' });
         }
       }
-
-      const expectedStorageKey = getOriginalStorageKey({
-        userId: req.user._id,
-        folderId: scopeContext.folderId,
-        mediaId,
-        originalName: name,
-      });
-      if (storageKey !== expectedStorageKey) {
-        return res.status(400).json({ message: 'Upload storage key does not match this media asset.' });
-      }
-
-      const existing = await Media.findOne({
-        _id: mediaId,
-        ...(scopeContext.scope === 'global' ? { scope: 'global' } : { campaignId: scopeContext.campaignId }),
-      })
-        .populate('socialAccountIds', 'name username platform avatarUrl isConnected');
-      if (existing) {
-        return res.status(200).json(existing);
-      }
-
-      const exists = await fileExists(storageKey);
-      if (!exists) {
-        return res.status(400).json({ message: 'Uploaded file was not found in R2.' });
-      }
-
-      const mediaType = getMediaTypeFromMime(contentType);
-      let thumbnailStorageKey = '';
-      let thumbnailUrl = '';
-      let thumbnailGeneratedAt = undefined;
-
-      if (mediaType === 'video') {
-        const expectedThumbKey = getThumbnailStorageKey({
-          userId: req.user._id,
-          folderId: scopeContext.folderId,
-          mediaId,
-        });
-
-        if (passedThumbKey && passedThumbKey === expectedThumbKey) {
-          thumbnailStorageKey = passedThumbKey;
-          thumbnailUrl = passedThumbUrl || getStorageUrl(passedThumbKey);
-          thumbnailGeneratedAt = new Date();
-        } else {
-          const thumbExists = await fileExists(expectedThumbKey);
-          if (thumbExists) {
-            thumbnailStorageKey = expectedThumbKey;
-            thumbnailUrl = getStorageUrl(expectedThumbKey);
-            thumbnailGeneratedAt = new Date();
-          }
-        }
-      }
-
-      const media = await Media.create({
-        _id: mediaId,
-        userId: req.user._id,
-        campaignId: scopeContext.campaignId,
-        scope: scopeContext.scope,
-        folderId: scopeContext.folderId,
-        socialAccountIds,
-        name,
-        type: mediaType,
-        url: getStorageUrl(storageKey),
-        storageKey,
-        thumbnailUrl,
-        thumbnailStorageKey,
-        thumbnailGeneratedAt,
-        caption: caption || '',
-        uploadBatchId: String(uploadBatchId || ''),
-        uploadBatchCreatedAt: parseUploadBatchCreatedAt(uploadBatchCreatedAt),
-        uploadOrder: parseUploadOrder(uploadOrder),
-        tags: parseTagList(tags),
-        size: Number(size) || undefined,
-      });
-
-      if (mediaType === 'video') {
-        if (!thumbnailUrl) {
-          // Trigger background fallback to extract frame using ffmpeg
-          ensureMediaThumbnail(media._id).catch(() => {});
-        }
-        media.aiStatus = 'processing';
-        await media.save();
-        // Asynchronously analyze with Gemini (non-blocking)
-        const explicitMode = aiMode === 'app_showcase' || aiMode === 'reaction' ? aiMode : undefined;
-        analyzeMediaVideo(media._id, { mode: explicitMode }).catch((err) => {
-          console.error(`[media.js] Failed to analyze video ${media._id}:`, err);
-        });
-      }
-
-      const populated = await Media.findById(media._id)
-        .populate('socialAccountIds', 'name username platform avatarUrl isConnected');
-
-      res.status(201).json(populated);
-    } catch (error) {
-      console.error('Direct upload complete error:', error);
-      res.status(500).json({ message: error.message });
-    }
-  });
-
-  // @desc    Upload media file
-  // @route   POST /api/media/upload
-  // @access  Private (Owner, Admin, Editor)
-  router.post('/upload', protect, authorize('owner', 'admin', 'editor'), upload.single('file'), async (req, res) => {
-    if (!req.file) {
-      return res.status(400).json({ message: 'No file uploaded' });
     }
 
-    const {
-      folderId,
-      tags,
-      caption,
-      sourceUsage,
-      aiMode,
-      uploadBatchId = '',
-      uploadBatchCreatedAt,
-      uploadOrder,
-    } = req.body;
-    const requestedAccountIds = parseIdList(req.body.socialAccountIds);
-    const mimeType = req.file.mimetype;
-    const mediaType = getMediaTypeFromMime(mimeType);
-
-    try {
-      const tagList = parseTagList(tags);
-      const parsedSourceUsage = parseSourceUsage(sourceUsage);
-      const isConnected = getDBStatus();
-      const scopeContext = isConnected
-        ? await getUploadScopeContext(req, res, folderId)
-        : {
-            scope: getRequestedScope(req),
-            campaignId: getRequestedScope(req) === 'global' ? null : getActiveCampaignId(req),
-            folderId: folderId && folderId !== 'null' ? folderId : null,
-          };
-      if (!scopeContext) return;
-
-      // Auto-assign showcase uploads to campaign's App Showcase folder if folderId is not specified
-      if (!scopeContext.folderId && scopeContext.campaignId) {
-        const isShowcaseUpload = aiMode === 'app_showcase' || tagList.some((t) => t === 'app-showcase' || t === 'showcase' || t === 'promo');
-        if (isShowcaseUpload) {
-          if (isConnected) {
-            const folderMap = await ensureDefaultCampaignFolders(scopeContext.campaignId, req.user?._id);
-            const showcaseFolder = folderMap?.['App Showcase'] || await Folder.findOne({
-              campaignId: scopeContext.campaignId,
-              scope: 'campaign',
-              $or: [{ name: /^app showcase$/i }, { tags: 'app-showcase' }, { tags: 'promo' }],
-            });
-            if (showcaseFolder?._id) {
-              scopeContext.folderId = showcaseFolder._id;
-            }
-          } else {
-            const mockFolder = mockStore.folders.find((f) => (
-              String(f.campaignId || '') === String(scopeContext.campaignId) &&
-              (/app showcase/i.test(f.name) || (f.tags || []).includes('app-showcase'))
-            ));
-            if (mockFolder?._id) {
-              scopeContext.folderId = mockFolder._id;
-            }
-          }
-        }
-      }
-
-      // Auto-assign schedule uploads or handler device uploads to campaign's Generated folder if folderId is not specified
-      if (!scopeContext.folderId && scopeContext.campaignId) {
-        const isScheduleUpload = req.user?.userType === 'account_handler'
-          || parsedSourceUsage === 'schedule'
-          || tagList.some((t) => t === 'schedule' || t === 'generated');
-
-        if (isScheduleUpload) {
-          if (isConnected) {
-            const folderMap = await ensureDefaultCampaignFolders(scopeContext.campaignId, req.user?._id);
-            const generatedFolder = folderMap?.['Generated'] || await Folder.findOne({
-              campaignId: scopeContext.campaignId,
-              scope: 'campaign',
-              $or: [{ name: /^generated$/i }, { tags: 'generated' }, { tags: 'schedule' }],
-            });
-            if (generatedFolder?._id) {
-              scopeContext.folderId = generatedFolder._id;
-            }
-          } else {
-            const mockFolder = mockStore.folders.find((f) => (
-              String(f.campaignId || '') === String(scopeContext.campaignId) &&
-              (/generated/i.test(f.name) || (f.tags || []).includes('generated') || (f.tags || []).includes('schedule'))
-            ));
-            if (mockFolder?._id) {
-              scopeContext.folderId = mockFolder._id;
-            }
-          }
-        }
-      }
-      let socialAccountIds = requestedAccountIds;
-
-      if (isConnected) {
-        if (scopeContext.scope === 'global') {
-          if (requestedAccountIds.length > 0) {
-            return res.status(400).json({ message: 'Global media cannot be restricted to campaign channels.' });
-          }
-          socialAccountIds = [];
-        } else {
-          socialAccountIds = await getValidSocialAccountIds(requestedAccountIds, scopeContext.campaignId);
-          if (requestedAccountIds.length > 0 && socialAccountIds.length !== requestedAccountIds.length) {
-            return res.status(400).json({ message: 'One or more selected publishing channels are not connected.' });
-          }
-        }
-      }
-
-      if (!isConnected) {
-        const mediaId = `m_${Date.now()}`;
-        const storageKey = getOriginalStorageKey({
-          userId: req.user?._id || 'mock-user',
-          folderId: scopeContext.folderId,
-          mediaId,
-          originalName: req.file.originalname,
-        });
-        const { url } = await uploadFile({ ...req.file, storageKey });
-        const newMedia = {
-          _id: mediaId,
-          campaignId: scopeContext.campaignId,
-          scope: scopeContext.scope,
-          folderId: scopeContext.folderId,
-          name: req.file.originalname,
-          type: mediaType,
-          url,
-          storageKey,
-          caption: caption || '',
-          sourceUsage: parsedSourceUsage,
-          uploadBatchId: String(uploadBatchId || ''),
-          uploadBatchCreatedAt: parseUploadBatchCreatedAt(uploadBatchCreatedAt),
-          uploadOrder: parseUploadOrder(uploadOrder),
-          socialAccountIds,
-          tags: tagList,
-          size: req.file.size,
-          createdAt: new Date(),
-        };
-        mockStore.media.push(newMedia);
-        return res.status(201).json(newMedia);
-      }
-
-      const mediaId = new Media()._id;
+    if (!isConnected) {
+      const mediaId = `m_${Date.now()}`;
       const storageKey = getOriginalStorageKey({
-        userId: req.user._id,
+        userId: req.user?._id || 'mock-user',
         folderId: scopeContext.folderId,
         mediaId,
         originalName: req.file.originalname,
       });
       const { url } = await uploadFile({ ...req.file, storageKey });
-
-      let thumbnailUrl = '';
-      let thumbnailStorageKey = '';
-      let thumbnailGeneratedAt = undefined;
-
-      if (mediaType === 'video') {
-        const thumbResult = await generateThumbnailFromBuffer({
-          buffer: req.file.buffer,
-          extension: path.extname(req.file.originalname),
-          userId: req.user._id,
-          folderId: scopeContext.folderId,
-          mediaId,
-        });
-        if (thumbResult) {
-          thumbnailUrl = thumbResult.thumbnailUrl;
-          thumbnailStorageKey = thumbResult.thumbnailStorageKey;
-          thumbnailGeneratedAt = thumbResult.thumbnailGeneratedAt;
-        }
-      }
-
-      const media = await Media.create({
+      const newMedia = {
         _id: mediaId,
         userId: req.user._id,
         campaignId: scopeContext.campaignId,
         scope: scopeContext.scope,
         folderId: scopeContext.folderId,
-        socialAccountIds,
         name: req.file.originalname,
         type: mediaType,
         url,
         storageKey,
-        thumbnailUrl,
-        thumbnailStorageKey,
-        thumbnailGeneratedAt,
         caption: caption || '',
         sourceUsage: parsedSourceUsage,
         uploadBatchId: String(uploadBatchId || ''),
         uploadBatchCreatedAt: parseUploadBatchCreatedAt(uploadBatchCreatedAt),
         uploadOrder: parseUploadOrder(uploadOrder),
+        socialAccountIds,
         tags: tagList,
         size: req.file.size,
-      });
-
-      // Media.sourceUsage is durable before reservations are released, so the
-      // cooldown index still prevents reuse even if the reservation cleanup fails.
-      try {
-        await releaseCompletedSourceReservations({
-          userId: req.user._id,
-          campaignId: scopeContext.campaignId,
-          sourceUsage: parsedSourceUsage,
-        });
-      } catch (reservationError) {
-        console.error('Generated media saved, but source reservation cleanup failed:', reservationError);
-      }
-
-      const populated = await Media.findById(media._id)
-        .populate('socialAccountIds', 'name username platform avatarUrl isConnected');
-
-      if (mediaType === 'video') {
-        media.aiStatus = 'processing';
-        await media.save();
-        const explicitMode = aiMode === 'app_showcase' || aiMode === 'reaction' ? aiMode : undefined;
-        analyzeMediaVideo(media._id, { mode: explicitMode }).catch((err) => {
-          console.error(`[media.js] Failed to analyze video ${media._id}:`, err);
-        });
-      }
-
-      res.status(201).json(populated);
-    } catch (error) {
-      console.error('Upload error in route:', error);
-      res.status(500).json({ message: error.message });
+        createdAt: new Date(),
+      };
+      mockStore.media.push(newMedia);
+      return res.status(201).json(newMedia);
     }
-  });
 
-  // @desc    Get AI analysis status/results for one video media asset
-  // @route   GET /api/media/:id/analyze-ai
-  // @access  Private
-  router.get('/:id/analyze-ai', protect, async (req, res) => {
-    const { id } = req.params;
+    const mediaId = new Media()._id;
+    const storageKey = getOriginalStorageKey({
+      userId: req.user._id,
+      folderId: scopeContext.folderId,
+      mediaId,
+      originalName: req.file.originalname,
+    });
+    const { url } = await uploadFile({ ...req.file, storageKey });
 
-    try {
-      const isConnected = getDBStatus();
-      if (!isConnected) {
-        const mediaItem = mockStore.media.find((item) => String(item._id) === String(id));
-        if (!mediaItem) {
-          return res.status(404).json({ message: 'Media not found' });
-        }
-        return res.status(200).json({
-          _id: mediaItem._id,
-          type: mediaItem.type,
-          tags: mediaItem.tags || [],
-          aiStatus: mediaItem.aiStatus || 'pending',
-          aiError: mediaItem.aiError || '',
-          aiProcessedAt: mediaItem.aiProcessedAt,
-          aiAnalysis: mediaItem.aiAnalysis,
-        });
-      }
+    let thumbnailUrl = '';
+    let thumbnailStorageKey = '';
+    let thumbnailGeneratedAt = undefined;
 
-      const campaignId = requireCampaignId(req, res);
-      if (!campaignId) return;
-
-      const media = await Media.findOne({
-        _id: id,
-        ...getReadableScopeQuery(campaignId),
-      })
-        .select('_id name type url thumbnailUrl size tags aiStatus aiError aiProcessedAt aiAnalysis')
-        .lean();
-
-      if (!media) {
-        return res.status(404).json({ message: 'Media not found' });
-      }
-      if (media.type !== 'video') {
-        return res.status(400).json({ message: 'AI video analysis is only available for video files.' });
-      }
-
-      return res.status(200).json(media);
-    } catch (error) {
-      console.error('Error refreshing AI analysis status:', error);
-      return res.status(500).json({ message: error.message || 'Failed to refresh AI analysis status.' });
-    }
-  });
-
-  // @desc    Trigger or re-run AI analysis on a video media asset
-  // @route   POST /api/media/:id/analyze-ai
-  // @access  Private (Owner, Admin, Editor)
-  router.post('/:id/analyze-ai', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
-    const { id } = req.params;
-    try {
-      const campaignId = requireCampaignId(req, res);
-      if (!campaignId) return;
-      const media = await Media.findOne({
-        _id: id,
-        ...getReadableScopeQuery(campaignId),
+    if (mediaType === 'video') {
+      const thumbResult = await generateThumbnailFromBuffer({
+        buffer: req.file.buffer,
+        extension: path.extname(req.file.originalname),
+        userId: req.user._id,
+        folderId: scopeContext.folderId,
+        mediaId,
       });
-      if (!media) {
-        return res.status(404).json({ message: 'Media not found' });
+      if (thumbResult) {
+        thumbnailUrl = thumbResult.thumbnailUrl;
+        thumbnailStorageKey = thumbResult.thumbnailStorageKey;
+        thumbnailGeneratedAt = thumbResult.thumbnailGeneratedAt;
       }
-      if (media.type !== 'video') {
-        return res.status(400).json({ message: 'AI video analysis is only available for video files.' });
-      }
+    }
 
+    const media = await Media.create({
+      _id: mediaId,
+      userId: req.user._id,
+      campaignId: scopeContext.campaignId,
+      scope: scopeContext.scope,
+      folderId: scopeContext.folderId,
+      socialAccountIds,
+      name: req.file.originalname,
+      type: mediaType,
+      url,
+      storageKey,
+      thumbnailUrl,
+      thumbnailStorageKey,
+      thumbnailGeneratedAt,
+      caption: caption || '',
+      sourceUsage: parsedSourceUsage,
+      uploadBatchId: String(uploadBatchId || ''),
+      uploadBatchCreatedAt: parseUploadBatchCreatedAt(uploadBatchCreatedAt),
+      uploadOrder: parseUploadOrder(uploadOrder),
+      tags: tagList,
+      size: req.file.size,
+    });
+
+    // Media.sourceUsage is durable before reservations are released, so the
+    // cooldown index still prevents reuse even if the reservation cleanup fails.
+    try {
+      await releaseCompletedSourceReservations({
+        userId: req.user._id,
+        campaignId: scopeContext.campaignId,
+        sourceUsage: parsedSourceUsage,
+      });
+    } catch (reservationError) {
+      console.error('Generated media saved, but source reservation cleanup failed:', reservationError);
+    }
+
+    const populated = await Media.findById(media._id)
+      .populate('socialAccountIds', 'name username platform avatarUrl isConnected');
+
+    if (mediaType === 'video') {
       media.aiStatus = 'processing';
-      media.aiError = '';
       await media.save();
-
-      // Trigger analysis asynchronously in background (auto-resolving mode if not explicitly provided)
-      const explicitMode = req.body?.mode === 'app_showcase' || req.body?.mode === 'reaction'
-        ? req.body.mode
-        : undefined;
-      analyzeMediaVideo(media._id, { mode: explicitMode, campaignId }).catch((err) => {
-        console.error(`[media.js] Manual AI analysis failed for ${media._id}:`, err);
+      const explicitMode = aiMode === 'app_showcase' || aiMode === 'reaction' ? aiMode : undefined;
+      analyzeMediaVideo(media._id, { mode: explicitMode }).catch((err) => {
+        console.error(`[media.js] Failed to analyze video ${media._id}:`, err);
       });
-
-      res.status(200).json({ message: 'AI video analysis started', media });
-    } catch (error) {
-      console.error('Error starting AI analysis:', error);
-      res.status(500).json({ message: error.message || 'Failed to start AI analysis.' });
     }
-  });
+
+    res.status(201).json(populated);
+  } catch (error) {
+    console.error('Upload error in route:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Get AI analysis status/results for one video media asset
+// @route   GET /api/media/:id/analyze-ai
+// @access  Private
+router.get('/:id/analyze-ai', protect, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const isConnected = getDBStatus();
+    if (!isConnected) {
+      const mediaItem = mockStore.media.find((item) => String(item._id) === String(id));
+      if (!mediaItem) {
+        return res.status(404).json({ message: 'Media not found' });
+      }
+      return res.status(200).json({
+        _id: mediaItem._id,
+        type: mediaItem.type,
+        tags: mediaItem.tags || [],
+        aiStatus: mediaItem.aiStatus || 'pending',
+        aiError: mediaItem.aiError || '',
+        aiProcessedAt: mediaItem.aiProcessedAt,
+        aiAnalysis: mediaItem.aiAnalysis,
+      });
+    }
+
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+
+    const media = await Media.findOne({
+      _id: id,
+      ...getReadableScopeQuery(campaignId),
+    })
+      .select('_id name type url thumbnailUrl size tags aiStatus aiError aiProcessedAt aiAnalysis')
+      .lean();
+
+    if (!media) {
+      return res.status(404).json({ message: 'Media not found' });
+    }
+    if (media.type !== 'video') {
+      return res.status(400).json({ message: 'AI video analysis is only available for video files.' });
+    }
+
+    return res.status(200).json(media);
+  } catch (error) {
+    console.error('Error refreshing AI analysis status:', error);
+    return res.status(500).json({ message: error.message || 'Failed to refresh AI analysis status.' });
+  }
+});
+
+// @desc    Trigger or re-run AI analysis on a video media asset
+// @route   POST /api/media/:id/analyze-ai
+// @access  Private (Owner, Admin, Editor)
+router.post('/:id/analyze-ai', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
+  const { id } = req.params;
+  try {
+    const campaignId = requireCampaignId(req, res);
+    if (!campaignId) return;
+    const media = await Media.findOne({
+      _id: id,
+      ...getReadableScopeQuery(campaignId),
+    });
+    if (!media) {
+      return res.status(404).json({ message: 'Media not found' });
+    }
+    if (media.type !== 'video') {
+      return res.status(400).json({ message: 'AI video analysis is only available for video files.' });
+    }
+
+    media.aiStatus = 'processing';
+    media.aiError = '';
+    await media.save();
+
+    // Trigger analysis asynchronously in background (auto-resolving mode if not explicitly provided)
+    const explicitMode = req.body?.mode === 'app_showcase' || req.body?.mode === 'reaction'
+      ? req.body.mode
+      : undefined;
+    analyzeMediaVideo(media._id, { mode: explicitMode, campaignId }).catch((err) => {
+      console.error(`[media.js] Manual AI analysis failed for ${media._id}:`, err);
+    });
+
+    res.status(200).json({ message: 'AI video analysis started', media });
+  } catch (error) {
+    console.error('Error starting AI analysis:', error);
+    res.status(500).json({ message: error.message || 'Failed to start AI analysis.' });
+  }
+});
 
 // @desc    Download selected media assets as a ZIP archive
 // @route   POST /api/media/download-batch
@@ -1735,12 +1840,14 @@ router.put('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, r
 
 // @desc    Delete media asset
 // @route   DELETE /api/media/:id
-// @access  Private (Owner, Admin)
-router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => {
+// @access  Private (Owner, Admin, Editor)
+router.delete('/:id', protect, resolveHandlerPreview, authorize('owner', 'admin', 'editor'), async (req, res) => {
   const { id } = req.params;
 
   try {
     const isConnected = getDBStatus();
+    const isAdmin = ['owner', 'admin'].includes(req.user.role);
+
     if (!isConnected) {
       const index = mockStore.media.findIndex(m => m._id === id);
       if (index === -1) {
@@ -1748,6 +1855,10 @@ router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => 
       }
 
       const mediaItem = mockStore.media[index];
+      if (!isAdmin && String(mediaItem.userId) !== String(req.user._id)) {
+        return res.status(403).json({ message: 'You can only delete your own media.' });
+      }
+
       await deleteFile(mediaItem.storageKey);
       if (mediaItem.thumbnailStorageKey) {
         await deleteFile(mediaItem.thumbnailStorageKey);
@@ -1756,15 +1867,22 @@ router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => 
       return res.status(200).json({ message: 'Media asset deleted successfully' });
     }
 
-    const campaignId = requireCampaignId(req, res);
-    if (!campaignId) return;
+    const requestedScope = getRequestedScope(req);
+    if (requestedScope === 'personal' && !requirePersonalScopePermission(req, res)) return;
+    const campaignId = requestedScope === 'personal' ? null : requireCampaignId(req, res);
+    if (!campaignId && requestedScope !== 'personal') return;
     const media = await Media.findOne({
       _id: id,
-      ...getReadableScopeQuery(campaignId),
+      ...getReadableScopeQuery(campaignId, requestedScope, req.user._id),
     });
     if (!media) {
       return res.status(404).json({ message: 'Media not found' });
     }
+
+    if (!isAdmin && String(media.userId) !== String(req.user._id)) {
+      return res.status(403).json({ message: 'You can only delete your own media.' });
+    }
+
     const mediaScope = normalizeScope(media.scope);
     if (mediaScope === 'global' && !requireGlobalPermission(req, res)) return;
 
@@ -1772,7 +1890,14 @@ router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => 
     if (media.thumbnailStorageKey) {
       await deleteFile(media.thumbnailStorageKey);
     }
-    await Media.deleteOne({ _id: id, ...(mediaScope === 'global' ? { scope: 'global' } : { campaignId }) });
+    await Media.deleteOne({
+      _id: id,
+      ...(mediaScope === 'global'
+        ? { scope: 'global' }
+        : mediaScope === 'personal'
+          ? { scope: 'personal', userId: req.user._id }
+          : { campaignId }),
+    });
     res.status(200).json({ message: 'Media asset deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });

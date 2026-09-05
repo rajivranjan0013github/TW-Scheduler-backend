@@ -14,7 +14,7 @@ const args = new Map(
 
 const dryRun = args.get('dryRun') === 'true';
 const oldBaseUrl = (args.get('oldBaseUrl') || process.env.OLD_R2_PUBLIC_URL || '').replace(/\/$/, '');
-const nextBaseUrl = (args.get('nextBaseUrl') || process.env.R2_PUBLIC_URL || 'https://media.theeasypost.com').replace(/\/$/, '');
+const nextBaseUrl = (args.get('nextBaseUrl') || process.env.R2_PUBLIC_URL || 'https://media.thousandpost.com').replace(/\/$/, '');
 
 const replaceBaseUrl = (value) => {
   if (!value || typeof value !== 'string') return value;
@@ -75,6 +75,6 @@ const main = async () => {
 
 main().catch(async (error) => {
   console.error(error.message);
-  await mongoose.disconnect().catch(() => {});
+  await mongoose.disconnect().catch(() => { });
   process.exit(1);
 });

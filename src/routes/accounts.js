@@ -10,6 +10,8 @@ import User from '../models/User.js';
 import Insight from '../models/Insight.js';
 import PublishedPost from '../models/PublishedPost.js';
 import PostInsight from '../models/PostInsight.js';
+import PostMetricSnapshot from '../models/PostMetricSnapshot.js';
+import PostMetricDailySnapshot from '../models/PostMetricDailySnapshot.js';
 import { recordStoredMetricSnapshots, healStaleSyncStatuses } from '../queues/metricSyncWorker.js';
 import { protect, authorize, resolveHandlerPreview } from '../middleware/auth.js';
 import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount, fetchYoutubeVideos, revokeYoutubeToken } from '../services/youtubeService.js';

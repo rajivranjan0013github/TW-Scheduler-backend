@@ -3,13 +3,13 @@ import { uploadFile, getStorageUrl } from './r2Service.js';
 import { getSocialAccountAvatarStorageKey, getUserAvatarStorageKey } from '../utils/storageKeys.js';
 
 const getConfiguredPublicBaseUrl = () => (
-  process.env.R2_PUBLIC_URL || 'https://media.theeasypost.com'
+  process.env.R2_PUBLIC_URL || 'https://media.thousandpost.com'
 ).trim().replace(/\/$/, '');
 
 const isStoredAvatarUrl = (url) => {
   if (!url || typeof url !== 'string') return false;
   const publicBaseUrl = getConfiguredPublicBaseUrl();
-  const backendUrl = (process.env.BACKEND_URL || 'https://theeasypost.com').trim().replace(/\/$/, '');
+  const backendUrl = (process.env.BACKEND_URL || 'https://thousandpost.com').trim().replace(/\/$/, '');
 
   return (
     url.startsWith(`${publicBaseUrl}/users/`) ||

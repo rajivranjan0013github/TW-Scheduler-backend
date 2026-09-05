@@ -2,6 +2,7 @@ import SocialAccount from '../models/SocialAccount.js';
 import CampaignChannel from '../models/CampaignChannel.js';
 import Campaign from '../models/Campaign.js';
 import PublishedPost from '../models/PublishedPost.js';
+import MetricSyncStatus from '../models/MetricSyncStatus.js';
 
 const DEFAULT_TIMEZONE = 'UTC';
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -151,6 +152,7 @@ export const getCreatorAnalytics = async ({ user, campaignId = '', timeZone: raw
       last7DaysComments: 0,
       thisMonthLikes: 0,
       thisMonthComments: 0,
+      lastSyncedAt: null,
       last30DaysPostedViews: [],
       accountRows: [],
     },
@@ -187,8 +189,26 @@ export const getCreatorAnalytics = async ({ user, campaignId = '', timeZone: raw
   };
 
   const posts = await PublishedPost.find(postQuery)
-    .select('_id accountId campaignId platform publishedAt latestViews latestLikes latestComments')
+    .select('_id accountId campaignId platform publishedAt latestViews latestLikes latestComments lastSyncedAt')
     .lean();
+
+  const metricSyncStatuses = await MetricSyncStatus.find({ accountId: { $in: accountIds } })
+    .select('lastSuccessAt lastAttemptAt')
+    .lean();
+
+  let lastSyncedAt = null;
+  const useLatestSyncDate = (value) => {
+    if (!value) return;
+    const syncDate = new Date(value);
+    if (Number.isNaN(syncDate.getTime())) return;
+    if (!lastSyncedAt || syncDate > lastSyncedAt) {
+      lastSyncedAt = syncDate;
+    }
+  };
+
+  metricSyncStatuses.forEach((status) => {
+    useLatestSyncDate(status.lastSuccessAt || status.lastAttemptAt);
+  });
 
   // 6. Build channel/account rows
   const accountRowsMap = new Map(
@@ -254,6 +274,7 @@ export const getCreatorAnalytics = async ({ user, campaignId = '', timeZone: raw
   };
 
   posts.forEach((post) => {
+    useLatestSyncDate(post.lastSyncedAt);
     const views = Number(post.latestViews || 0);
     const likes = Number(post.latestLikes || 0);
     const comments = Number(post.latestComments || 0);
@@ -375,6 +396,7 @@ export const getCreatorAnalytics = async ({ user, campaignId = '', timeZone: raw
       last7DaysComments,
       thisMonthLikes,
       thisMonthComments,
+      lastSyncedAt,
       last30DaysPostedViews: Array.from(last30DaysPostedViewsMap.values()),
       accountRows,
       byPlatform,

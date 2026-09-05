@@ -136,6 +136,38 @@ export const fetchFacebookPostInsightValue = async (accessToken, postId, metric)
 export const fetchFacebookPostEngagement = async (accessToken, postId) => {
   if (!postId) return { likes: null, comments: null, errorType: 'invalid_post' };
 
+  // 1. Primary: Use Post Insights (requires only 'pages_read_engagement')
+  try {
+    const data = await fetchGraphJson(`${postId}/insights`, accessToken, {
+      metric: 'post_reactions_by_type_total,post_activity_by_action_type',
+    });
+    const items = data?.data || [];
+    const reactionsItem = items.find((d) => d.name === 'post_reactions_by_type_total');
+    const activityItem = items.find((d) => d.name === 'post_activity_by_action_type');
+
+    if (reactionsItem || activityItem) {
+      const reactionsVal = reactionsItem?.values?.[0]?.value || {};
+      const activityVal = activityItem?.values?.[0]?.value || {};
+
+      const likes = typeof reactionsVal === 'object' && reactionsVal !== null
+        ? Object.values(reactionsVal).reduce((sum, count) => sum + (Number(count) || 0), 0)
+        : toNumber(reactionsVal);
+
+      const comments = typeof activityVal === 'object' && activityVal !== null
+        ? toNumber(activityVal.comment || activityVal.comments || 0)
+        : 0;
+
+      return { likes, comments, errorType: '' };
+    }
+  } catch (insightsError) {
+    // Insights API unavailable for this post type or permission issue, fallback to fields query
+    const insightsCode = getGraphErrorCode(insightsError);
+    if (insightsCode === 10) {
+      warnMetricFailure('post engagement insights', insightsError);
+    }
+  }
+
+  // 2. Fallback: Direct post fields query (requires 'pages_read_user_content')
   try {
     const data = await fetchGraphJson(postId, accessToken, {
       fields: 'comments.limit(0).summary(true),reactions.type(LIKE).limit(0).summary(total_count)',

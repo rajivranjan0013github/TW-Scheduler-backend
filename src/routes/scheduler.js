@@ -131,7 +131,7 @@ const populateSchedulerPostList = (query) => query
   .select('campaignId socialAccountIds campaignChannelIds mediaIds caption scheduledAt scheduleMode status publishSource manualDownloadedAt manualPostedAt manualConfirmedAt manualPostUrl publishError platformSpecifics publishResponseId createdAt updatedAt')
   .populate({ path: 'socialAccountIds', select: 'username name platform avatarUrl isConnected tokenStatus' })
   .populate({ path: 'campaignChannelIds', select: 'requestedHandle normalizedHandle displayName platform status socialAccountId assignedHandlerEmail assignedHandlerUserId' })
-  .populate({ path: 'mediaIds', select: 'name type url folderId caption' })
+  .populate({ path: 'mediaIds', select: 'name type url thumbnailUrl folderId caption' })
   .sort({ scheduledAt: 1 })
   .lean();
 
@@ -719,6 +719,46 @@ const validateSchedulingAccess = async ({ campaignId, socialAccountIds, campaign
   return { ok: true };
 };
 
+export const validatePersonalSchedulingAccess = async ({ userId, socialAccountIds, campaignChannelIds, channelTargets, mediaIds }) => {
+  const accountIds = getUniqueIds(idsToStrings(socialAccountIds));
+  const channelIds = getUniqueIds(idsToStrings(campaignChannelIds));
+  const targets = normalizeChannelTargets({ channelTargets, socialAccountIds, campaignChannelIds });
+  const mediaIdList = getUniqueIds(idsToStrings(mediaIds));
+
+  if (targets.length === 0 || mediaIdList.length === 0) {
+    return { ok: false, message: 'Must select publishing channels and at least one media file' };
+  }
+  if (channelIds.length > 0 || targets.some((target) => target.campaignChannelId)) {
+    return { ok: false, message: 'Campaign channels cannot be used for a personal post.' };
+  }
+  if (accountIds.length !== targets.length) {
+    return { ok: false, message: 'Every personal publishing target must be a connected social account.' };
+  }
+
+  const [accounts, mediaItems] = await Promise.all([
+    SocialAccount.find({
+      _id: { $in: accountIds },
+      userId,
+      isConnected: true,
+    }).select('_id'),
+    Media.find({
+      _id: { $in: mediaIdList },
+      userId,
+      scope: 'personal',
+      campaignId: null,
+    }).select('_id'),
+  ]);
+
+  if (accounts.length !== accountIds.length) {
+    return { ok: false, message: 'One or more selected publishing channels are not owned by this creator.' };
+  }
+  if (mediaItems.length !== mediaIdList.length) {
+    return { ok: false, message: 'One or more selected personal media assets were not found.' };
+  }
+
+  return { ok: true };
+};
+
 // @desc    Get all scheduled and published posts
 // @route   GET /api/scheduler
 // @access  Private
@@ -1073,14 +1113,17 @@ router.get('/', protect, async (req, res) => {
 // @desc    Create a scheduled post
 // @route   POST /api/scheduler
 // @access  Private (Owner, Admin, Editor)
-router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
+router.post('/', protect, resolveHandlerPreview, authorize('owner', 'admin', 'editor'), async (req, res) => {
   const { socialAccountIds, campaignChannelIds, channelTargets, mediaIds, caption, scheduledAt, platformSpecifics } = req.body;
   const scheduleMode = normalizeScheduleMode(req.body.scheduleMode);
 
   try {
     const isConnected = getDBStatus();
-    const campaignId = requireCampaignId(req, res);
-    if (!campaignId) return;
+    const campaignId = getActiveCampaignId(req);
+    const isPersonalCreatorPost = !campaignId && req.user?.userType === 'account_handler';
+    if (!campaignId && !isPersonalCreatorPost) {
+      return res.status(400).json({ message: 'Campaign is required.' });
+    }
     const scheduledDate = new Date(scheduledAt);
     let postCaption = caption || '';
 
@@ -1092,6 +1135,8 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
       const targets = normalizeChannelTargets({ channelTargets, socialAccountIds, campaignChannelIds });
       const newPosts = targets.map((target) => ({
         _id: `sp_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        userId: req.user._id,
+        ...(campaignId ? { campaignId } : {}),
         socialAccountIds: target.socialAccountId ? [target.socialAccountId] : [],
         campaignChannelIds: target.campaignChannelId ? [target.campaignChannelId] : [],
         mediaIds,
@@ -1113,20 +1158,33 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
         });
     }
 
-    const access = await validateSchedulingAccess({
-      campaignId,
-      socialAccountIds,
-      campaignChannelIds,
-      channelTargets,
-      mediaIds,
-      allowDisconnectedAccounts: scheduleMode === 'manual',
-    });
+    const access = isPersonalCreatorPost
+      ? await validatePersonalSchedulingAccess({
+        userId: req.user._id,
+        socialAccountIds,
+        campaignChannelIds,
+        channelTargets,
+        mediaIds,
+      })
+      : await validateSchedulingAccess({
+        campaignId,
+        socialAccountIds,
+        campaignChannelIds,
+        channelTargets,
+        mediaIds,
+        allowDisconnectedAccounts: scheduleMode === 'manual',
+      });
     if (!access.ok) {
       return res.status(400).json({ message: access.message });
     }
 
     if (!postCaption && mediaIds?.[0]) {
-      const mediaItem = await Media.findOne({ _id: mediaIds[0], campaignId }).select('caption');
+      const mediaItem = await Media.findOne({
+        _id: mediaIds[0],
+        ...(isPersonalCreatorPost
+          ? { userId: req.user._id, scope: 'personal', campaignId: null }
+          : { campaignId }),
+      }).select('caption');
       postCaption = mediaItem?.caption || '';
     }
 
@@ -1136,7 +1194,7 @@ router.post('/', protect, authorize('owner', 'admin', 'editor'), async (req, res
     for (const target of targets) {
       const post = await ScheduledPost.create({
         userId: req.user._id,
-        campaignId,
+        ...(campaignId ? { campaignId } : {}),
         socialAccountIds: target.socialAccountId ? [target.socialAccountId] : [],
         campaignChannelIds: target.campaignChannelId ? [target.campaignChannelId] : [],
         mediaIds,
@@ -2079,7 +2137,7 @@ router.delete('/queue/account/:accountId', protect, authorize('owner', 'admin', 
 // @desc    Delete/Cancel a scheduled post
 // @route   DELETE /api/scheduler/:id
 // @access  Private (Owner, Admin, Editor)
-router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req, res) => {
+router.delete('/:id', protect, resolveHandlerPreview, authorize('owner', 'admin', 'editor'), async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -2104,6 +2162,10 @@ router.delete('/:id', protect, authorize('owner', 'admin', 'editor'), async (req
 
     if (!post) {
       return res.status(404).json({ message: 'Post not found' });
+    }
+    if (!campaignId && req.user?.userType === 'account_handler'
+      && String(post.userId || '') !== String(req.user._id)) {
+      return res.status(403).json({ message: 'You can only cancel your own personal posts.' });
     }
     if (!cancellablePostStatuses.has(post.status)) {
       return res.status(409).json({ message: 'Only pending, paused, or manually posted queue records can be deleted.' });

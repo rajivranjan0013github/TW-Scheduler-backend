@@ -130,3 +130,48 @@ export const ensureDefaultCampaignFolders = async (campaignId, userId = null, op
     return null;
   }
 };
+
+/**
+ * Ensures a dedicated folder exists for a creator within a campaign.
+ * The folder is named after the creator and tagged with creator-uploads.
+ *
+ * @param {string|import('mongoose').Types.ObjectId} campaignId
+ * @param {Object} user - User document or auth user
+ * @returns {Promise<Folder|null>}
+ */
+export const ensureCreatorFolder = async (campaignId, user) => {
+  if (!campaignId || !user?._id) return null;
+
+  try {
+    const creatorName = (user.name || user.email?.split('@')[0] || 'Creator').trim();
+    const folderName = creatorName;
+
+    let folder = await Folder.findOne({
+      campaignId,
+      scope: 'campaign',
+      $or: [
+        { tags: `creator:${user._id}` },
+        { userId: user._id, tags: 'creator-uploads' },
+        { name: new RegExp(`^${escapeRegex(folderName)}$`, 'i') },
+      ],
+    });
+
+    if (!folder) {
+      folder = await Folder.create({
+        userId: user._id,
+        campaignId,
+        scope: 'campaign',
+        name: folderName,
+        parentFolderId: null,
+        kind: 'folder',
+        tags: ['creator-uploads', `creator:${user._id}`, 'schedule'],
+      });
+    }
+
+    return folder;
+  } catch (error) {
+    console.error(`[campaignFolderService] Error ensuring creator folder for campaign ${campaignId}:`, error.message);
+    return null;
+  }
+};
+
