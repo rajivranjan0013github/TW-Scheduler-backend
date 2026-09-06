@@ -182,10 +182,17 @@ export const startServer = async () => {
 
   // 4. Listen on PORT
   app.listen(PORT, () => {
+    console.log(`🚀 TW Creator Suite Backend running on port ${PORT}`);
   });
 };
 
-if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+const isDirectRun = !process.argv[1] ||
+  path.resolve(process.argv[1]) === __filename ||
+  process.env.pm_id !== undefined ||
+  process.argv[1].includes('pm2') ||
+  process.argv[1].includes('ProcessContainer');
+
+if (isDirectRun) {
   startServer();
 }
 
