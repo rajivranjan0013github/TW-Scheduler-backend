@@ -24,6 +24,7 @@ const getEncryptionKey = () => {
  */
 export const encryptToken = (plaintext) => {
   if (!plaintext) return plaintext;
+  if (String(plaintext).startsWith('enc:')) return plaintext;
   const key = getEncryptionKey();
   if (!key) return plaintext;
 
@@ -71,4 +72,10 @@ export const decryptToken = (encryptedValue) => {
  */
 export const isEncryptionEnabled = () => {
   return getEncryptionKey() !== null;
+};
+
+export const assertTokenEncryptionConfigured = () => {
+  if (process.env.NODE_ENV === 'production' && !isEncryptionEnabled()) {
+    throw new Error('SOCIAL_TOKEN_ENCRYPTION_KEY is required in production.');
+  }
 };

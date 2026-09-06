@@ -1,5 +1,8 @@
 import mongoose from 'mongoose';
-import { encryptToken, decryptToken, isEncryptionEnabled } from '../utils/tokenEncryption.js';
+import { encryptToken, decryptToken } from '../utils/tokenEncryption.js';
+
+const encryptCredential = (value) => encryptToken(value);
+const decryptCredential = (value) => decryptToken(value);
 
 const SocialAccountSchema = new mongoose.Schema({
   userId: {
@@ -32,6 +35,8 @@ const SocialAccountSchema = new mongoose.Schema({
   accessToken: {
     type: String,
     required: true,
+    set: encryptCredential,
+    get: decryptCredential,
   },
   authProvider: {
     type: String,
@@ -40,6 +45,8 @@ const SocialAccountSchema = new mongoose.Schema({
   },
   refreshToken: {
     type: String,
+    set: encryptCredential,
+    get: decryptCredential,
   },
   tokenExpiresAt: {
     type: Date,
@@ -51,6 +58,10 @@ const SocialAccountSchema = new mongoose.Schema({
   },
   tokenLastCheckedAt: {
     type: Date,
+  },
+  providerDataRefreshedAt: {
+    type: Date,
+    default: null,
   },
   tokenRefreshError: {
     type: String,
@@ -80,29 +91,16 @@ const SocialAccountSchema = new mongoose.Schema({
     type: Boolean,
     default: true,
   },
-}, { timestamps: true });
-
-// Encrypt tokens before saving to database
-SocialAccountSchema.pre('save', function (next) {
-  if (isEncryptionEnabled()) {
-    if (this.isModified('accessToken') && this.accessToken && !this.accessToken.startsWith('enc:')) {
-      this.accessToken = encryptToken(this.accessToken);
-    }
-    if (this.isModified('refreshToken') && this.refreshToken && !this.refreshToken.startsWith('enc:')) {
-      this.refreshToken = encryptToken(this.refreshToken);
-    }
-  }
-  next();
-});
+}, { timestamps: true, toObject: { getters: false } });
 
 // Instance method to get decrypted access token
 SocialAccountSchema.methods.getDecryptedAccessToken = function () {
-  return decryptToken(this.accessToken);
+  return this.accessToken;
 };
 
 // Instance method to get decrypted refresh token
 SocialAccountSchema.methods.getDecryptedRefreshToken = function () {
-  return this.refreshToken ? decryptToken(this.refreshToken) : null;
+  return this.refreshToken || null;
 };
 
 SocialAccountSchema.set('toJSON', {

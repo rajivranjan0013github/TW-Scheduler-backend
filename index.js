@@ -27,6 +27,10 @@ import bulkAgentRoutes from './src/routes/bulkAgent.js';
 import { protect } from './src/middleware/auth.js';
 import ScheduledPost from './src/models/ScheduledPost.js';
 import rateLimit from 'express-rate-limit';
+import helmet from 'helmet';
+import { assertTokenEncryptionConfigured } from './src/utils/tokenEncryption.js';
+
+assertTokenEncryptionConfigured();
 
 // Rate limiters
 const authLimiter = rateLimit({
@@ -53,7 +57,7 @@ const app = express();
 const PORT = process.env.PORT || 5001;
 
 // Middleware
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173')
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://thousandpost.com,https://www.thousandpost.com,http://localhost:5173')
   .split(',')
   .map(o => o.trim())
   .filter(Boolean);
@@ -69,14 +73,37 @@ app.use(cors({
   },
   credentials: true,
 }));
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+app.use(helmet({
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'wasm-unsafe-eval'"],
+      styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+      fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
+      imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
+      mediaSrc: ["'self'", 'blob:', 'https:'],
+      connectSrc: ["'self'", 'https://thousandpost.com', 'https://www.thousandpost.com', 'https://media.thousandpost.com'],
+      frameSrc: ["'self'", 'https://www.youtube.com', 'https://www.facebook.com', 'https://www.instagram.com'],
+      workerSrc: ["'self'", 'blob:'],
+      objectSrc: ["'none'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"],
+    },
+  },
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+}));
 app.use((req, res, next) => {
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
   res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   next();
 });
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '64kb' }));
 
 // Serve uploads statically for local file uploads fallback
 app.use('/uploads', express.static(path.join(__dirname, 'public/uploads'), {
@@ -123,23 +150,27 @@ const frontendBuildPath = path.join(__dirname, '../TW-Scheduler/dist');
 app.use(express.static(frontendBuildPath));
 
 // All other GET requests not handled by API routes should serve index.html
-app.get('*', (req, res) => {
+app.get('/{*splat}', (req, res) => {
   res.sendFile(path.join(frontendBuildPath, 'index.html'));
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
-  res.status(500).json({
+  const isCorsError = err?.message === 'Not allowed by CORS';
+  res.status(isCorsError ? 403 : 500).json({
     error: 'Internal Server Error',
-    message: err.message
+    message: isCorsError ? 'Origin is not allowed.' : 'An unexpected server error occurred.'
   });
 });
 
 // Start application connections & server
-const startServer = async () => {
+export const startServer = async () => {
   // 1. Connect MongoDB
-  await connectDB();
+  const databaseReady = await connectDB();
+  if (!databaseReady && process.env.NODE_ENV === 'production') {
+    throw new Error('Production startup aborted because MongoDB is unavailable.');
+  }
 
   // 2. Connect Redis
   connectRedis();
@@ -154,5 +185,8 @@ const startServer = async () => {
   });
 };
 
-startServer();
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  startServer();
+}
 
+export default app;

@@ -10,6 +10,7 @@
 import SocialAccount from '../models/SocialAccount.js';
 import PublishedPost from '../models/PublishedPost.js';
 import { getDBStatus } from '../config/db.js';
+import { META_GRAPH_API_VERSION } from '../config/platforms.js';
 import { fetchYoutubeVideos } from '../services/youtubeService.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
 import { fetchFacebookPostEngagement, fetchFacebookPostViews } from '../services/facebookMetricsService.js';
@@ -75,7 +76,7 @@ export const fetchFacebookPosts = async (account, { maxPages = MAX_FEED_SYNC_PAG
     shouldStop: cutoff ? (items) => items.some((post) => new Date(post.created_time).getTime() < cutoff) : null,
   };
   const buildUrl = (fields) => {
-    const url = new URL(`https://graph.facebook.com/v20.0/${account.accountId}/published_posts`);
+    const url = new URL(`https://graph.facebook.com/${META_GRAPH_API_VERSION}/${account.accountId}/published_posts`);
     url.searchParams.set('fields', fields);
     url.searchParams.set('limit', String(limit));
     url.searchParams.set('access_token', account.accessToken);
@@ -152,7 +153,7 @@ export const fetchFacebookPosts = async (account, { maxPages = MAX_FEED_SYNC_PAG
  */
 export const fetchInstagramPosts = async (account, { maxPages = MAX_FEED_SYNC_PAGES, limit = 100, sinceDate = null } = {}) => {
   const graphHost = account.authProvider === 'instagram' ? 'graph.instagram.com' : 'graph.facebook.com';
-  const url = `https://${graphHost}/v20.0/${account.accountId}/media?fields=id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count&limit=${limit}&access_token=${account.accessToken}`;
+  const url = `https://${graphHost}/${META_GRAPH_API_VERSION}/${account.accountId}/media?fields=id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count&limit=${limit}&access_token=${account.accessToken}`;
   const cutoff = sinceDate ? new Date(sinceDate).getTime() : null;
   const data = (await fetchMetaPagedData(url, {
     maxPages,

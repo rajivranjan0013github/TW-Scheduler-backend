@@ -41,7 +41,7 @@ export const sendBatchRequests = async (accessToken, requests, graphHost = 'grap
         relative_url: req.relativeUrl,
       }));
 
-      const response = await fetch(`https://${graphHost}/v20.0/`, {
+      const response = await fetch(`https://${graphHost}/${META_GRAPH_API_VERSION}/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({
@@ -124,3 +124,4 @@ export const sendBatchRequests = async (accessToken, requests, graphHost = 'grap
 
   return results;
 };
+import { META_GRAPH_API_VERSION } from '../config/platforms.js';

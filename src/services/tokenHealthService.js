@@ -1,8 +1,10 @@
 import { OAuth2Client } from 'google-auth-library';
 import SocialAccount from '../models/SocialAccount.js';
+import ScheduledPost from '../models/ScheduledPost.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const REFRESH_WINDOW_MS = 14 * DAY_MS;
+const AUTHORIZED_DATA_REFRESH_MS = 25 * DAY_MS;
 
 const getYoutubeOAuthClient = () => {
   const clientId = process.env.YOUTUBE_CLIENT_ID || process.env.GOOGLE_CLIENT_ID;
@@ -193,6 +195,40 @@ const refreshYoutubeToken = async (account) => {
   });
 };
 
+const refreshYoutubeAuthorizedData = async (account) => {
+  const refreshedAt = account.providerDataRefreshedAt
+    ? new Date(account.providerDataRefreshedAt).getTime()
+    : 0;
+  if (Date.now() - refreshedAt < AUTHORIZED_DATA_REFRESH_MS) return account;
+
+  const response = await fetch('https://youtube.googleapis.com/youtube/v3/channels?part=snippet&mine=true', {
+    headers: { Authorization: `Bearer ${account.accessToken}` },
+  });
+  const data = await readErrorBody(response);
+  const channel = data.items?.[0];
+  if (!response.ok || !channel) {
+    throwProviderError(data.error?.message || 'The connected YouTube channel could not be refreshed.', {
+      status: response.status,
+      error: data.error,
+      data,
+    });
+  }
+
+  const snippet = channel.snippet || {};
+  account.name = snippet.title || account.name;
+  account.username = (snippet.customUrl || snippet.title || account.username || '').replace(/^@+/, '');
+  account.metadata = {
+    ...(account.metadata || {}),
+    channelId: channel.id,
+    description: snippet.description || '',
+    country: snippet.country || '',
+    channelUrl: `https://www.youtube.com/channel/${channel.id}`,
+  };
+  account.providerDataRefreshedAt = new Date();
+  await account.save();
+  return account;
+};
+
 export const ensureFreshAccountToken = async (account, { force = false } = {}) => {
   if (!account || account.accessToken?.startsWith('mock-')) return account;
   if (account.isConnected === false) {
@@ -203,8 +239,10 @@ export const ensureFreshAccountToken = async (account, { force = false } = {}) =
 
   try {
     if (account.platform === 'youtube') {
-      if (force || status !== 'healthy') return refreshYoutubeToken(account);
-      return markAccountHealthy(account);
+      const freshAccount = force || status !== 'healthy'
+        ? await refreshYoutubeToken(account)
+        : await markAccountHealthy(account);
+      return refreshYoutubeAuthorizedData(freshAccount);
     }
 
     if (account.platform === 'instagram' && account.authProvider === 'instagram') {
@@ -231,10 +269,8 @@ export const handleProviderAuthFailure = async (account, errorData, fallbackMess
 };
 
 export const runTokenHealthCheck = async () => {
-  const accounts = await SocialAccount.find({
-    isConnected: true,
-    accessToken: { $not: /^mock-/ },
-  });
+  const accounts = (await SocialAccount.find({ isConnected: true }))
+    .filter((account) => !account.accessToken?.startsWith('mock-'));
 
   const result = {
     checked: 0,
@@ -262,6 +298,20 @@ export const runTokenHealthCheck = async () => {
       }
       console.error(`❌ [Token Health] ${account.platform} account "${account.name}" failed:`, error.message);
     }
+  }
+
+  const youtubeAccountIds = accounts
+    .filter((account) => account.platform === 'youtube')
+    .map((account) => account._id);
+  if (youtubeAccountIds.length > 0) {
+    await ScheduledPost.updateMany(
+      {
+        socialAccountIds: { $in: youtubeAccountIds },
+        status: { $in: ['published', 'published_auto', 'posted_manual', 'failed', 'cancelled'] },
+        updatedAt: { $lt: new Date(Date.now() - 30 * DAY_MS) },
+      },
+      { $unset: { publishResponseId: '' } },
+    );
   }
 
   return result;

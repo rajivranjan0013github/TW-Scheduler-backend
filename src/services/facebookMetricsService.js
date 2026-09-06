@@ -1,4 +1,6 @@
-const API_VERSION = 'v20.0';
+import { META_GRAPH_API_VERSION } from '../config/platforms.js';
+
+const API_VERSION = META_GRAPH_API_VERSION;
 const GRAPH_BASE = `https://graph.facebook.com/${API_VERSION}`;
 const FAILURE_LOG_TTL_MS = 15 * 60 * 1000;
 const UNSUPPORTED_CAPABILITY_TTL_MS = 6 * 60 * 60 * 1000;

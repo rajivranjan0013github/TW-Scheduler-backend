@@ -3,7 +3,21 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import mongoose from 'mongoose';
 import SocialAccount, { sanitizeSocialAccount } from '../src/models/SocialAccount.js';
+import User from '../src/models/User.js';
 import { parseMetaSignedRequest } from '../src/routes/auth.js';
+
+test('User schema never serializes password hashes', () => {
+  const user = new User({
+    email: 'reviewer@example.com',
+    name: 'Reviewer',
+    password: '$2b$12$exampleHashThatMustNeverReachTheClient',
+  });
+
+  const jsonResult = JSON.parse(JSON.stringify(user));
+  assert.equal(jsonResult.email, 'reviewer@example.com');
+  assert.equal(jsonResult.password, undefined);
+  assert.equal(User.schema.path('password').options.select, false);
+});
 
 test('SocialAccount schema strips accessToken and refreshToken on toJSON', () => {
   const accountDoc = new SocialAccount({
@@ -81,15 +95,20 @@ test('parseMetaSignedRequest verifies valid signatures and rejects invalid ones'
 test('signOAuthState and verifyOAuthState protect against OAuth CSRF', async () => {
   const { signOAuthState, verifyOAuthState } = await import('../src/routes/accounts.js');
   const userId = 'user_abc123';
+  const originalSecret = process.env.JWT_SECRET;
+  process.env.JWT_SECRET = 'test-only-oauth-state-secret-with-sufficient-entropy';
+
+  try {
 
   // 1. Valid signed state verifies correctly
-  const state = signOAuthState({ userId, campaignId: 'camp_456' });
+  const state = signOAuthState({ userId, campaignId: 'camp_456', provider: 'facebook' });
   assert.ok(typeof state === 'string' && state.includes('.'), 'State must be signed with HMAC delimiter');
 
-  const verified = verifyOAuthState(state, userId);
+  const verified = verifyOAuthState(state, userId, 'facebook');
   assert.ok(verified, 'Valid state must verify');
   assert.equal(verified.userId, userId);
   assert.equal(verified.campaignId, 'camp_456');
+  assert.ok(verified.nonce, 'Signed state must contain an unpredictable nonce');
 
   // 2. State for a different user fails verification
   const wrongUserVerified = verifyOAuthState(state, 'user_attacker999');
@@ -103,6 +122,14 @@ test('signOAuthState and verifyOAuthState protect against OAuth CSRF', async () 
   // 4. Expired state fails verification
   const expiredState = signOAuthState({ userId, ts: Date.now() - (20 * 60 * 1000) });
   assert.equal(verifyOAuthState(expiredState, userId), null, 'Expired state must be rejected');
+
+  // 5. Legacy unsigned JSON and provider confusion are rejected
+  assert.equal(verifyOAuthState(JSON.stringify({ userId, provider: 'facebook' }), userId, 'facebook'), null);
+  assert.equal(verifyOAuthState(state, userId, 'instagram'), null);
+  } finally {
+    if (originalSecret === undefined) delete process.env.JWT_SECRET;
+    else process.env.JWT_SECRET = originalSecret;
+  }
 });
 
 test('revokeMetaPermissions safely handles missing tokens', async () => {
@@ -113,35 +140,31 @@ test('revokeMetaPermissions safely handles missing tokens', async () => {
   assert.equal(resultEmpty, undefined);
 });
 
-test('Reviewer email and password verify successfully and normalize properly', () => {
-  // Simulate env vars being set (as they would be in production)
-  const originalEmail = process.env.REVIEWER_EMAIL;
-  const originalPassword = process.env.REVIEWER_PASSWORD;
-  process.env.REVIEWER_EMAIL = 'reviewer@thousandpost.com';
-  process.env.REVIEWER_PASSWORD = 'Reviewer2026!';
-
+test('SocialAccount credentials are encrypted at rest while document access remains transparent', () => {
+  const originalKey = process.env.SOCIAL_TOKEN_ENCRYPTION_KEY;
+  process.env.SOCIAL_TOKEN_ENCRYPTION_KEY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
   try {
-    const reviewerEmail = (process.env.REVIEWER_EMAIL || '').toLowerCase().trim();
-    const reviewerPassword = process.env.REVIEWER_PASSWORD || '';
+    const account = new SocialAccount({
+      userId: new mongoose.Types.ObjectId(),
+      platform: 'youtube',
+      accountId: 'channel_secure',
+      name: 'Secure Channel',
+      accessToken: 'access-token-plaintext',
+      refreshToken: 'refresh-token-plaintext',
+    });
+    assert.match(account.get('accessToken', null, { getters: false }), /^enc:/);
+    assert.match(account.get('refreshToken', null, { getters: false }), /^enc:/);
+    assert.equal(account.accessToken, 'access-token-plaintext');
+    assert.equal(account.refreshToken, 'refresh-token-plaintext');
 
-    const testInputEmail = ' REVIEWER@thousandpost.com ';
-    const testInputPassword = 'Reviewer2026!';
-    const normalized = testInputEmail.toLowerCase().trim();
-
-    const isReviewer = reviewerEmail && reviewerPassword && normalized === reviewerEmail && testInputPassword === reviewerPassword;
-    assert.equal(isReviewer, true, 'Reviewer credentials must match when env vars are set');
-
-    // Without env vars, reviewer login should be disabled
-    const emptyEmail = '';
-    const emptyPassword = '';
-    const isReviewerDisabled = emptyEmail && emptyPassword && normalized === emptyEmail && testInputPassword === emptyPassword;
-    assert.ok(!isReviewerDisabled, 'Reviewer login must be disabled when env vars are not set');
+    const updateQuery = SocialAccount.findOneAndUpdate(
+      { accountId: 'channel_secure' },
+      { $set: { accessToken: 'updated-access-token' } },
+    );
+    const castedUpdate = updateQuery._castUpdate(updateQuery.getUpdate());
+    assert.match(castedUpdate.$set.accessToken, /^enc:/, 'query updates must also encrypt credentials');
   } finally {
-    // Restore original env vars
-    if (originalEmail !== undefined) process.env.REVIEWER_EMAIL = originalEmail;
-    else delete process.env.REVIEWER_EMAIL;
-    if (originalPassword !== undefined) process.env.REVIEWER_PASSWORD = originalPassword;
-    else delete process.env.REVIEWER_PASSWORD;
+    if (originalKey === undefined) delete process.env.SOCIAL_TOKEN_ENCRYPTION_KEY;
+    else process.env.SOCIAL_TOKEN_ENCRYPTION_KEY = originalKey;
   }
 });
-

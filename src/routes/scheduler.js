@@ -595,11 +595,49 @@ const withPostCaption = (platformSpecifics, postCaption, type) => {
   if (nextSpecifics.youtube) {
     nextSpecifics.youtube = {
       ...nextSpecifics.youtube,
-      description: postCaption,
+      description: typeof nextSpecifics.youtube.description === 'string'
+        ? nextSpecifics.youtube.description
+        : postCaption,
     };
   }
 
   return nextSpecifics;
+};
+
+export const validateYoutubePublishingSpecifics = ({ youtube, mediaTypes = [] } = {}) => {
+  if (!youtube || typeof youtube !== 'object') return 'YouTube publishing details are required.';
+  const title = String(youtube.title || '').trim();
+  const description = typeof youtube.description === 'string' ? youtube.description : '';
+  if (!title) return 'Enter a YouTube video title.';
+  if (Array.from(title).length > 100) return 'YouTube title must be 100 characters or fewer.';
+  if (Buffer.byteLength(description, 'utf8') > 5000) return 'YouTube description must be 5,000 bytes or fewer.';
+  if (!['public', 'private', 'unlisted'].includes(youtube.privacyStatus)) {
+    return 'Choose a YouTube privacy setting: public, private, or unlisted.';
+  }
+  if (typeof youtube.selfDeclaredMadeForKids !== 'boolean') {
+    return 'Choose whether the YouTube video is made for kids.';
+  }
+  if (youtube.communityGuidelinesCertified !== true) {
+    return 'Confirm that the upload complies with the YouTube Community Guidelines.';
+  }
+  if (mediaTypes.length > 0 && mediaTypes.some((type) => type !== 'video')) {
+    return 'YouTube API publishing requires a video file.';
+  }
+  return '';
+};
+
+const getTargetPlatforms = async (targets) => {
+  const accountIds = getUniqueIds(targets.map((target) => target.socialAccountId));
+  const channelIds = getUniqueIds(targets.map((target) => target.campaignChannelId));
+  const [accounts, channels] = await Promise.all([
+    accountIds.length
+      ? SocialAccount.find({ _id: { $in: accountIds } }).select('platform').lean()
+      : [],
+    channelIds.length
+      ? CampaignChannel.find({ _id: { $in: channelIds } }).select('platform').lean()
+      : [],
+  ]);
+  return new Set([...accounts, ...channels].map((item) => item.platform).filter(Boolean));
 };
 
 const getAccountMatchHandles = (account = {}) => (
@@ -1149,6 +1187,9 @@ router.post('/', protect, resolveHandlerPreview, authorize('owner', 'admin', 'ed
       return res.status(400).json({ message: 'Campaign is required.' });
     }
     const scheduledDate = new Date(scheduledAt);
+    if (Number.isNaN(scheduledDate.getTime()) || scheduledDate.getTime() < Date.now() - 2 * 60 * 1000) {
+      return res.status(400).json({ message: 'Choose a valid publish date and time that is not in the past.' });
+    }
     let postCaption = caption || '';
 
     if (!isConnected) {
@@ -1213,6 +1254,15 @@ router.post('/', protect, resolveHandlerPreview, authorize('owner', 'admin', 'ed
     }
 
     const targets = normalizeChannelTargets({ channelTargets, socialAccountIds, campaignChannelIds });
+    const targetPlatforms = await getTargetPlatforms(targets);
+    if (scheduleMode !== 'manual' && targetPlatforms.has('youtube')) {
+      const mediaItems = await Media.find({ _id: { $in: idsToStrings(mediaIds) } }).select('type').lean();
+      const youtubeError = validateYoutubePublishingSpecifics({
+        youtube: platformSpecifics?.youtube,
+        mediaTypes: mediaItems.map((item) => item.type),
+      });
+      if (youtubeError) return res.status(400).json({ message: youtubeError });
+    }
     const posts = [];
 
     for (const target of targets) {

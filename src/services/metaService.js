@@ -273,7 +273,7 @@ const verifyPublishedInstagramCarousel = async ({
  */
 export const publishToInstagram = async (accessToken, instagramBusinessAccountId, mediaUrl, mediaType, caption, authProvider = 'facebook') => {
   const isVideo = mediaType === 'video';
-  const apiVersion = 'v20.0';
+  const apiVersion = META_GRAPH_API_VERSION;
   const graphHost = authProvider === 'instagram' ? 'graph.instagram.com' : 'graph.facebook.com';
   const baseUrl = `https://${graphHost}/${apiVersion}`;
 
@@ -350,7 +350,7 @@ export const publishToInstagram = async (accessToken, instagramBusinessAccountId
 };
 
 export const publishCarouselToInstagram = async (accessToken, instagramBusinessAccountId, mediaFiles = [], caption, authProvider = 'facebook') => {
-  const apiVersion = 'v20.0';
+  const apiVersion = META_GRAPH_API_VERSION;
   const graphHost = authProvider === 'instagram' ? 'graph.instagram.com' : 'graph.facebook.com';
   const baseUrl = `https://${graphHost}/${apiVersion}`;
   const containerUrl = `${baseUrl}/${instagramBusinessAccountId}/media`;
@@ -471,7 +471,7 @@ export const publishCarouselToInstagram = async (accessToken, instagramBusinessA
  * @returns {Promise<string>} - Published Facebook post ID
  */
 export const publishToFacebook = async (accessToken, pageId, mediaUrl, mediaType, caption) => {
-  const apiVersion = 'v20.0';
+  const apiVersion = META_GRAPH_API_VERSION;
   const baseUrl = `https://graph.facebook.com/${apiVersion}`;
 
 
@@ -518,15 +518,16 @@ export const publishToFacebook = async (accessToken, pageId, mediaUrl, mediaType
   return publishedId;
 };
 
-export const revokeMetaPermissions = async (accessToken) => {
+export const revokeMetaPermissions = async (accessToken, { authProvider = 'facebook' } = {}) => {
   if (!accessToken) return;
-  try {
-    const res = await fetch(`https://graph.facebook.com/v20.0/me/permissions?access_token=${encodeURIComponent(accessToken)}`, {
-      method: 'DELETE',
-    });
-    const data = await res.json();
-    return data;
-  } catch (err) {
-    console.warn('⚠️ [Meta OAuth] Failed to revoke permissions on disconnect:', err.message);
+  const graphHost = authProvider === 'instagram' ? 'graph.instagram.com' : 'graph.facebook.com';
+  const res = await fetch(`https://${graphHost}/${META_GRAPH_API_VERSION}/me/permissions?access_token=${encodeURIComponent(accessToken)}`, {
+    method: 'DELETE',
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.error) {
+    throw new Error(data?.error?.message || `Provider revocation failed with status ${res.status}.`);
   }
+  return data;
 };
+import { META_GRAPH_API_VERSION } from '../config/platforms.js';

@@ -4,6 +4,7 @@
 import 'dotenv/config';
 import mongoose from 'mongoose';
 import SocialAccount from '../models/SocialAccount.js';
+import { META_GRAPH_API_VERSION } from '../config/platforms.js';
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
@@ -23,9 +24,9 @@ const debug = async () => {
 
       let postsUrl;
       if (acc.platform === 'instagram') {
-        postsUrl = `https://${graphHost}/v20.0/${acc.accountId}/media?fields=id,caption,timestamp&limit=3&access_token=${acc.accessToken}`;
+        postsUrl = `https://${graphHost}/${META_GRAPH_API_VERSION}/${acc.accountId}/media?fields=id,caption,timestamp&limit=3&access_token=${acc.accessToken}`;
       } else {
-        postsUrl = `https://graph.facebook.com/v20.0/${acc.accountId}/published_posts?fields=id,message,created_time&limit=3&access_token=${acc.accessToken}`;
+        postsUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${acc.accountId}/published_posts?fields=id,message,created_time&limit=3&access_token=${acc.accessToken}`;
       }
 
       try {
@@ -40,9 +41,9 @@ const debug = async () => {
             
             let commentsUrl;
             if (acc.platform === 'instagram') {
-              commentsUrl = `https://${graphHost}/v20.0/${firstPost.id}/comments?fields=id,text,username,timestamp&access_token=${acc.accessToken}`;
+              commentsUrl = `https://${graphHost}/${META_GRAPH_API_VERSION}/${firstPost.id}/comments?fields=id,text,username,timestamp&access_token=${acc.accessToken}`;
             } else {
-              commentsUrl = `https://graph.facebook.com/v20.0/${firstPost.id}/comments?fields=id,message,from,created_time&access_token=${acc.accessToken}`;
+              commentsUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${firstPost.id}/comments?fields=id,message,from,created_time&access_token=${acc.accessToken}`;
             }
 
             const commRes = await fetch(commentsUrl);

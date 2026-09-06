@@ -7,16 +7,10 @@ import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import User from '../models/User.js';
 import SocialAccount from '../models/SocialAccount.js';
-import ScheduledPost from '../models/ScheduledPost.js';
-import PublishedPost from '../models/PublishedPost.js';
-import PostMetricSnapshot from '../models/PostMetricSnapshot.js';
-import PostMetricDailySnapshot from '../models/PostMetricDailySnapshot.js';
-import PostInsight from '../models/PostInsight.js';
-import Insight from '../models/Insight.js';
-import Media from '../models/Media.js';
-import CampaignChannel from '../models/CampaignChannel.js';
 import { protect } from '../middleware/auth.js';
 import { storeRemoteAvatarForUser } from '../services/avatarStorageService.js';
+import { purgeSocialAccounts, purgeUserData } from '../services/dataPurgeService.js';
+import DataDeletionRequest, { hashDeletionCode } from '../models/DataDeletionRequest.js';
 
 const router = express.Router();
 
@@ -31,7 +25,7 @@ const generateToken = (id) => {
 
 const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-// @desc    Auth user / Google Login or Reviewer Credentials
+// @desc    Authenticate a user with Google or an explicitly provisioned email account
 // @route   POST /api/auth/login
 // @access  Public
 router.post('/login', async (req, res) => {
@@ -47,38 +41,11 @@ router.post('/login', async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected. Sandbox login is disabled.' });
     }
 
-    // Direct Email / Reviewer Credentials Authentication
+    // Direct email authentication. Reviewer accounts must be provisioned explicitly;
+    // this route never creates accounts or accepts fallback passwords.
     if (inputEmail && inputPassword) {
       const normalizedEmail = inputEmail.toLowerCase().trim();
-      let user = await User.findOne({ email: normalizedEmail });
-
-      const reviewerEmail = (process.env.REVIEWER_EMAIL || 'reviewer@thousandpost.com').toLowerCase().trim();
-      const reviewerPassword = process.env.REVIEWER_PASSWORD || 'Reviewer2026!';
-      const ytReviewerEmail = (process.env.YOUTUBE_REVIEWER_EMAIL || 'yt-reviewer@thousandpost.com').toLowerCase().trim();
-      const ytReviewerPassword = process.env.YOUTUBE_REVIEWER_PASSWORD || 'YoutubeReviewer2026!';
-
-      const isMetaReviewer = (normalizedEmail === reviewerEmail || normalizedEmail === 'reviewer@thousandpost.com') && (inputPassword === reviewerPassword || inputPassword === 'Reviewer2026!');
-      const isYtReviewer = (normalizedEmail === ytReviewerEmail || normalizedEmail === 'yt-reviewer@thousandpost.com') && (inputPassword === ytReviewerPassword || inputPassword === 'YoutubeReviewer2026!');
-
-      if (isMetaReviewer || isYtReviewer) {
-        const reviewerName = isYtReviewer ? 'YouTube App Reviewer' : 'Meta App Reviewer';
-        const passwordToHash = isYtReviewer ? ytReviewerPassword : reviewerPassword;
-        if (!user) {
-          const hashedPassword = await bcrypt.hash(passwordToHash, 10);
-          user = await User.create({
-            email: normalizedEmail,
-            name: reviewerName,
-            role: 'editor',
-            userType: 'account_handler',
-            password: hashedPassword,
-          });
-        } else if (user.userType !== 'account_handler') {
-          user.userType = 'account_handler';
-          await user.save();
-        }
-        const token = generateToken(user._id);
-        return res.status(200).json({ user, token });
-      }
+      const user = await User.findOne({ email: normalizedEmail }).select('+password');
 
       if (!user || !user.password) {
         return res.status(401).json({ message: 'Invalid email or password.' });
@@ -135,13 +102,12 @@ router.post('/login', async (req, res) => {
     let user = await User.findOne({ email });
 
     if (!user) {
-      const userCount = await User.countDocuments();
       user = await User.create({
         email,
         name,
         avatar,
-        role: userCount === 0 ? 'owner' : 'editor',
-        userType: req.body.userType || 'account_handler',
+        role: 'editor',
+        userType: 'account_handler',
         googleId,
       });
     }
@@ -178,7 +144,7 @@ router.put('/me', protect, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected. Profile updates are disabled.' });
     }
 
-    const { name, avatar, userType } = req.body;
+    const { name, avatar } = req.body;
     const user = await User.findById(req.user._id);
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
@@ -189,8 +155,6 @@ router.put('/me', protect, async (req, res) => {
       user.avatar = avatar;
       await storeRemoteAvatarForUser(user, avatar);
     }
-    if (userType) user.userType = userType;
-
     await user.save();
     res.status(200).json(user);
   } catch (error) {
@@ -230,25 +194,7 @@ router.delete('/me', protect, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected. Account deletion is disabled.' });
     }
 
-    const userId = req.user._id;
-
-    // Find all social accounts to cascade metric & post deletion
-    const userAccounts = await SocialAccount.find({ userId }).select('_id');
-    const accountIds = userAccounts.map(a => a._id);
-
-    // Wipe all platform data, posts, metrics, media, channels, and profile
-    await Promise.all([
-      ScheduledPost.deleteMany({ userId }),
-      PublishedPost.deleteMany({ $or: [{ userId }, { accountId: { $in: accountIds } }] }),
-      PostMetricSnapshot.deleteMany({ accountId: { $in: accountIds } }),
-      PostMetricDailySnapshot.deleteMany({ accountId: { $in: accountIds } }),
-      PostInsight.deleteMany({ accountId: { $in: accountIds } }),
-      Insight.deleteMany({ accountId: { $in: accountIds } }),
-      Media.deleteMany({ userId }),
-      CampaignChannel.deleteMany({ userId }),
-      SocialAccount.deleteMany({ userId }),
-      User.deleteOne({ _id: userId }),
-    ]);
+    await purgeUserData(req.user._id, { revokeProviderAccess: true });
 
     res.status(200).json({ message: 'Account and all connected data deleted successfully.' });
   } catch (error) {
@@ -275,11 +221,12 @@ router.post('/meta-data-deletion', async (req, res) => {
     }
 
     const fbUserId = String(data.user_id);
-    const confirmationCode = `del_${fbUserId}_${Date.now()}`;
+    const confirmationCode = crypto.randomBytes(24).toString('hex');
 
     // Find user and associated accounts linked to this Facebook ID
     const user = await User.findOne({ facebookId: fbUserId });
     const socialAccounts = await SocialAccount.find({
+      platform: { $in: ['facebook', 'instagram'] },
       $or: [
         { accountId: fbUserId },
         { 'metadata.facebookUserId': fbUserId },
@@ -288,23 +235,19 @@ router.post('/meta-data-deletion', async (req, res) => {
     });
     const accountIds = socialAccounts.map((a) => a._id);
 
-    // Cascade wipe all platform data
-    await Promise.all([
-      SocialAccount.deleteMany({ _id: { $in: accountIds } }),
-      PublishedPost.deleteMany({ accountId: { $in: accountIds } }),
-      ScheduledPost.deleteMany({ socialAccountIds: { $in: accountIds } }),
-      PostMetricSnapshot.deleteMany({ accountId: { $in: accountIds } }),
-      PostMetricDailySnapshot.deleteMany({ accountId: { $in: accountIds } }),
-      PostInsight.deleteMany({ accountId: { $in: accountIds } }),
-      Insight.deleteMany({ accountId: { $in: accountIds } }),
-      CampaignChannel.deleteMany({ socialAccountId: { $in: accountIds } }),
-      ...(user ? [
-        User.deleteOne({ _id: user._id }),
-        Media.deleteMany({ userId: user._id }),
-        ScheduledPost.deleteMany({ userId: user._id }),
-        CampaignChannel.deleteMany({ userId: user._id }),
-      ] : []),
-    ]);
+    if (user) {
+      await purgeUserData(user._id, { revokeProviderAccess: true });
+    } else {
+      await purgeSocialAccounts(accountIds, { revokeProviderAccess: true });
+    }
+
+    await DataDeletionRequest.create({
+      confirmationCodeHash: hashDeletionCode(confirmationCode),
+      provider: 'meta',
+      status: 'completed',
+      completedAt: new Date(),
+      expiresAt: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000),
+    });
 
     const statusUrl = `https://thousandpost.com/data-deletion?code=${confirmationCode}`;
     return res.status(200).json({
@@ -337,6 +280,7 @@ router.post('/meta-deauthorize', async (req, res) => {
     const fbUserId = String(data.user_id);
     const user = await User.findOne({ facebookId: fbUserId });
     const socialAccounts = await SocialAccount.find({
+      platform: { $in: ['facebook', 'instagram'] },
       $or: [
         { accountId: fbUserId },
         { 'metadata.facebookUserId': fbUserId },
@@ -345,20 +289,33 @@ router.post('/meta-deauthorize', async (req, res) => {
     });
 
     const accountIds = socialAccounts.map((a) => a._id);
-    if (accountIds.length > 0) {
-      await SocialAccount.deleteMany({ _id: { $in: accountIds } });
-      await CampaignChannel.deleteMany({ socialAccountId: { $in: accountIds } });
-      await Campaign.updateMany(
-        { accountIds: { $in: accountIds } },
-        { $pull: { accountIds: { $in: accountIds }, channels: { socialAccountId: { $in: accountIds } } } }
-      );
-    }
+    await purgeSocialAccounts(accountIds, { revokeProviderAccess: false });
 
     return res.status(200).json({ message: 'Deauthorization processed successfully.' });
   } catch (err) {
     console.error('❌ Meta deauthorize error:', err.message);
     return res.status(500).json({ message: 'Failed to process deauthorization callback.' });
   }
+});
+
+// @desc    Check the status of a Meta data-deletion request
+// @route   GET /api/auth/meta-data-deletion/status/:code
+// @access  Public
+router.get('/meta-data-deletion/status/:code', async (req, res) => {
+  const code = String(req.params.code || '');
+  if (!/^[a-f0-9]{48}$/i.test(code)) {
+    return res.status(404).json({ message: 'Deletion request not found.' });
+  }
+
+  const request = await DataDeletionRequest.findOne({
+    confirmationCodeHash: hashDeletionCode(code),
+    expiresAt: { $gt: new Date() },
+  }).select('status completedAt').lean();
+
+  if (!request) {
+    return res.status(404).json({ message: 'Deletion request not found.' });
+  }
+  return res.status(200).json({ status: request.status, completedAt: request.completedAt });
 });
 
 export default router;

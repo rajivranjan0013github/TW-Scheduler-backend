@@ -2,6 +2,7 @@ import 'dotenv/config';
 import mongoose from 'mongoose';
 import SocialAccount from '../models/SocialAccount.js';
 import { shouldStoreAvatarUrl, storeRemoteSocialAccountAvatar } from '../services/avatarStorageService.js';
+import { META_GRAPH_API_VERSION } from '../config/platforms.js';
 
 const platformArg = process.argv.find((arg) => arg.startsWith('--platform='));
 const platform = platformArg?.split('=')[1] || 'youtube';
@@ -19,7 +20,7 @@ const fetchFreshAvatarUrl = async (account) => {
   if (!account.accessToken) return '';
 
   if (account.platform === 'facebook') {
-    return `https://graph.facebook.com/v20.0/${account.accountId}/picture?type=normal&access_token=${encodeURIComponent(account.accessToken)}`;
+    return `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${account.accountId}/picture?type=normal&access_token=${encodeURIComponent(account.accessToken)}`;
   }
 
   if (account.platform === 'instagram') {
@@ -30,7 +31,7 @@ const fetchFreshAvatarUrl = async (account) => {
       ? 'me'
       : account.accountId;
     const data = await fetchJson(
-      `https://${graphHost}/v20.0/${accountPath}?fields=profile_picture_url&access_token=${encodeURIComponent(account.accessToken)}`
+      `https://${graphHost}/${META_GRAPH_API_VERSION}/${accountPath}?fields=profile_picture_url&access_token=${encodeURIComponent(account.accessToken)}`
     );
     return data.profile_picture_url || '';
   }

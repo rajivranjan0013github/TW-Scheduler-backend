@@ -83,6 +83,7 @@ export const exchangeYoutubeCodeForAccount = async (code, userId) => {
     tokenStatus: 'healthy',
     tokenRefreshError: '',
     tokenLastCheckedAt: new Date(),
+    providerDataRefreshedAt: new Date(),
     scopes: tokens.scope ? tokens.scope.split(' ') : [YOUTUBE_UPLOAD_SCOPE, YOUTUBE_READONLY_SCOPE],
     avatarUrl,
     metadata: {
@@ -108,26 +109,48 @@ const parseTags = (tags) => {
 
 const buildYoutubeMetadata = ({ caption, specifics }) => {
   const youtube = specifics?.youtube || {};
-  const fallbackTitle = (caption || 'Scheduled YouTube Upload').split('\n')[0].slice(0, 100);
 
   return {
     snippet: {
-      title: youtube.title || fallbackTitle || 'Scheduled YouTube Upload',
-      description: youtube.description || caption || '',
+      title: youtube.title,
+      description: youtube.description,
       tags: parseTags(youtube.tags),
       categoryId: youtube.categoryId || '22',
     },
     status: {
       privacyStatus: youtube.privacyStatus || 'private',
-      selfDeclaredMadeForKids: Boolean(youtube.selfDeclaredMadeForKids),
+      selfDeclaredMadeForKids: youtube.selfDeclaredMadeForKids,
+      containsSyntheticMedia: Boolean(youtube.containsSyntheticMedia),
     },
   };
+};
+
+const assertYoutubeUploadDetails = (specifics) => {
+  const youtube = specifics?.youtube;
+  const title = String(youtube?.title || '').trim();
+  const description = typeof youtube?.description === 'string' ? youtube.description : '';
+  if (!title || Array.from(title).length > 100) {
+    throw new Error('A user-selected YouTube title of 100 characters or fewer is required.');
+  }
+  if (Buffer.byteLength(description, 'utf8') > 5000) {
+    throw new Error('The user-selected YouTube description exceeds 5,000 bytes.');
+  }
+  if (!['public', 'private', 'unlisted'].includes(youtube?.privacyStatus)) {
+    throw new Error('A user-selected YouTube privacy setting is required.');
+  }
+  if (typeof youtube?.selfDeclaredMadeForKids !== 'boolean') {
+    throw new Error('A user-selected YouTube Made for Kids setting is required.');
+  }
+  if (youtube?.communityGuidelinesCertified !== true) {
+    throw new Error('YouTube Community Guidelines certification is required.');
+  }
 };
 
 export const publishToYoutube = async ({ account, media, caption, specifics }) => {
   if (!media || media.type !== 'video') {
     throw new Error('YouTube publishing requires a video media asset.');
   }
+  assertYoutubeUploadDetails(specifics);
 
   const freshAccount = await ensureFreshAccountToken(account, { force: true });
   const accessToken = freshAccount.accessToken;
@@ -292,11 +315,6 @@ export const fetchYoutubeVideos = async (account, { limit = 25 } = {}) => {
 export const revokeYoutubeToken = async (account) => {
   const tokenToRevoke = account?.refreshToken || account?.accessToken;
   if (!tokenToRevoke) return;
-  try {
-    const client = getYoutubeOAuthClient();
-    await client.revokeToken(tokenToRevoke);
-  } catch (err) {
-    console.warn('⚠️ [YouTube OAuth] Failed to revoke token on disconnect:', err.message);
-  }
+  const client = getYoutubeOAuthClient();
+  await client.revokeToken(tokenToRevoke);
 };
-

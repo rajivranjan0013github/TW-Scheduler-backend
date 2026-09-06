@@ -124,6 +124,7 @@ export const fileExists = async (storageKey) => {
  * @param {string} storageKey 
  */
 export const deleteFile = async (storageKey) => {
+  if (!storageKey || typeof storageKey !== 'string') return;
   if (useR2 && r2Client) {
     try {
       const command = new DeleteObjectCommand({
@@ -133,14 +134,36 @@ export const deleteFile = async (storageKey) => {
       await r2Client.send(command);
     } catch (error) {
       console.error('❌ Cloudflare R2 delete error:', error.message);
+      throw error;
     }
   } else {
     // Local delete fallback
     const uploadDir = path.join(__dirname, '../../public/uploads');
-    const localFilePath = path.join(uploadDir, storageKey);
+    const localFilePath = path.resolve(uploadDir, storageKey);
+    if (!localFilePath.startsWith(`${path.resolve(uploadDir)}${path.sep}`)) {
+      throw new Error('Invalid storage key.');
+    }
     if (fs.existsSync(localFilePath)) {
       fs.unlinkSync(localFilePath);
     }
+  }
+};
+
+export const getStorageKeyFromUrl = (url) => {
+  if (!url || typeof url !== 'string') return '';
+  try {
+    const parsed = new URL(url);
+    const configuredBase = new URL(`${publicBaseUrl()}/`);
+    if (parsed.origin === configuredBase.origin) {
+      return decodeURIComponent(parsed.pathname.replace(/^\//, ''));
+    }
+    const uploadsMarker = '/uploads/';
+    const markerIndex = parsed.pathname.indexOf(uploadsMarker);
+    return markerIndex >= 0
+      ? decodeURIComponent(parsed.pathname.slice(markerIndex + uploadsMarker.length))
+      : '';
+  } catch {
+    return '';
   }
 };
 

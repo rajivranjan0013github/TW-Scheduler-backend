@@ -2,8 +2,10 @@ import express from 'express';
 import crypto from 'crypto';
 import mongoose from 'mongoose';
 import { getDBStatus } from '../config/db.js';
+import { META_GRAPH_API_VERSION } from '../config/platforms.js';
 import { mockStore } from '../models/mockStore.js';
 import SocialAccount, { sanitizeSocialAccount } from '../models/SocialAccount.js';
+import OAuthStateNonce from '../models/OAuthStateNonce.js';
 import Campaign from '../models/Campaign.js';
 import Media from '../models/Media.js';
 import User from '../models/User.js';
@@ -14,8 +16,8 @@ import PostMetricSnapshot from '../models/PostMetricSnapshot.js';
 import PostMetricDailySnapshot from '../models/PostMetricDailySnapshot.js';
 import { recordStoredMetricSnapshots, healStaleSyncStatuses } from '../queues/metricSyncWorker.js';
 import { protect, authorize, resolveHandlerPreview } from '../middleware/auth.js';
-import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount, fetchYoutubeVideos, revokeYoutubeToken } from '../services/youtubeService.js';
-import { revokeMetaPermissions } from '../services/metaService.js';
+import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount, fetchYoutubeVideos } from '../services/youtubeService.js';
+import { purgeSocialAccounts } from '../services/dataPurgeService.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
 import {
   fetchFacebookPostEngagement,
@@ -34,46 +36,71 @@ import MetricSyncStatus from '../models/MetricSyncStatus.js';
 import { requestAccountSync } from '../queues/publisherQueue.js';
 import { ensureDefaultCampaignFolders } from '../services/campaignFolderService.js';
 import { getCreatorAnalytics } from '../services/creatorAnalyticsService.js';
-const OAUTH_STATE_SECRET = process.env.JWT_SECRET || 'oauth_state_secret_tw';
 const OAUTH_STATE_MAX_AGE_MS = 15 * 60 * 1000; // 15 minutes
 
 export const signOAuthState = (payload = {}) => {
+  const oauthStateSecret = process.env.JWT_SECRET;
+  if (!oauthStateSecret) throw new Error('JWT_SECRET is required to sign OAuth state.');
   const data = JSON.stringify({
     ts: Date.now(),
+    nonce: crypto.randomBytes(24).toString('base64url'),
     ...payload,
   });
   const encoded = Buffer.from(data, 'utf8').toString('base64url');
-  const hmac = crypto.createHmac('sha256', OAUTH_STATE_SECRET).update(encoded).digest('base64url');
+  const hmac = crypto.createHmac('sha256', oauthStateSecret).update(encoded).digest('base64url');
   return `${encoded}.${hmac}`;
 };
 
-export const verifyOAuthState = (stateString, expectedUserId = null) => {
+export const verifyOAuthState = (stateString, expectedUserId = null, expectedProvider = null) => {
   if (!stateString || typeof stateString !== 'string') return null;
   const parts = stateString.split('.');
-  if (parts.length !== 2) {
-    try {
-      return JSON.parse(stateString);
-    } catch {
-      return null;
-    }
-  }
+  if (parts.length !== 2 || !process.env.JWT_SECRET) return null;
 
   const [encoded, hmac] = parts;
   try {
-    const expectedHmac = crypto.createHmac('sha256', OAUTH_STATE_SECRET).update(encoded).digest('base64url');
-    if (hmac !== expectedHmac) return null;
+    const expectedHmac = crypto.createHmac('sha256', process.env.JWT_SECRET).update(encoded).digest('base64url');
+    const actualBuffer = Buffer.from(hmac, 'utf8');
+    const expectedBuffer = Buffer.from(expectedHmac, 'utf8');
+    if (actualBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(actualBuffer, expectedBuffer)) return null;
 
     const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
-    if (parsed.ts && Date.now() - parsed.ts > OAUTH_STATE_MAX_AGE_MS) {
-      return null;
-    }
-    if (expectedUserId && parsed.userId && String(parsed.userId) !== String(expectedUserId)) {
-      return null;
-    }
+    if (!parsed.ts || !parsed.nonce || Date.now() - parsed.ts > OAUTH_STATE_MAX_AGE_MS || parsed.ts > Date.now() + 60_000) return null;
+    if (expectedUserId && String(parsed.userId || '') !== String(expectedUserId)) return null;
+    if (expectedProvider && parsed.provider !== expectedProvider) return null;
     return parsed;
   } catch {
     return null;
   }
+};
+
+const createOAuthState = async (payload) => {
+  const state = signOAuthState(payload);
+  const parsed = verifyOAuthState(state, payload.userId, payload.provider);
+  if (!parsed) throw new Error('Could not create OAuth state.');
+  await OAuthStateNonce.create({
+    nonce: parsed.nonce,
+    userId: payload.userId,
+    provider: payload.provider,
+    expiresAt: new Date(parsed.ts + OAUTH_STATE_MAX_AGE_MS),
+  });
+  return state;
+};
+
+export const consumeOAuthState = async (state, expectedUserId, expectedProvider) => {
+  const parsed = verifyOAuthState(state, expectedUserId, expectedProvider);
+  if (!parsed) return null;
+  const consumed = await OAuthStateNonce.findOneAndUpdate(
+    {
+      nonce: parsed.nonce,
+      userId: expectedUserId,
+      provider: expectedProvider,
+      consumedAt: null,
+      expiresAt: { $gt: new Date() },
+    },
+    { $set: { consumedAt: new Date() } },
+    { returnDocument: 'after' },
+  ).lean();
+  return consumed ? parsed : null;
 };
 
 const router = express.Router();
@@ -190,6 +217,10 @@ const getAccountAccessFilter = async (req, id) => {
   }
   return { _id: id, userId: req.user._id };
 };
+
+const getOwnedAccountAccessFilter = (req, id) => (
+  hasAdminAccess(req.user) ? { _id: id } : { _id: id, userId: req.user._id }
+);
 
 const getReauthorizationAccount = async (req, accountId, platform, campaignId) => {
   if (!accountId) return null;
@@ -1053,7 +1084,7 @@ router.get('/insights', protect, async (req, res) => {
         : 'graph.facebook.com';
 
       for (const metric of metricCandidates) {
-        const url = `https://${graphHost}/v20.0/${account.accountId}/insights?metric=${metric}&period=day&since=${sinceTime}&until=${untilTime}&access_token=${account.accessToken}`;
+        const url = `https://${graphHost}/${META_GRAPH_API_VERSION}/${account.accountId}/insights?metric=${metric}&period=day&since=${sinceTime}&until=${untilTime}&access_token=${account.accessToken}`;
         const apiRes = await fetch(url);
         const apiData = await apiRes.json();
 
@@ -1208,77 +1239,19 @@ router.get('/insights', protect, async (req, res) => {
   }
 });
 
-// @desc    Connect a new account
-// @route   POST /api/accounts/connect
-// @access  Private (Owner, Admin)
-router.post('/connect', protect, resolveHandlerPreview, async (req, res) => {
-  const { platform, accountId, name, username, accessToken, avatarUrl, campaignId } = req.body;
-
-  try {
-    const isConnected = getDBStatus();
-    if (!isConnected) {
-      return res.status(503).json({ message: 'Database disconnected.' });
-    }
-
-    const linkableCampaignId = await getLinkableCampaignId(req, campaignId, {
-      platform,
-      accountId,
-      name,
-      username,
-    });
-    const storedAvatarUrl = await storeRemoteSocialAccountAvatar({
-      platform,
-      accountId,
-      avatarUrl,
-    });
-
-    let account = await SocialAccount.findOne({ userId: req.user._id, accountId });
-    if (account) {
-      account.isConnected = true;
-      account.accessToken = accessToken || 'mock-access-token';
-      if (storedAvatarUrl) account.avatarUrl = storedAvatarUrl;
-      account.campaignId = linkableCampaignId || undefined;
-      account.tokenStatus = 'healthy';
-      account.tokenRefreshError = '';
-      account.tokenLastCheckedAt = new Date();
-      await account.save();
-    } else {
-      account = await SocialAccount.create({
-        userId: req.user._id,
-        campaignId: linkableCampaignId || undefined,
-        platform,
-        accountId,
-        name,
-        username,
-        accessToken: accessToken || 'mock-access-token',
-        avatarUrl: storedAvatarUrl,
-        tokenStatus: 'healthy',
-        tokenLastCheckedAt: new Date(),
-      });
-    }
-
-    if (linkableCampaignId) {
-      await linkAccountToCampaign(linkableCampaignId, account._id, platform, username, name, accountId, req.user._id, req.user.email || '');
-    }
-
-    res.status(201).json(account);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-});
-
 // @desc    Get YouTube OAuth URL
 // @route   GET /api/accounts/youtube/auth-url
 // @access  Private (Owner, Admin)
 router.get('/youtube/auth-url', protect, resolveHandlerPreview, async (req, res) => {
   try {
-    const state = signOAuthState({
+    const redirectUri = process.env.YOUTUBE_REDIRECT_URI || 'https://thousandpost.com/auth/youtube/callback';
+    const state = await createOAuthState({
       userId: req.user._id,
       campaignId: req.query.campaignId || '',
       reauthorizeAccountId: req.query.reauthorizeAccountId || '',
       provider: 'youtube',
+      redirectUri,
     });
-    const redirectUri = req.query.redirectUri || process.env.YOUTUBE_REDIRECT_URI || undefined;
     const url = getYoutubeAuthUrl({ state, redirectUri });
     res.status(200).json({ url });
   } catch (error) {
@@ -1292,15 +1265,16 @@ router.get('/youtube/auth-url', protect, resolveHandlerPreview, async (req, res)
 router.get('/facebook/auth-url', protect, resolveHandlerPreview, async (req, res) => {
   try {
     const appId = process.env.META_APP_ID;
-    const redirectUri = req.query.redirectUri || process.env.META_REDIRECT_URI || 'https://thousandpost.com/auth/facebook/callback';
+    const redirectUri = process.env.META_REDIRECT_URI || 'https://thousandpost.com/auth/facebook/callback';
     if (!appId) {
       return res.status(500).json({ message: 'Meta App credentials are not configured on the backend.' });
     }
-    const state = signOAuthState({
+    const state = await createOAuthState({
       userId: req.user._id,
       campaignId: req.query.campaignId || '',
       reauthorizeAccountId: req.query.reauthorizeAccountId || '',
       provider: 'facebook',
+      redirectUri,
     });
     const params = new URLSearchParams({
       client_id: appId,
@@ -1310,7 +1284,7 @@ router.get('/facebook/auth-url', protect, resolveHandlerPreview, async (req, res
       auth_type: 'rerequest',
       state,
     });
-    const url = `https://www.facebook.com/v20.0/dialog/oauth?${params.toString()}`;
+    const url = `https://www.facebook.com/${META_GRAPH_API_VERSION}/dialog/oauth?${params.toString()}`;
     res.status(200).json({ url });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -1323,18 +1297,19 @@ router.get('/facebook/auth-url', protect, resolveHandlerPreview, async (req, res
 router.get('/instagram/auth-url', protect, resolveHandlerPreview, async (req, res) => {
   try {
     const appId = process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID;
-    let redirectUri = req.query.redirectUri || process.env.INSTAGRAM_REDIRECT_URI || 'https://thousandpost.com/auth/instagram/callback';
+    let redirectUri = process.env.INSTAGRAM_REDIRECT_URI || 'https://thousandpost.com/auth/instagram/callback';
     if (typeof redirectUri === 'string' && redirectUri.includes('theeasypost.com')) {
       redirectUri = redirectUri.replace('theeasypost.com', 'thousandpost.com');
     }
     if (!appId) {
       return res.status(500).json({ message: 'Instagram App credentials are not configured on the backend.' });
     }
-    const state = signOAuthState({
+    const state = await createOAuthState({
       userId: req.user._id,
       campaignId: req.query.campaignId || '',
       reauthorizeAccountId: req.query.reauthorizeAccountId || '',
       provider: 'instagram',
+      redirectUri,
     });
     const params = new URLSearchParams({
       client_id: appId,
@@ -1350,84 +1325,21 @@ router.get('/instagram/auth-url', protect, resolveHandlerPreview, async (req, re
   }
 });
 
-// Fallback direct browser connect redirects
-router.get('/connect/youtube', async (req, res) => {
-  try {
-    const state = JSON.stringify({
-      campaignId: req.query.campaignId || '',
-      reauthorizeAccountId: req.query.reauthorizeAccountId || req.query.socialAccountId || '',
-    });
-    const url = getYoutubeAuthUrl({ state });
-    return res.redirect(url);
-  } catch (err) {
-    return res.status(500).send(`YouTube connection error: ${err.message}`);
-  }
-});
-
-router.get('/connect/facebook', async (req, res) => {
-  try {
-    const appId = process.env.META_APP_ID;
-    const redirectUri = process.env.META_REDIRECT_URI || 'https://thousandpost.com/auth/facebook/callback';
-    if (!appId) return res.status(500).send('Meta App ID not configured.');
-    const state = JSON.stringify({
-      campaignId: req.query.campaignId || '',
-      reauthorizeAccountId: req.query.reauthorizeAccountId || req.query.socialAccountId || '',
-    });
-    const params = new URLSearchParams({
-      client_id: appId,
-      redirect_uri: redirectUri,
-      scope: 'pages_show_list,pages_read_engagement,pages_manage_posts',
-      response_type: 'code',
-      auth_type: 'rerequest',
-      state,
-    });
-    return res.redirect(`https://www.facebook.com/v20.0/dialog/oauth?${params.toString()}`);
-  } catch (err) {
-    return res.status(500).send(`Facebook connection error: ${err.message}`);
-  }
-});
-
-router.get('/connect/instagram', async (req, res) => {
-  try {
-    const appId = process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID;
-    const redirectUri = process.env.INSTAGRAM_REDIRECT_URI || 'https://thousandpost.com/auth/instagram/callback';
-    if (!appId) return res.status(500).send('Instagram App ID not configured.');
-    const state = JSON.stringify({
-      campaignId: req.query.campaignId || '',
-      reauthorizeAccountId: req.query.reauthorizeAccountId || req.query.socialAccountId || '',
-    });
-    const params = new URLSearchParams({
-      client_id: appId,
-      redirect_uri: redirectUri,
-      scope: 'instagram_business_basic,instagram_business_content_publish,instagram_business_manage_insights',
-      response_type: 'code',
-      state,
-    });
-    return res.redirect(`https://www.instagram.com/oauth/authorize?${params.toString()}`);
-  } catch (err) {
-    return res.status(500).send(`Instagram connection error: ${err.message}`);
-  }
-});
-
 // @desc    Callback from YouTube OAuth to connect a channel
 // @route   POST /api/accounts/youtube-callback
 // @access  Private (Owner, Admin)
 router.post('/youtube-callback', protect, resolveHandlerPreview, async (req, res) => {
-  const { code, state, campaignId: directCampaignId, reauthorizeAccountId: directReauthId } = req.body;
+  const { code, state } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
   }
 
-  let verifiedState = null;
-  if (state) {
-    verifiedState = verifyOAuthState(state, req.user._id);
-    if (!verifiedState) {
-      return res.status(400).json({ message: 'Invalid or expired OAuth state parameter. Please try connecting again.' });
-    }
+  const verifiedState = await consumeOAuthState(state, req.user._id, 'youtube');
+  if (!verifiedState) {
+    return res.status(400).json({ message: 'Missing, invalid, or expired OAuth state parameter. Please try connecting again.' });
   }
-
-  const campaignId = directCampaignId || verifiedState?.campaignId;
-  const reauthorizeAccountId = directReauthId || verifiedState?.reauthorizeAccountId;
+  const campaignId = verifiedState.campaignId;
+  const reauthorizeAccountId = verifiedState.reauthorizeAccountId;
 
   try {
     const isConnected = getDBStatus();
@@ -1493,31 +1405,15 @@ router.delete('/:id', protect, resolveHandlerPreview, async (req, res) => {
       return res.status(503).json({ message: 'Database disconnected.' });
     }
 
-    const account = await SocialAccount.findOne(await getAccountAccessFilter(req, id));
+    const account = await SocialAccount.findOne(getOwnedAccountAccessFilter(req, id));
     if (!account) {
-      return res.status(404).json({ message: 'Account not found' });
+      return res.status(403).json({ message: 'Only the channel owner can disconnect and revoke this account.' });
     }
-
-    // Revoke permissions/tokens with upstream provider asynchronously
-    if (account.platform === 'facebook' || account.platform === 'instagram') {
-      void revokeMetaPermissions(account.accessToken).catch(() => {});
-    } else if (account.platform === 'youtube') {
-      void revokeYoutubeToken(account).catch(() => {});
-    }
-
-    await SocialAccount.deleteOne(await getAccountAccessFilter(req, id));
-    await CampaignChannel.deleteMany({ socialAccountId: id });
-    await PublishedPost.deleteMany({ accountId: id });
-    await PostMetricSnapshot.deleteMany({ accountId: id });
-    await PostMetricDailySnapshot.deleteMany({ accountId: id });
-    await PostInsight.deleteMany({ accountId: id });
-    await Insight.deleteMany({ accountId: id });
-    await MetricSyncStatus.deleteMany({ accountId: id });
-    await Campaign.updateMany(
-      { accountIds: id },
-      { $pull: { accountIds: id, channels: { socialAccountId: id } } }
-    );
-    res.status(200).json({ message: 'Account disconnected successfully' });
+    const result = await purgeSocialAccounts([account._id], { revokeProviderAccess: true });
+    res.status(200).json({
+      message: 'Account disconnected and locally stored platform data erased successfully.',
+      providerRevocationConfirmed: result.revocationFailures === 0,
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -1527,25 +1423,21 @@ router.delete('/:id', protect, resolveHandlerPreview, async (req, res) => {
 // @route   POST /api/accounts/facebook-callback
 // @access  Private (Owner, Admin)
 router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, res) => {
-  const { code, state, redirectUri: requestRedirectUri, campaignId: directCampaignId, reauthorizeAccountId: directReauthId } = req.body;
+  const { code, state } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
   }
 
-  let verifiedState = null;
-  if (state) {
-    verifiedState = verifyOAuthState(state, req.user._id);
-    if (!verifiedState) {
-      return res.status(400).json({ message: 'Invalid or expired OAuth state parameter. Please try connecting again.' });
-    }
+  const verifiedState = await consumeOAuthState(state, req.user._id, 'facebook');
+  if (!verifiedState) {
+    return res.status(400).json({ message: 'Missing, invalid, or expired OAuth state parameter. Please try connecting again.' });
   }
-
-  const campaignId = directCampaignId || verifiedState?.campaignId;
-  const reauthorizeAccountId = directReauthId || verifiedState?.reauthorizeAccountId;
+  const campaignId = verifiedState.campaignId;
+  const reauthorizeAccountId = verifiedState.reauthorizeAccountId;
 
   const appId = process.env.META_APP_ID;
   const appSecret = process.env.META_APP_SECRET;
-  const redirectUri = requestRedirectUri || process.env.META_REDIRECT_URI || 'https://thousandpost.com/auth/facebook/callback';
+  const redirectUri = verifiedState.redirectUri || process.env.META_REDIRECT_URI || 'https://thousandpost.com/auth/facebook/callback';
 
   if (!appId || !appSecret) {
     return res.status(500).json({ message: 'Meta App credentials are not configured on the backend.' });
@@ -1558,8 +1450,8 @@ router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, re
     if (reauthorizeAccountId && !reauthorizationAccount) {
       return res.status(404).json({ message: 'The channel selected for reauthorization was not found.' });
     }
-    if (reauthorizationAccount && !['facebook', 'instagram'].includes(reauthorizationAccount.platform)) {
-      return res.status(400).json({ message: 'This channel cannot be reauthorized with Meta.' });
+    if (reauthorizationAccount && reauthorizationAccount.platform !== 'facebook') {
+      return res.status(400).json({ message: 'Only Facebook Pages can be reauthorized through Facebook Login.' });
     }
     if (reauthorizationAccount) {
       await getReauthorizationAccount(
@@ -1571,7 +1463,7 @@ router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, re
     }
     
     // 1. Exchange authorization code for short-lived user token
-    const tokenExchangeUrl = `https://graph.facebook.com/v20.0/oauth/access_token` +
+    const tokenExchangeUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/oauth/access_token` +
       `?client_id=${appId}` +
       `&redirect_uri=${encodeURIComponent(redirectUri)}` +
       `&client_secret=${appSecret}` +
@@ -1588,7 +1480,7 @@ router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, re
     const shortLivedToken = exchangeData.access_token;
 
     // 2. Upgrade to long-lived user token (60 days)
-    const upgradeUrl = `https://graph.facebook.com/v20.0/oauth/access_token` +
+    const upgradeUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/oauth/access_token` +
       `?grant_type=fb_exchange_token` +
       `&client_id=${appId}` +
       `&client_secret=${appSecret}` +
@@ -1641,7 +1533,7 @@ router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, re
     }
 
     // 3. Fetch user's Facebook Pages and Page Access Tokens
-    const pagesUrl = `https://graph.facebook.com/v20.0/me/accounts?access_token=${longLivedUserToken}`;
+    const pagesUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/accounts?access_token=${longLivedUserToken}`;
     const pagesRes = await fetch(pagesUrl);
     const pagesData = await pagesRes.json();
 
@@ -1656,7 +1548,7 @@ router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, re
     for (const pageId of targetPageIds) {
       if (!pagesList.some(p => p.id === pageId)) {
         try {
-          const directPageUrl = `https://graph.facebook.com/v20.0/${pageId}?fields=name,username,access_token&access_token=${longLivedUserToken}`;
+          const directPageUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${pageId}?fields=name,username,access_token&access_token=${longLivedUserToken}`;
           const directPageRes = await fetch(directPageUrl);
           const directPageData = await directPageRes.json();
           if (directPageRes.ok && directPageData.access_token) {
@@ -1708,7 +1600,7 @@ router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, re
 
       if (!reauthorizationAccount || reauthorizationAccount.platform === 'facebook') {
         // Get page avatar from metadata or fallback
-        const pagePicUrl = `https://graph.facebook.com/v20.0/${pageId}/picture?type=normal&access_token=${pageAccessToken}`;
+        const pagePicUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${pageId}/picture?type=normal&access_token=${pageAccessToken}`;
         const pageAvatarUrl = await storeRemoteSocialAccountAvatar({
           platform: 'facebook',
           accountId: pageId,
@@ -1762,75 +1654,6 @@ router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, re
         }
       }
 
-      if (reauthorizationAccount?.platform === 'facebook') {
-        continue;
-      }
-
-      // Check for linked Instagram Business Account
-      const igBusinessUrl = `https://graph.facebook.com/v20.0/${pageId}?fields=instagram_business_account{id,username,name,profile_picture_url}&access_token=${pageAccessToken}`;
-      const igRes = await fetch(igBusinessUrl);
-      const igData = await igRes.json();
-
-      if (igData.instagram_business_account) {
-        const ig = igData.instagram_business_account;
-        const igAccountId = ig.id;
-        const igUsername = ig.username || `ig_${igAccountId}`;
-        const igName = ig.name || igUsername;
-
-        // Store Instagram Avatar
-        const storedIgAvatarUrl = await storeRemoteSocialAccountAvatar({
-          platform: 'instagram',
-          accountId: igAccountId,
-          avatarUrl: ig.profile_picture_url,
-        });
-
-        const instagramLinkableCampaignId = await getLinkableCampaignId(req, campaignId, {
-          platform: 'instagram',
-          accountId: igAccountId,
-          name: igName,
-          username: igUsername,
-        });
-        const instagramPayload = {
-          platform: 'instagram',
-          accountId: igAccountId,
-          name: igName,
-          username: igUsername,
-        };
-        if (reauthorizationAccount && !providerAccountMatches(reauthorizationAccount, instagramPayload)) {
-          continue;
-        }
-
-        // Upsert Instagram Account in database
-        const igAccount = await saveConnectedAccount({
-          reauthorizationAccount,
-          filter: { userId: req.user._id, accountId: igAccountId },
-          payload: {
-            userId: reauthorizationAccount?.userId || req.user._id,
-            campaignId: instagramLinkableCampaignId || reauthorizationAccount?.campaignId || undefined,
-            platform: 'instagram',
-            accountId: igAccountId,
-            name: igName,
-            username: igUsername,
-            accessToken: pageAccessToken, // Instagram operations use page tokens or long-lived user tokens
-            authProvider: 'facebook',
-            avatarUrl: storedIgAvatarUrl,
-            isConnected: true,
-            tokenStatus: 'healthy',
-            tokenRefreshError: '',
-            tokenLastCheckedAt: new Date(),
-            metadata: {
-              ...(reauthorizationAccount?.metadata || {}),
-              ...(metaUserId ? { facebookUserId: metaUserId } : {}),
-              linkedFacebookPageId: pageId,
-            },
-          },
-        });
-        connectedAccounts.push(igAccount);
-        reauthorizationMatched = reauthorizationMatched || Boolean(reauthorizationAccount);
-        if (instagramLinkableCampaignId) {
-          await linkAccountToCampaign(instagramLinkableCampaignId, igAccount._id, 'instagram', igAccount.username, igAccount.name, igAccount.accountId, req.user._id, req.user.email || '');
-        }
-      }
     }
 
     if (reauthorizationAccount && !reauthorizationMatched) {
@@ -1847,7 +1670,7 @@ router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, re
     });
 
     res.status(200).json({
-      message: `Successfully connected ${connectedAccounts.length} Meta accounts/pages.`,
+      message: `Successfully connected ${connectedAccounts.length} Facebook Page${connectedAccounts.length === 1 ? '' : 's'}.`,
       accounts: sanitizeSocialAccount(connectedAccounts),
     });
   } catch (error) {
@@ -1860,25 +1683,21 @@ router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, re
 // @route   POST /api/accounts/instagram-callback
 // @access  Private (Owner, Admin)
 router.post('/instagram-callback', protect, resolveHandlerPreview, async (req, res) => {
-  const { code, state, redirectUri: requestRedirectUri, campaignId: directCampaignId, reauthorizeAccountId: directReauthId } = req.body;
+  const { code, state } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
   }
 
-  let verifiedState = null;
-  if (state) {
-    verifiedState = verifyOAuthState(state, req.user._id);
-    if (!verifiedState) {
-      return res.status(400).json({ message: 'Invalid or expired OAuth state parameter. Please try connecting again.' });
-    }
+  const verifiedState = await consumeOAuthState(state, req.user._id, 'instagram');
+  if (!verifiedState) {
+    return res.status(400).json({ message: 'Missing, invalid, or expired OAuth state parameter. Please try connecting again.' });
   }
-
-  const campaignId = directCampaignId || verifiedState?.campaignId;
-  const reauthorizeAccountId = directReauthId || verifiedState?.reauthorizeAccountId;
+  const campaignId = verifiedState.campaignId;
+  const reauthorizeAccountId = verifiedState.reauthorizeAccountId;
 
   const appId = process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID;
   const appSecret = process.env.INSTAGRAM_APP_SECRET || process.env.META_APP_SECRET;
-  let redirectUri = requestRedirectUri || process.env.INSTAGRAM_REDIRECT_URI || 'https://thousandpost.com/auth/instagram/callback';
+  let redirectUri = verifiedState.redirectUri || process.env.INSTAGRAM_REDIRECT_URI || 'https://thousandpost.com/auth/instagram/callback';
   if (typeof redirectUri === 'string' && redirectUri.includes('theeasypost.com')) {
     redirectUri = redirectUri.replace('theeasypost.com', 'thousandpost.com');
   }
@@ -1927,7 +1746,7 @@ router.post('/instagram-callback', protect, resolveHandlerPreview, async (req, r
     }
 
     const longLivedToken = upgradeData.access_token;
-    const profileUrl = `https://graph.instagram.com/v20.0/me?fields=id,user_id,username,name,account_type,profile_picture_url&access_token=${encodeURIComponent(longLivedToken)}`;
+    const profileUrl = `https://graph.instagram.com/${META_GRAPH_API_VERSION}/me?fields=id,user_id,username,name,account_type,profile_picture_url&access_token=${encodeURIComponent(longLivedToken)}`;
     const profileRes = await fetch(profileUrl);
     const profileData = await profileRes.json();
 
@@ -2147,7 +1966,7 @@ router.get('/:id/posts', protect, async (req, res) => {
         const graphHost = liveAccount.platform === 'instagram' && liveAccount.authProvider === 'instagram'
           ? 'graph.instagram.com'
           : 'graph.facebook.com';
-        const url = `https://${graphHost}/v20.0/${postId}/insights?metric=${metric}&access_token=${liveAccount.accessToken}`;
+        const url = `https://${graphHost}/${META_GRAPH_API_VERSION}/${postId}/insights?metric=${metric}&access_token=${liveAccount.accessToken}`;
         const insightRes = await fetch(url);
         const insightData = await insightRes.json();
 
@@ -2175,7 +1994,7 @@ router.get('/:id/posts', protect, async (req, res) => {
     // Call actual Meta APIs
     let posts = [];
     if (liveAccount.platform === 'facebook') {
-      const url = `https://graph.facebook.com/v20.0/${liveAccount.accountId}/published_posts?fields=id,message,created_time,full_picture,permalink_url,object_id&limit=100&access_token=${liveAccount.accessToken}`;
+      const url = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${liveAccount.accountId}/published_posts?fields=id,message,created_time,full_picture,permalink_url,object_id&limit=100&access_token=${liveAccount.accessToken}`;
       const apiResult = await fetchMetaPagedData(url, {
         shouldStop: (pageItems) => pageItems.some((post) => !isInFeedWindow(post.created_time)),
       });
@@ -2246,7 +2065,7 @@ router.get('/:id/posts', protect, async (req, res) => {
       }
     } else if (liveAccount.platform === 'instagram') {
       const graphHost = liveAccount.authProvider === 'instagram' ? 'graph.instagram.com' : 'graph.facebook.com';
-      const url = `https://${graphHost}/v20.0/${liveAccount.accountId}/media?fields=id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count&limit=100&access_token=${liveAccount.accessToken}`;
+      const url = `https://${graphHost}/${META_GRAPH_API_VERSION}/${liveAccount.accountId}/media?fields=id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count&limit=100&access_token=${liveAccount.accessToken}`;
       const apiResult = await fetchMetaPagedData(url, {
         shouldStop: (pageItems) => pageItems.some((post) => !isInFeedWindow(post.timestamp)),
       });

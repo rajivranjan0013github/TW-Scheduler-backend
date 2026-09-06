@@ -2,8 +2,34 @@ import mongoose from 'mongoose';
 import SocialAccount from '../models/SocialAccount.js';
 import Folder from '../models/Folder.js';
 import User from '../models/User.js';
+import { encryptToken, isEncryptionEnabled } from '../utils/tokenEncryption.js';
 
 let isConnected = false;
+
+const migrateSocialTokensAtRest = async () => {
+  if (!isEncryptionEnabled()) return 0;
+  const accounts = await SocialAccount.collection.find(
+    {},
+    { projection: { accessToken: 1, refreshToken: 1 } },
+  ).toArray();
+  const operations = accounts.flatMap((account) => {
+    const accessToken = account.accessToken && !String(account.accessToken).startsWith('enc:')
+      ? encryptToken(account.accessToken)
+      : account.accessToken;
+    const refreshToken = account.refreshToken && !String(account.refreshToken).startsWith('enc:')
+      ? encryptToken(account.refreshToken)
+      : account.refreshToken;
+    if (accessToken === account.accessToken && refreshToken === account.refreshToken) return [];
+    return [{
+      updateOne: {
+        filter: { _id: account._id },
+        update: { $set: { accessToken, ...(refreshToken ? { refreshToken } : {}) } },
+      },
+    }];
+  });
+  if (operations.length) await SocialAccount.collection.bulkWrite(operations);
+  return operations.length;
+};
 
 const seedDatabase = async () => {
   try {
@@ -91,6 +117,9 @@ export const connectDB = async () => {
       serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
     });
     isConnected = true;
+
+    // Encrypt legacy plaintext OAuth credentials before application workers start.
+    await migrateSocialTokensAtRest();
 
     // Run database seeder
     await seedDatabase();

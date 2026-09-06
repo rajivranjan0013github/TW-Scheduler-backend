@@ -11,7 +11,8 @@
     "backfill:user-avatars": "node src/scripts/backfill-user-avatars.js",
     "migrate:split-merged-posts": "node src/scripts/split-merged-scheduled-posts.js",
     "migrate:storage-keys": "node src/scripts/migrate-structured-storage-keys.js",
-    "thumbnails:generate": "node src/scripts/generate-video-thumbnails.js"
+    "thumbnails:generate": "node src/scripts/generate-video-thumbnails.js",
+    "reviewer:provision": "node src/scripts/provision-reviewer.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1068.0",
@@ -21,9 +22,10 @@
     "bullmq": "^5.78.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2",
+    "express": "^5.2.1",
     "express-rate-limit": "^8.7.0",
     "google-auth-library": "^10.7.0",
+    "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.7.0",
     "multer": "^2.1.1",

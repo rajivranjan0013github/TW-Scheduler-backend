@@ -1,4 +1,6 @@
-const API_VERSION = 'v20.0';
+import { META_GRAPH_API_VERSION } from '../config/platforms.js';
+
+const API_VERSION = META_GRAPH_API_VERSION;
 
 const getGraphHost = (account) => (
   account.authProvider === 'instagram' ? 'graph.instagram.com' : 'graph.facebook.com'
