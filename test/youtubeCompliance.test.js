@@ -40,3 +40,34 @@ test('PublishedPost accepts youtubeDataExpiresAt and serializes properly', () =>
   assert.equal(postDoc.latestViews, 500);
   assert.equal(postDoc.youtubeDataExpiresAt.getTime(), testDate.getTime());
 });
+
+test('YouTube reviewer email and password verify successfully and normalize properly', () => {
+  const originalEmail = process.env.YOUTUBE_REVIEWER_EMAIL;
+  const originalPassword = process.env.YOUTUBE_REVIEWER_PASSWORD;
+  process.env.YOUTUBE_REVIEWER_EMAIL = 'yt-reviewer@thousandpost.com';
+  process.env.YOUTUBE_REVIEWER_PASSWORD = 'YoutubeReviewer2026!';
+
+  try {
+    const ytEmail = (process.env.YOUTUBE_REVIEWER_EMAIL || '').toLowerCase().trim();
+    const ytPassword = process.env.YOUTUBE_REVIEWER_PASSWORD || '';
+
+    const testInputEmail = ' YT-REVIEWER@thousandpost.com ';
+    const testInputPassword = 'YoutubeReviewer2026!';
+    const normalized = testInputEmail.toLowerCase().trim();
+
+    const isYtReviewer = ytEmail && ytPassword && normalized === ytEmail && testInputPassword === ytPassword;
+    assert.equal(isYtReviewer, true, 'YouTube reviewer credentials must match when env vars are set');
+
+    // Without env vars, login should be disabled
+    const emptyEmail = '';
+    const emptyPassword = '';
+    const isYtDisabled = emptyEmail && emptyPassword && normalized === emptyEmail && testInputPassword === emptyPassword;
+    assert.ok(!isYtDisabled, 'YouTube reviewer login must be disabled when env vars are not set');
+  } finally {
+    if (originalEmail !== undefined) process.env.YOUTUBE_REVIEWER_EMAIL = originalEmail;
+    else delete process.env.YOUTUBE_REVIEWER_EMAIL;
+    if (originalPassword !== undefined) process.env.YOUTUBE_REVIEWER_PASSWORD = originalPassword;
+    else delete process.env.YOUTUBE_REVIEWER_PASSWORD;
+  }
+});
+

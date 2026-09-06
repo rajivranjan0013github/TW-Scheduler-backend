@@ -94,7 +94,6 @@ const PublishedPostSchema = new mongoose.Schema({
   // YouTube Developer Policy III.E.4.a: 30-day data retention TTL
   youtubeDataExpiresAt: {
     type: Date,
-    index: true,
   },
 }, { timestamps: true });
 

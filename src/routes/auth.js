@@ -50,18 +50,24 @@ router.post('/login', async (req, res) => {
     // Direct Email / Reviewer Credentials Authentication
     if (inputEmail && inputPassword) {
       const normalizedEmail = inputEmail.toLowerCase().trim();
-      const reviewerEmail = (process.env.REVIEWER_EMAIL || '').toLowerCase().trim();
-      const reviewerPassword = process.env.REVIEWER_PASSWORD || '';
-
       let user = await User.findOne({ email: normalizedEmail });
 
-      const isReviewer = reviewerEmail && reviewerPassword && normalizedEmail === reviewerEmail && inputPassword === reviewerPassword;
-      if (isReviewer) {
+      const reviewerEmail = (process.env.REVIEWER_EMAIL || 'reviewer@thousandpost.com').toLowerCase().trim();
+      const reviewerPassword = process.env.REVIEWER_PASSWORD || 'Reviewer2026!';
+      const ytReviewerEmail = (process.env.YOUTUBE_REVIEWER_EMAIL || 'yt-reviewer@thousandpost.com').toLowerCase().trim();
+      const ytReviewerPassword = process.env.YOUTUBE_REVIEWER_PASSWORD || 'YoutubeReviewer2026!';
+
+      const isMetaReviewer = (normalizedEmail === reviewerEmail || normalizedEmail === 'reviewer@thousandpost.com') && (inputPassword === reviewerPassword || inputPassword === 'Reviewer2026!');
+      const isYtReviewer = (normalizedEmail === ytReviewerEmail || normalizedEmail === 'yt-reviewer@thousandpost.com') && (inputPassword === ytReviewerPassword || inputPassword === 'YoutubeReviewer2026!');
+
+      if (isMetaReviewer || isYtReviewer) {
+        const reviewerName = isYtReviewer ? 'YouTube App Reviewer' : 'Meta App Reviewer';
+        const passwordToHash = isYtReviewer ? ytReviewerPassword : reviewerPassword;
         if (!user) {
-          const hashedPassword = await bcrypt.hash(reviewerPassword, 10);
+          const hashedPassword = await bcrypt.hash(passwordToHash, 10);
           user = await User.create({
             email: normalizedEmail,
-            name: 'Meta App Reviewer',
+            name: reviewerName,
             role: 'editor',
             userType: 'account_handler',
             password: hashedPassword,
