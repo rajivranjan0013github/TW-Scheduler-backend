@@ -7,7 +7,10 @@ import Campaign from '../src/models/Campaign.js';
 import CampaignChannel from '../src/models/CampaignChannel.js';
 import PublishedPost from '../src/models/PublishedPost.js';
 import MetricSyncStatus from '../src/models/MetricSyncStatus.js';
-import { validatePersonalSchedulingAccess } from '../src/routes/scheduler.js';
+import {
+  getTargetPlatforms,
+  validatePersonalSchedulingAccess,
+} from '../src/routes/scheduler.js';
 import { getCreatorAnalytics } from '../src/services/creatorAnalyticsService.js';
 
 const selectedResult = (items) => ({
@@ -51,6 +54,36 @@ test('personal scheduling accepts only the creator owned account and media', asy
   });
 
   assert.deepEqual(result, { ok: true });
+});
+
+test('personal target platform lookup ignores its null campaign channel id', async (t) => {
+  const accountId = new mongoose.Types.ObjectId();
+  const originalAccountFind = SocialAccount.find;
+  const originalCampaignChannelFind = CampaignChannel.find;
+
+  t.after(() => {
+    SocialAccount.find = originalAccountFind;
+    CampaignChannel.find = originalCampaignChannelFind;
+  });
+
+  SocialAccount.find = (query) => {
+    assert.deepEqual(query._id.$in, [String(accountId)]);
+    return {
+      select: () => ({
+        lean: async () => [{ platform: 'instagram' }],
+      }),
+    };
+  };
+  CampaignChannel.find = () => {
+    assert.fail('Personal targets must not query CampaignChannel with a null id.');
+  };
+
+  const platforms = await getTargetPlatforms([{
+    socialAccountId: accountId,
+    campaignChannelId: null,
+  }]);
+
+  assert.deepEqual([...platforms], ['instagram']);
 });
 
 test('personal scheduling rejects campaign channel targets before database access', async () => {

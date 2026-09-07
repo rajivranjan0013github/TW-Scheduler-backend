@@ -42,7 +42,10 @@ const requireCampaignId = (req, res) => {
   return campaignId;
 };
 
-const idsToStrings = (items = []) => items.map((item) => String(item?._id || item));
+const idsToStrings = (items = []) => items
+  .map((item) => item?._id ?? item)
+  .filter((item) => item !== null && item !== undefined && item !== '')
+  .map((item) => String(item));
 const validScheduleModes = new Set(['auto', 'manual', 'hybrid']);
 const terminalManualStatuses = new Set(['posted_manual', 'published', 'published_auto', 'cancelled']);
 const cancellablePostStatuses = new Set(['scheduled', 'manual_ready', 'downloaded', 'paused', 'posted_manual']);
@@ -626,7 +629,7 @@ export const validateYoutubePublishingSpecifics = ({ youtube, mediaTypes = [] } 
   return '';
 };
 
-const getTargetPlatforms = async (targets) => {
+export const getTargetPlatforms = async (targets) => {
   const accountIds = getUniqueIds(targets.map((target) => target.socialAccountId));
   const channelIds = getUniqueIds(targets.map((target) => target.campaignChannelId));
   const [accounts, channels] = await Promise.all([

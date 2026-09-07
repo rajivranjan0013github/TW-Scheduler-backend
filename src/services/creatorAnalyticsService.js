@@ -241,6 +241,14 @@ export const getCreatorAnalytics = async ({ user, campaignId = '', timeZone: raw
         last7DaysComments: 0,
         thisMonthLikes: 0,
         thisMonthComments: 0,
+        last30DaysActivity: Array.from({ length: 30 }, (_, index) => {
+          const date = addDays(last30DaysStart, index);
+          return {
+            dateStr: dateKey(date, timeZone),
+            views: 0,
+            posts: 0,
+          };
+        }),
       },
     ])
   );
@@ -309,6 +317,13 @@ export const getCreatorAnalytics = async ({ user, campaignId = '', timeZone: raw
     if (dayBucket) {
       dayBucket.views += views;
       dayBucket.posts += 1;
+      if (postAccount && Array.isArray(postAccount.last30DaysActivity)) {
+        const accountDay = postAccount.last30DaysActivity.find((day) => day.dateStr === postDateKey);
+        if (accountDay) {
+          accountDay.views += views;
+          accountDay.posts += 1;
+        }
+      }
     }
 
     const isToday = publishedAt >= todayStart;
