@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 // Fail fast if critical secrets are missing
@@ -81,13 +82,36 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'wasm-unsafe-eval'"],
-      styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+      scriptSrc: [
+        "'self'",
+        "'wasm-unsafe-eval'",
+        'https://accounts.google.com',
+        'https://unpkg.com',
+      ],
+      styleSrc: [
+        "'self'",
+        "'unsafe-inline'",
+        'https://fonts.googleapis.com',
+        'https://accounts.google.com',
+      ],
       fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
       imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
       mediaSrc: ["'self'", 'blob:', 'https:'],
-      connectSrc: ["'self'", 'https://thousandpost.com', 'https://www.thousandpost.com', 'https://media.thousandpost.com'],
-      frameSrc: ["'self'", 'https://www.youtube.com', 'https://www.facebook.com', 'https://www.instagram.com'],
+      connectSrc: [
+        "'self'",
+        'https://thousandpost.com',
+        'https://www.thousandpost.com',
+        'https://media.thousandpost.com',
+        'https://accounts.google.com',
+        'https://unpkg.com',
+      ],
+      frameSrc: [
+        "'self'",
+        'https://accounts.google.com',
+        'https://www.youtube.com',
+        'https://www.facebook.com',
+        'https://www.instagram.com',
+      ],
       workerSrc: ["'self'", 'blob:'],
       objectSrc: ["'none'"],
       baseUri: ["'self'"],
@@ -97,7 +121,7 @@ app.use(helmet({
   referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
 }));
 app.use((req, res, next) => {
-  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
   res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   next();
@@ -145,8 +169,10 @@ app.post('/api/scheduler/publish-now/:id', protect, async (req, res) => {
   }
 });
 
-// Serve frontend static assets from ../TW-Scheduler/dist
-const frontendBuildPath = path.join(__dirname, '../TW-Scheduler/dist');
+// Serve frontend static assets from ../TW-Scheduler/dist or ../tw-frontend/dist
+const defaultBuildPath = path.join(__dirname, '../TW-Scheduler/dist');
+const altBuildPath = path.join(__dirname, '../tw-frontend/dist');
+const frontendBuildPath = fs.existsSync(defaultBuildPath) ? defaultBuildPath : altBuildPath;
 app.use(express.static(frontendBuildPath));
 
 // All other GET requests not handled by API routes should serve index.html
