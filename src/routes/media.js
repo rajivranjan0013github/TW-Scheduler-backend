@@ -423,6 +423,7 @@ router.get('/proxy', async (req, res) => {
     const response = await fetch(url, { headers });
 
     // Set headers
+    res.setHeader('Cache-Control', 'public, max-age=86400');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');

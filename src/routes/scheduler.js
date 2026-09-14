@@ -416,7 +416,7 @@ const syncRecentFeedForManualPost = async (post, { verificationStart } = {}) => 
 
         syncedPosts.push(cachedPost);
         const publishedAt = cachedPost?.publishedAt ? new Date(cachedPost.publishedAt).getTime() : NaN;
-        if (isVideoPublishedPost(cachedPost) && Number.isFinite(publishedAt) && publishedAt >= verificationStart.getTime()) {
+        if (Number.isFinite(publishedAt) && publishedAt >= verificationStart.getTime()) {
           matchingPosts.push(cachedPost);
         }
       }
