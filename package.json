@@ -12,7 +12,8 @@
     "migrate:split-merged-posts": "node src/scripts/split-merged-scheduled-posts.js",
     "migrate:storage-keys": "node src/scripts/migrate-structured-storage-keys.js",
     "thumbnails:generate": "node src/scripts/generate-video-thumbnails.js",
-    "reviewer:provision": "node src/scripts/provision-reviewer.js"
+    "reviewer:provision": "node src/scripts/provision-reviewer.js",
+    "r2:cors": "node src/scripts/apply-r2-cors.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1068.0",

@@ -84,6 +84,7 @@ app.use(helmet({
       defaultSrc: ["'self'"],
       scriptSrc: [
         "'self'",
+        'blob:',
         "'wasm-unsafe-eval'",
         'https://accounts.google.com',
         'https://unpkg.com',
@@ -99,6 +100,8 @@ app.use(helmet({
       mediaSrc: ["'self'", 'blob:', 'https:'],
       connectSrc: [
         "'self'",
+        'blob:',
+        'data:',
         'https://thousandpost.com',
         'https://www.thousandpost.com',
         'https://media.thousandpost.com',
