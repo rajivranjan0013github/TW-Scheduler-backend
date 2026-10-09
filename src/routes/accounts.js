@@ -18,6 +18,7 @@ import { recordStoredMetricSnapshots, healStaleSyncStatuses } from '../queues/me
 import { protect, authorize, resolveHandlerPreview } from '../middleware/auth.js';
 import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount, fetchYoutubeVideos } from '../services/youtubeService.js';
 import { purgeSocialAccounts } from '../services/dataPurgeService.js';
+import { findUnassignedAccounts, assertAccountNotAssignedElsewhere } from '../services/unassignedChannelService.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from '../services/tokenHealthService.js';
 import {
   fetchFacebookPostEngagement,
@@ -458,6 +459,22 @@ router.get('/', protect, resolveHandlerPreview, async (req, res) => {
   }
 });
 
+// @desc    Get connected accounts that have no campaign assignment
+// @route   GET /api/accounts/unassigned
+// @access  Private
+router.get('/unassigned', protect, resolveHandlerPreview, async (req, res) => {
+  try {
+    if (!getDBStatus()) {
+      return res.status(503).json({ message: 'Database disconnected.' });
+    }
+    const accountFilter = hasAdminAccess(req.user) ? {} : { userId: req.user._id };
+    const accounts = await findUnassignedAccounts(accountFilter);
+    return res.status(200).json(sanitizeSocialAccount(accounts));
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ message: error.message });
+  }
+});
+
 // @desc    Get campaign publishing channels, including pending verification rows
 // @route   GET /api/accounts/publishing-channels?campaignId=...
 // @access  Private
@@ -721,9 +738,12 @@ router.post('/toggle-campaign-link', protect, resolveHandlerPreview, async (req,
     if (!isConnected) {
       return res.status(503).json({ message: 'Database disconnected.' });
     }
-    const { campaignId, socialAccountId } = req.body;
+    const { campaignId, socialAccountId, action = 'toggle' } = req.body;
     if (!campaignId || !socialAccountId) {
       return res.status(400).json({ message: 'campaignId and socialAccountId are required.' });
+    }
+    if (!['toggle', 'link'].includes(action)) {
+      return res.status(400).json({ message: 'Invalid campaign link action.' });
     }
     const allowed = await canAccessCampaign(req, campaignId);
     if (!allowed) {
@@ -737,6 +757,16 @@ router.post('/toggle-campaign-link', protect, resolveHandlerPreview, async (req,
     if (!account) {
       return res.status(404).json({ message: 'Social account not found.' });
     }
+    if (action === 'link' && account.isConnected === false) {
+      return res.status(400).json({ message: 'Reconnect this social account before adding it to a campaign.' });
+    }
+    if (action === 'link') {
+      const accessibleAccount = await SocialAccount.exists(getOwnedAccountAccessFilter(req, account._id));
+      if (!accessibleAccount) {
+        return res.status(403).json({ message: 'You cannot assign this social account.' });
+      }
+      await assertAccountNotAssignedElsewhere(account._id, campaignId);
+    }
 
     const normHandle = normalizeChannelHandle(account.username || account.name || account.accountId);
     const existing = await CampaignChannel.findOne({
@@ -747,7 +777,7 @@ router.post('/toggle-campaign-link', protect, resolveHandlerPreview, async (req,
       ]
     });
 
-    if (existing) {
+    if (existing && action === 'toggle') {
       await CampaignChannel.deleteOne({ _id: existing._id });
       await Campaign.findByIdAndUpdate(campaignId, {
         $pull: {
@@ -761,8 +791,11 @@ router.post('/toggle-campaign-link', protect, resolveHandlerPreview, async (req,
           accountIds: existing.socialAccountId
         }
       });
-    } else {
+    } else if (!existing) {
       const handle = account.username || account.name || account.accountId || 'channel';
+      const accountOwner = action === 'link' && account.userId
+        ? await User.findById(account.userId).select('email').lean()
+        : null;
       await CampaignChannel.create({
         campaignId,
         platform: account.platform,
@@ -773,7 +806,7 @@ router.post('/toggle-campaign-link', protect, resolveHandlerPreview, async (req,
         status: account.isConnected !== false ? 'verified' : 'disconnected',
         addedByUserId: req.user._id,
         assignedHandlerUserId: account.userId || req.user._id,
-        assignedHandlerEmail: req.user.email || '',
+        assignedHandlerEmail: action === 'link' ? (accountOwner?.email || '') : (req.user.email || ''),
         verifiedAt: new Date(),
         verifiedByUserId: req.user._id,
       });
@@ -1533,7 +1566,7 @@ router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, re
     }
 
     // 3. Fetch user's Facebook Pages and Page Access Tokens
-    const pagesUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/accounts?access_token=${longLivedUserToken}`;
+    const pagesUrl = `https://graph.facebook.com/${META_GRAPH_API_VERSION}/me/accounts?fields=id,name,username,access_token,link&access_token=${longLivedUserToken}`;
     const pagesRes = await fetch(pagesUrl);
     const pagesData = await pagesRes.json();
 

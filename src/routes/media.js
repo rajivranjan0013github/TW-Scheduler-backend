@@ -64,6 +64,7 @@ const normalizeScope = (value) => (
   ['global', 'personal'].includes(value) ? value : 'campaign'
 );
 const getRequestedScope = (req) => normalizeScope(req.query.scope || req.body?.scope);
+const ADMIN_ROLES = ['owner', 'admin'];
 const isAdminRole = (req) => ADMIN_ROLES.includes(req.user?.role);
 
 const requirePersonalScopePermission = (req, res) => {

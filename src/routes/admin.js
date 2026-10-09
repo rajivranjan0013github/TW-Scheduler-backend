@@ -443,15 +443,7 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
     row.thisMonthAccountInsight = totals.thisMonthAccountInsight;
   });
 
-  const upcomingQuery = {
-    campaignId: campaign._id,
-    status: { $in: DASHBOARD_UPCOMING_STATUSES },
-  };
-
-  const upcomingPostsList = await ScheduledPost.find(upcomingQuery)
-    .select('_id socialAccountIds campaignChannelIds')
-    .lean();
-
+  const channelIds = campaignChannels.map((channel) => channel._id);
   const accountIdSet = new Set(accountIds.map(toKey));
   const channelAccountMap = new Map(
     campaignChannels.map((channel) => {
@@ -471,7 +463,23 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
     })
   );
 
-  const upcomingPosts = upcomingPostsList.length;
+  const upcomingQuery = {
+    campaignId: campaign._id,
+    status: { $in: DASHBOARD_UPCOMING_STATUSES },
+    ...(accountIds.length > 0 || channelIds.length > 0
+      ? {
+        $or: [
+          ...(accountIds.length > 0 ? [{ socialAccountIds: { $in: accountIds } }] : []),
+          ...(channelIds.length > 0 ? [{ campaignChannelIds: { $in: channelIds } }] : []),
+        ],
+      }
+      : {}),
+  };
+
+  const upcomingPostsList = await ScheduledPost.find(upcomingQuery)
+    .select('_id socialAccountIds campaignChannelIds')
+    .lean();
+
   upcomingPostsList.forEach((post) => {
     const targetAccountIds = new Set();
     (post.socialAccountIds || []).forEach((accountId) => {
@@ -487,6 +495,11 @@ const getCampaignMetrics = async (campaign, { timeZone = DEFAULT_DASHBOARD_TIMEZ
       if (row) row.upcomingPosts += 1;
     });
   });
+
+  const upcomingPosts = Array.from(accountRowsMap.values()).reduce(
+    (sum, row) => sum + (row.upcomingPosts || 0),
+    0
+  );
 
   const accountInsightSummary = Array.from(accountInsightTotals.values()).reduce((sum, item) => ({
     lifetimeAccountInsight: sum.lifetimeAccountInsight + item.lifetimeAccountInsight,
