@@ -1312,11 +1312,18 @@ router.get('/facebook/auth-url', protect, resolveHandlerPreview, async (req, res
     const params = new URLSearchParams({
       client_id: appId,
       redirect_uri: redirectUri,
-      scope: 'pages_show_list,pages_read_engagement,pages_manage_posts',
       response_type: 'code',
       auth_type: 'rerequest',
       state,
     });
+    // Business-type apps use Facebook Login for Business, which only works for
+    // non-role users when the dialog is driven by a login configuration.
+    const loginConfigId = process.env.META_LOGIN_CONFIG_ID;
+    if (loginConfigId) {
+      params.set('config_id', loginConfigId);
+    } else {
+      params.set('scope', 'pages_show_list,pages_read_engagement,pages_manage_posts');
+    }
     const url = `https://www.facebook.com/${META_GRAPH_API_VERSION}/dialog/oauth?${params.toString()}`;
     res.status(200).json({ url });
   } catch (error) {
