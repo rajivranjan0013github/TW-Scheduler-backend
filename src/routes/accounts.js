@@ -37,6 +37,7 @@ import MetricSyncStatus from '../models/MetricSyncStatus.js';
 import { requestAccountSync } from '../queues/publisherQueue.js';
 import { ensureDefaultCampaignFolders } from '../services/campaignFolderService.js';
 import { getCreatorAnalytics } from '../services/creatorAnalyticsService.js';
+import { INSTAGRAM_AUTOMATION_SCOPES, subscribeAccountToWebhooks } from '../services/instagramAutomationService.js';
 const OAUTH_STATE_MAX_AGE_MS = 15 * 60 * 1000; // 15 minutes
 
 export const signOAuthState = (payload = {}) => {
@@ -1354,7 +1355,12 @@ router.get('/instagram/auth-url', protect, resolveHandlerPreview, async (req, re
     const params = new URLSearchParams({
       client_id: appId,
       redirect_uri: redirectUri,
-      scope: 'instagram_business_basic,instagram_business_content_publish,instagram_business_manage_insights',
+      scope: [
+        'instagram_business_basic',
+        'instagram_business_content_publish',
+        'instagram_business_manage_insights',
+        ...INSTAGRAM_AUTOMATION_SCOPES,
+      ].join(','),
       response_type: 'code',
       state,
     });
@@ -1796,6 +1802,12 @@ router.post('/instagram-callback', protect, resolveHandlerPreview, async (req, r
     }
 
     const instagramAccountId = profileData.id || profileData.user_id || tokenData.user_id?.toString();
+    const instagramProfessionalId = profileData.user_id ? String(profileData.user_id) : '';
+    const grantedScopes = (Array.isArray(tokenData.permissions)
+      ? tokenData.permissions
+      : String(tokenData.permissions || '').split(','))
+      .map((scope) => String(scope).trim())
+      .filter(Boolean);
     const username = profileData.username || 'instagram_account';
     const name = profileData.name || username;
     const tokenExpiresAt = upgradeData.expires_in
@@ -1852,9 +1864,11 @@ router.post('/instagram-callback', protect, resolveHandlerPreview, async (req, r
         tokenStatus: 'healthy',
         tokenRefreshError: '',
         tokenLastCheckedAt: new Date(),
+        ...(grantedScopes.length ? { scopes: grantedScopes } : {}),
         metadata: {
           ...(reauthorizationAccount?.metadata || {}),
           instagramUserId: instagramAccountId,
+          ...(instagramProfessionalId ? { instagramProfessionalId } : {}),
           accountType: profileData.account_type || '',
         },
       },
@@ -1866,6 +1880,9 @@ router.post('/instagram-callback', protect, resolveHandlerPreview, async (req, r
 
     void requestAccountSync(account._id).catch((syncErr) => {
       console.warn(`[OAuth Connect] Initial sync failed to queue for ${account.name}:`, syncErr.message);
+    });
+    void subscribeAccountToWebhooks(account).catch((subscribeErr) => {
+      console.warn(`[OAuth Connect] Comment webhook subscription failed for ${account.name}:`, subscribeErr.message);
     });
 
     res.status(200).json({

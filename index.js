@@ -16,6 +16,7 @@ import { connectDB } from './src/config/db.js';
 import { connectRedis } from './src/config/redis.js';
 import { initQueue } from './src/queues/publisherQueue.js';
 import { initWorker, publishPostJob } from './src/queues/publisherWorker.js';
+import { initAutomationQueue } from './src/queues/automationQueue.js';
 
 // Import route files
 import authRoutes from './src/routes/auth.js';
@@ -25,6 +26,8 @@ import schedulerRoutes, { startCreatorAutoCheckInterval } from './src/routes/sch
 import adminRoutes from './src/routes/admin.js';
 import aiRoutes from './src/routes/ai.js';
 import bulkAgentRoutes from './src/routes/bulkAgent.js';
+import webhookRoutes from './src/routes/webhooks.js';
+import automationRoutes from './src/routes/automations.js';
 import { protect } from './src/middleware/auth.js';
 import ScheduledPost from './src/models/ScheduledPost.js';
 import rateLimit from 'express-rate-limit';
@@ -129,6 +132,15 @@ app.use((req, res, next) => {
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   next();
 });
+// Webhooks need the raw body to verify Meta's signature, so they are mounted before the JSON parser
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 600,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/api/webhooks', webhookLimiter, express.raw({ type: '*/*', limit: '1mb' }), webhookRoutes);
+
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '64kb' }));
 
@@ -147,6 +159,7 @@ app.use('/api/scheduler', schedulerRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/bulk-agent', bulkAgentRoutes);
+app.use('/api/automations', automationRoutes);
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
@@ -207,6 +220,7 @@ export const startServer = async () => {
   // 3. Initialize background worker & queue engines
   await initQueue();
   initWorker();
+  initAutomationQueue();
   startCreatorAutoCheckInterval();
 
   // 4. Listen on PORT
