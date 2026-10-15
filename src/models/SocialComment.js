@@ -46,6 +46,11 @@ const SocialCommentSchema = new mongoose.Schema({
     type: Boolean,
     default: false,
   },
+  // The connected account's own reply; shown inside its thread, never as a feed item
+  isOwn: {
+    type: Boolean,
+    default: false,
+  },
   // Not yet seen in the Recent comments feed
   unseen: {
     type: Boolean,

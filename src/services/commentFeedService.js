@@ -1,6 +1,9 @@
 import SocialComment from '../models/SocialComment.js';
 import { fetchMediaComments, fetchRecentMedia, findAccountsForEntry, getOwnIds, withAccount } from './socialProviders/index.js';
 import { collectNewYoutubeComments } from './youtubeCommentPoller.js';
+import { recordOwnReply } from './ownReplyStore.js';
+
+export { recordOwnReply };
 
 const SYNC_MIN_INTERVAL_MS = 2 * 60 * 1000;
 const SYNC_MEDIA_LIMIT = 10;
@@ -10,20 +13,22 @@ const isOwnComment = (account, { fromId, username }) => (
   || (Boolean(username) && String(username).toLowerCase() === String(account.username || '').toLowerCase())
 );
 
-const markParentReplied = (account, parentId) => SocialComment.updateOne(
-  { socialAccountId: account._id, commentId: parentId },
-  { $set: { ownerReplied: true } }
-);
-
 /**
- * Saves a comment from the webhook. The account's own replies are not stored,
- * they only mark the comment they answer as replied.
+ * Saves a comment from the webhook. The account's own replies are stored as replies
+ * of the comment they answer (own top-level comments are ignored).
  */
 export const recordWebhookComment = async (comment) => {
   const accounts = await findAccountsForEntry(comment.platform || 'instagram', comment.entryId);
   for (const account of accounts) {
     if (comment.fromId === comment.entryId || isOwnComment(account, { fromId: comment.fromId, username: comment.fromUsername })) {
-      if (comment.parentId) await markParentReplied(account, comment.parentId);
+      if (comment.parentId) {
+        await recordOwnReply(account, {
+          commentId: comment.commentId,
+          parentId: comment.parentId,
+          mediaId: comment.mediaId,
+          text: comment.text,
+        });
+      }
       continue;
     }
     await SocialComment.updateOne(
@@ -73,7 +78,18 @@ export const syncRecentComments = async (account, { force = false } = {}) => {
       const thread = [comment, ...comment.replies.map((reply) => ({ ...reply, parentId: comment.id }))];
       const ownerReplied = comment.replies.some((reply) => isOwnComment(account, reply));
       for (const item of thread) {
-        if (isOwnComment(account, item)) continue;
+        if (isOwnComment(account, item)) {
+          if (item.parentId) {
+            await recordOwnReply(account, {
+              commentId: item.id,
+              parentId: item.parentId,
+              mediaId: String(post.id),
+              text: item.text,
+              commentedAt: item.timestamp ? new Date(item.timestamp) : new Date(),
+            });
+          }
+          continue;
+        }
         const result = await SocialComment.updateOne(
           { socialAccountId: account._id, commentId: String(item.id) },
           {
@@ -102,4 +118,3 @@ export const syncRecentComments = async (account, { force = false } = {}) => {
   return { skipped: false, stored };
 };
 
-export const markCommentReplied = (account, commentId) => markParentReplied(account, commentId);

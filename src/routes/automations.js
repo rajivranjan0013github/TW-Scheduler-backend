@@ -9,7 +9,7 @@ import AutomationEvent from '../models/AutomationEvent.js';
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
 import SocialComment from '../models/SocialComment.js';
-import { markCommentReplied, syncRecentComments } from '../services/commentFeedService.js';
+import { recordOwnReply, syncRecentComments } from '../services/commentFeedService.js';
 import {
   getReplyWindowClosesAt,
   isReplyWindowOpen,
@@ -30,6 +30,15 @@ import {
 } from '../services/socialProviders/index.js';
 
 const router = express.Router();
+
+/**
+ * Meta / YouTube rejected the call. Answered with 424 rather than 502: proxies like nginx and
+ * Cloudflare replace 502 bodies with their own error page, which hides the provider's reason.
+ */
+const sendProviderError = (res, req, error) => {
+  console.error(`[Automations] ${req.method} ${req.path} failed:`, error.message, error.data?.error || '');
+  res.status(error.statusCode && error.statusCode < 500 ? error.statusCode : 424).json({ message: error.message });
+};
 
 const MAX_KEYWORDS = 30;
 const MAX_REPLIES = 10;
@@ -147,7 +156,7 @@ router.post('/accounts/:id/subscribe', async (req, res) => {
     const updated = await subscribeAccountToWebhooks(account);
     res.status(200).json(serializeAccount(updated));
   } catch (error) {
-    res.status(502).json({ message: error.message });
+    sendProviderError(res, req, error);
   }
 });
 
@@ -161,7 +170,7 @@ router.get('/accounts/:id/media', async (req, res) => {
     const media = await fetchRecentMedia(account);
     res.status(200).json(media);
   } catch (error) {
-    res.status(502).json({ message: error.message });
+    sendProviderError(res, req, error);
   }
 });
 
@@ -183,7 +192,7 @@ router.get('/accounts/:id/media/:mediaId/comments', async (req, res) => {
     }).select('commentId').lean()).map((event) => event.commentId));
     res.status(200).json(comments.map((comment) => ({ ...comment, dmSent: dmSentIds.has(String(comment.id)) })));
   } catch (error) {
-    res.status(502).json({ message: error.message });
+    sendProviderError(res, req, error);
   }
 });
 
@@ -202,10 +211,15 @@ router.post('/comments/:commentId/reply', async (req, res) => {
       return res.status(400).json({ message: 'Invalid comment ID.' });
     }
     const result = await replyToComment(account, req.params.commentId, message);
-    await markCommentReplied(account, req.params.commentId);
+    await recordOwnReply(account, {
+      commentId: result.id,
+      // YouTube reply IDs are "parent.child"; Instagram and Facebook replies go to the given comment
+      parentId: account.platform === 'youtube' ? req.params.commentId.split('.')[0] : req.params.commentId,
+      text: message,
+    });
     res.status(201).json({ id: result.id, message });
   } catch (error) {
-    res.status(502).json({ message: error.message });
+    sendProviderError(res, req, error);
   }
 });
 
@@ -249,7 +263,7 @@ router.post('/comments/:commentId/dm', async (req, res) => {
     );
     res.status(201).json({ message: 'DM sent.' });
   } catch (error) {
-    res.status(502).json({ message: error.message });
+    sendProviderError(res, req, error);
   }
 });
 
@@ -271,10 +285,27 @@ router.get('/comments/recent', async (req, res) => {
     if (!accountIds) return res.status(404).json({ message: 'Account not found.' });
     const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
 
+    const feedFilter = { socialAccountId: { $in: accountIds }, isOwn: { $ne: true } };
     const [comments, unseenCount] = await Promise.all([
-      SocialComment.find({ socialAccountId: { $in: accountIds } }).sort({ commentedAt: -1 }).limit(limit).lean(),
-      SocialComment.countDocuments({ socialAccountId: { $in: accountIds }, unseen: true }),
+      SocialComment.find(feedFilter).sort({ commentedAt: -1 }).limit(limit).lean(),
+      SocialComment.countDocuments({ ...feedFilter, unseen: true }),
     ]);
+
+    // The account's own replies, shown inside the thread of the comment they answer
+    const threadIdOf = (comment) => comment.parentId || comment.commentId;
+    const ownReplies = await SocialComment.find({
+      socialAccountId: { $in: accountIds },
+      isOwn: true,
+      parentId: { $in: [...new Set(comments.map(threadIdOf))] },
+    }).sort({ commentedAt: 1 }).lean();
+    const repliesFor = (comment) => ownReplies
+      .filter((reply) => (
+        String(reply.socialAccountId) === String(comment.socialAccountId)
+        && reply.parentId === threadIdOf(comment)
+        // In a thread, only show replies written after this comment
+        && (!comment.parentId || new Date(reply.commentedAt) >= new Date(comment.commentedAt))
+      ))
+      .map((reply) => ({ id: reply.commentId, text: reply.text, timestamp: reply.commentedAt }));
     const dmSentKeys = new Set((await AutomationEvent.find({
       socialAccountId: { $in: accountIds },
       commentId: { $in: comments.map((comment) => comment.commentId) },
@@ -296,6 +327,7 @@ router.get('/comments/recent', async (req, res) => {
         ownerReplied: comment.ownerReplied,
         unseen: comment.unseen,
         dmSent: dmSentKeys.has(`${comment.socialAccountId}:${comment.commentId}`),
+        replies: repliesFor(comment),
       })),
     });
   } catch (error) {
@@ -316,7 +348,7 @@ router.post('/comments/recent/sync', async (req, res) => {
     const result = await syncRecentComments(account, { force: Boolean(req.body?.force) });
     res.status(200).json(result);
   } catch (error) {
-    res.status(502).json({ message: error.message });
+    sendProviderError(res, req, error);
   }
 });
 
@@ -396,7 +428,7 @@ router.post('/inbox/accounts/:id/sync', async (req, res) => {
     const result = await syncConversations(account, { force: Boolean(req.body?.force) });
     res.status(200).json(result);
   } catch (error) {
-    res.status(502).json({ message: error.message });
+    sendProviderError(res, req, error);
   }
 });
 

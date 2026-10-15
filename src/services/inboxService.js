@@ -170,7 +170,7 @@ export const sendConversationMessage = async (account, conversation, text, userI
       return provider.sendMessage(current, conversation.participantId, text);
     });
   } catch (error) {
-    error.statusCode = 502;
+    error.statusCode = 424;
     throw error;
   }
 

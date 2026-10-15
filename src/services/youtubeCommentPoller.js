@@ -3,6 +3,7 @@ import AutomationRule from '../models/AutomationRule.js';
 import SocialComment from '../models/SocialComment.js';
 import { withAccount } from './socialProviders/index.js';
 import { COMMENT_SCOPE } from './socialProviders/youtube.js';
+import { recordOwnReply } from './ownReplyStore.js';
 
 // Comments can show up in the API a little after their publish time; re-check this window each poll
 const POLL_OVERLAP_MS = 10 * 60 * 1000;
@@ -22,7 +23,13 @@ export const collectNewYoutubeComments = async (account, threads, { lastPolledAt
     for (const item of items) {
       if (item.fromId === channelId) {
         if (item.parentId) {
-          await SocialComment.updateOne({ socialAccountId: account._id, commentId: item.parentId }, { $set: { ownerReplied: true } });
+          await recordOwnReply(account, {
+            commentId: item.id,
+            parentId: item.parentId,
+            mediaId: item.mediaId || thread.mediaId,
+            text: item.text,
+            commentedAt: item.timestamp ? new Date(item.timestamp) : new Date(),
+          });
         }
         continue;
       }
