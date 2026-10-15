@@ -1,7 +1,9 @@
 import express from 'express';
 import crypto from 'crypto';
-import { parseCommentChange } from '../services/instagramAutomationService.js';
-import { enqueueInstagramComment } from '../queues/automationQueue.js';
+import { enqueueComment } from '../queues/automationQueue.js';
+import { getProviderForWebhookObject } from '../services/socialProviders/index.js';
+import { handleIncomingMessage, parseMessagingEvent } from '../services/inboxService.js';
+import { recordWebhookComment } from '../services/commentFeedService.js';
 
 const router = express.Router();
 
@@ -36,7 +38,7 @@ router.get('/meta', (req, res) => {
   return res.sendStatus(403);
 });
 
-// @desc    Receive Instagram comment events
+// @desc    Receive Instagram and Facebook Page comment and message events
 // @route   POST /api/webhooks/meta
 // @access  Public (verified by X-Hub-Signature-256)
 router.post('/meta', async (req, res) => {
@@ -54,15 +56,30 @@ router.post('/meta', async (req, res) => {
   // Acknowledge immediately: Meta disables webhooks that respond slowly
   res.sendStatus(200);
 
-  if (payload?.object !== 'instagram') return;
+  const provider = getProviderForWebhookObject(payload?.object);
+  if (!provider) return;
   for (const entry of payload.entry || []) {
     for (const change of entry.changes || []) {
-      const comment = parseCommentChange(entry.id, change);
+      const comment = provider.parseCommentChange(entry.id, change);
       if (!comment) continue;
       try {
-        await enqueueInstagramComment(comment);
+        await recordWebhookComment(comment);
+      } catch (error) {
+        console.error(`[Webhook] Failed to store comment ${comment.commentId}:`, error.message);
+      }
+      try {
+        await enqueueComment(comment);
       } catch (error) {
         console.error(`[Webhook] Failed to queue comment ${comment.commentId}:`, error.message);
+      }
+    }
+    for (const item of entry.messaging || []) {
+      const message = parseMessagingEvent(entry.id, item, provider.platform);
+      if (!message) continue;
+      try {
+        await handleIncomingMessage(message);
+      } catch (error) {
+        console.error(`[Webhook] Failed to store message ${message.mid}:`, error.message);
       }
     }
   }

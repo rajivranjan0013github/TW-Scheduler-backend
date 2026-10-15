@@ -37,7 +37,9 @@ import MetricSyncStatus from '../models/MetricSyncStatus.js';
 import { requestAccountSync } from '../queues/publisherQueue.js';
 import { ensureDefaultCampaignFolders } from '../services/campaignFolderService.js';
 import { getCreatorAnalytics } from '../services/creatorAnalyticsService.js';
-import { INSTAGRAM_AUTOMATION_SCOPES, subscribeAccountToWebhooks } from '../services/instagramAutomationService.js';
+import { hasAutomationScopes, subscribeAccountToWebhooks } from '../services/socialProviders/index.js';
+import { requiredScopes as INSTAGRAM_AUTOMATION_SCOPES } from '../services/socialProviders/instagram.js';
+import { requiredScopes as FACEBOOK_AUTOMATION_SCOPES } from '../services/socialProviders/facebook.js';
 const OAUTH_STATE_MAX_AGE_MS = 15 * 60 * 1000; // 15 minutes
 
 export const signOAuthState = (payload = {}) => {
@@ -1323,7 +1325,7 @@ router.get('/facebook/auth-url', protect, resolveHandlerPreview, async (req, res
     if (loginConfigId) {
       params.set('config_id', loginConfigId);
     } else {
-      params.set('scope', 'pages_show_list,pages_read_engagement,pages_manage_posts');
+      params.set('scope', ['pages_show_list', 'pages_read_engagement', 'pages_manage_posts', ...FACEBOOK_AUTOMATION_SCOPES].join(','));
     }
     const url = `https://www.facebook.com/${META_GRAPH_API_VERSION}/dialog/oauth?${params.toString()}`;
     res.status(200).json({ url });
@@ -1713,6 +1715,12 @@ router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, re
       void requestAccountSync(acc._id).catch((syncErr) => {
         console.warn(`[OAuth Connect] Initial sync failed to queue for ${acc.name}:`, syncErr.message);
       });
+      // Comment and Messenger webhooks need the automation permissions granted for this Page
+      if (hasAutomationScopes(acc)) {
+        void subscribeAccountToWebhooks(acc).catch((subscribeErr) => {
+          console.warn(`[OAuth Connect] Page webhook subscription failed for ${acc.name}:`, subscribeErr.message);
+        });
+      }
     });
 
     res.status(200).json({

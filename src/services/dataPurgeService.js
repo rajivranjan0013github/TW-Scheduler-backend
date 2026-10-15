@@ -1,10 +1,14 @@
+import AutomationEvent from '../models/AutomationEvent.js';
+import AutomationRule from '../models/AutomationRule.js';
 import BulkAgentPlan from '../models/BulkAgentPlan.js';
 import BulkMediaReservation from '../models/BulkMediaReservation.js';
 import Campaign from '../models/Campaign.js';
 import CampaignChannel from '../models/CampaignChannel.js';
+import Conversation from '../models/Conversation.js';
 import Folder from '../models/Folder.js';
 import Insight from '../models/Insight.js';
 import Media from '../models/Media.js';
+import Message from '../models/Message.js';
 import MetricSyncStatus from '../models/MetricSyncStatus.js';
 import OAuthStateNonce from '../models/OAuthStateNonce.js';
 import PostInsight from '../models/PostInsight.js';
@@ -14,6 +18,7 @@ import PublishedPost from '../models/PublishedPost.js';
 import SavedCaption from '../models/SavedCaption.js';
 import ScheduledPost from '../models/ScheduledPost.js';
 import SocialAccount from '../models/SocialAccount.js';
+import SocialComment from '../models/SocialComment.js';
 import User from '../models/User.js';
 import { deleteFile, getStorageKeyFromUrl } from './r2Service.js';
 import { revokeMetaPermissions } from './metaService.js';
@@ -21,6 +26,20 @@ import { revokeYoutubeToken } from './youtubeService.js';
 
 const uniqueStrings = (values = []) => [...new Set(values.map(String).filter(Boolean))];
 const anyOf = (clauses) => (clauses.length ? { $or: clauses } : { _id: null });
+
+// Comment feed, DM inbox and comment-automation records are keyed by socialAccountId;
+// rules and activity logs also carry userId so they are removed even if the account is already gone.
+const deleteEngagementData = ({ accountIds = [], userId = null } = {}) => {
+  const byAccount = accountIds.length ? [{ socialAccountId: { $in: accountIds } }] : [];
+  const byAccountOrUser = anyOf([...byAccount, ...(userId ? [{ userId }] : [])]);
+  return [
+    SocialComment.deleteMany(anyOf(byAccount)),
+    Message.deleteMany(anyOf(byAccount)),
+    Conversation.deleteMany(anyOf(byAccount)),
+    AutomationEvent.deleteMany(byAccountOrUser),
+    AutomationRule.deleteMany(byAccountOrUser),
+  ];
+};
 
 const revokeAccount = async (account) => {
   if (!account) return;
@@ -92,6 +111,7 @@ export const purgeSocialAccounts = async (accountIds = [], { revokeProviderAcces
     Insight.deleteMany({ accountId: { $in: persistedIds } }),
     MetricSyncStatus.deleteMany({ accountId: { $in: persistedIds } }),
     CampaignChannel.deleteMany({ socialAccountId: { $in: persistedIds } }),
+    ...deleteEngagementData({ accountIds: persistedIds }),
     Campaign.updateMany(
       { $or: [{ accountIds: { $in: persistedIds } }, { 'channels.socialAccountId': { $in: persistedIds } }] },
       {
@@ -187,6 +207,7 @@ export const purgeUserData = async (userId, { revokeProviderAccess = true } = {}
     BulkAgentPlan.deleteMany({ userId }),
     BulkMediaReservation.deleteMany({ userId }),
     OAuthStateNonce.deleteMany({ userId }),
+    ...deleteEngagementData({ accountIds, userId }),
     CampaignChannel.deleteMany(anyOf([
         ...(accountIds.length ? [{ socialAccountId: { $in: accountIds } }] : []),
         ...(ownedCampaignIds.length ? [{ campaignId: { $in: ownedCampaignIds } }] : []),

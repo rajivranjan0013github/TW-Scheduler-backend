@@ -18,6 +18,7 @@ import { deleteFile } from '../services/r2Service.js';
 import { healStaleSyncStatuses } from '../queues/metricSyncWorker.js';
 import { requestAccountSync } from '../queues/publisherQueue.js';
 import { ensureDefaultCampaignFolders } from '../services/campaignFolderService.js';
+import { purgeUserData } from '../services/dataPurgeService.js';
 
 const router = express.Router();
 const VALID_ROLES = ['owner', 'admin', 'editor', 'viewer'];
@@ -1129,21 +1130,7 @@ router.delete('/users/:id', protect, authorize('owner'), async (req, res) => {
       }
     }
 
-    const [accountIds, publishedPostIds] = await Promise.all([
-      SocialAccount.find({ userId: targetUser._id }).distinct('_id'),
-      PublishedPost.find({ userId: targetUser._id }).distinct('_id'),
-    ]);
-
-    await Promise.all([
-      PostInsight.deleteMany({ $or: [{ postId: { $in: publishedPostIds } }, { accountId: { $in: accountIds } }] }),
-      Insight.deleteMany({ accountId: { $in: accountIds } }),
-      SocialAccount.deleteMany({ userId: targetUser._id }),
-      ScheduledPost.deleteMany({ userId: targetUser._id }),
-      PublishedPost.deleteMany({ userId: targetUser._id }),
-      Media.deleteMany({ userId: targetUser._id }),
-      Folder.deleteMany({ userId: targetUser._id }),
-      User.deleteOne({ _id: targetUser._id }),
-    ]);
+    await purgeUserData(targetUser._id, { revokeProviderAccess: true });
 
     res.status(200).json({ message: 'User and related workspace data deleted successfully.' });
   } catch (error) {

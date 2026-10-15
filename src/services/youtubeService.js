@@ -4,6 +4,8 @@ import { storeRemoteSocialAccountAvatar } from './avatarStorageService.js';
 
 const YOUTUBE_UPLOAD_SCOPE = 'https://www.googleapis.com/auth/youtube.upload';
 const YOUTUBE_READONLY_SCOPE = 'https://www.googleapis.com/auth/youtube.readonly';
+// Read and reply to comments for the Automations page
+const YOUTUBE_COMMENTS_SCOPE = 'https://www.googleapis.com/auth/youtube.force-ssl';
 
 const getYoutubeOAuthClient = () => {
   const clientId = process.env.YOUTUBE_CLIENT_ID || process.env.GOOGLE_CLIENT_ID;
@@ -24,7 +26,7 @@ export const getYoutubeAuthUrl = ({ state = '', redirectUri = null } = {}) => {
     access_type: 'offline',
     prompt: 'consent',
     include_granted_scopes: true,
-    scope: [YOUTUBE_UPLOAD_SCOPE, YOUTUBE_READONLY_SCOPE],
+    scope: [YOUTUBE_UPLOAD_SCOPE, YOUTUBE_READONLY_SCOPE, YOUTUBE_COMMENTS_SCOPE],
     ...(state ? { state } : {}),
     ...(redirectUri ? { redirect_uri: redirectUri } : {}),
   });

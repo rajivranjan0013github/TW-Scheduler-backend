@@ -220,7 +220,7 @@ export const startServer = async () => {
   // 3. Initialize background worker & queue engines
   await initQueue();
   initWorker();
-  initAutomationQueue();
+  await initAutomationQueue();
   startCreatorAutoCheckInterval();
 
   // 4. Listen on PORT

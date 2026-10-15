@@ -15,7 +15,7 @@ const AutomationRuleSchema = new mongoose.Schema({
   },
   platform: {
     type: String,
-    enum: ['instagram'],
+    enum: ['instagram', 'facebook', 'youtube'],
     default: 'instagram',
   },
   name: {
