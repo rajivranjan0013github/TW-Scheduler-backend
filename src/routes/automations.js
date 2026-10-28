@@ -9,8 +9,6 @@ import AutomationEvent from '../models/AutomationEvent.js';
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
 import User from '../models/User.js';
-import { currentPolicyConsentFilter } from '../config/legalPolicy.js';
-import { requireCurrentPolicyConsent } from '../middleware/policyConsent.js';
 import SocialComment from '../models/SocialComment.js';
 import { visibleEngagementFilter } from '../utils/engagementRetention.js';
 import { recordOwnReply, syncRecentComments } from '../services/commentFeedService.js';
@@ -49,7 +47,7 @@ const MAX_REPLIES = 10;
 const MAX_MEDIA_IDS = 100;
 const PRIVATE_REPLY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
-router.use(protect, resolveHandlerPreview, requireCurrentPolicyConsent, (req, res, next) => {
+router.use(protect, resolveHandlerPreview, (req, res, next) => {
   if (!getDBStatus()) {
     return res.status(503).json({ message: 'Database disconnected.' });
   }
@@ -75,9 +73,7 @@ const getManageableAccountQuery = async (req) => {
       { _id: { $in: assignedIds } },
     ],
   };
-  const ownerIds = await SocialAccount.distinct('userId', accessible);
-  const consentingOwnerIds = await User.distinct('_id', { _id: { $in: ownerIds }, ...currentPolicyConsentFilter() });
-  return { ...accessible, userId: { $in: consentingOwnerIds } };
+  return accessible;
 };
 
 const findManageableAccount = async (req, accountId) => {

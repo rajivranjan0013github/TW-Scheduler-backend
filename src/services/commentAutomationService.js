@@ -5,7 +5,6 @@ import SocialComment from '../models/SocialComment.js';
 import { visibleEngagementFilter, youtubeEngagementExpiry } from '../utils/engagementRetention.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from './tokenHealthService.js';
 import { findAccountsForEntry, getOwnIds, getProvider, supportsDm } from './socialProviders/index.js';
-import { hasAccountPolicyConsent } from './policyConsentService.js';
 
 const normalizeText = (value) => String(value || '').toLowerCase().normalize('NFKC');
 
@@ -131,7 +130,6 @@ export const processStoredComment = async ({ socialAccountId, socialCommentId } 
   if (!socialAccountId || !socialCommentId) return { handled: 0 };
   const account = await SocialAccount.findOne({ _id: socialAccountId, isConnected: true });
   if (!account) return { handled: 0 };
-  if (!await hasAccountPolicyConsent(account)) return { handled: 0, reason: 'policy_consent_required' };
   const comment = await SocialComment.findOne({
     _id: socialCommentId, socialAccountId, ...visibleEngagementFilter(),
   });

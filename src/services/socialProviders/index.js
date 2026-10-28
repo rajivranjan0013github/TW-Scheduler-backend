@@ -3,7 +3,6 @@ import { ensureFreshAccountToken, handleProviderAuthFailure } from '../tokenHeal
 import * as instagram from './instagram.js';
 import * as facebook from './facebook.js';
 import * as youtube from './youtube.js';
-import { hasAccountPolicyConsent, requireAccountPolicyConsent } from '../policyConsentService.js';
 
 const providers = { instagram, facebook, youtube };
 
@@ -21,12 +20,10 @@ export const getProviderForWebhookObject = (object) => (
 );
 
 export const findAccountsForEntry = async (platform, entryId) => {
-  const accounts = await SocialAccount.find({
+  return SocialAccount.find({
     isConnected: true,
     ...getProvider(platform).accountQueryForWebhookId(String(entryId)),
   });
-  const consent = await Promise.all(accounts.map(hasAccountPolicyConsent));
-  return accounts.filter((_account, index) => consent[index]);
 };
 
 export const getOwnIds = (account) => getProvider(account.platform).getOwnIds(account);
@@ -61,7 +58,6 @@ export const supportsDm = (platform) => providers[platform]?.supportsDm !== fals
  * when Meta rejects the token.
  */
 export const withAccount = async (account, call) => {
-  await requireAccountPolicyConsent(account);
   const freshAccount = await ensureFreshAccountToken(account);
   try {
     return await call(getProvider(freshAccount.platform), freshAccount);
