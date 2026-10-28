@@ -131,8 +131,11 @@ const serializeAccount = (account) => ({
   tokenStatus: account.tokenStatus,
   hasAutomationScopes: hasAutomationScopes(account),
   supportsDm: supportsDm(account.platform),
-  // Accounts subscribed before DMs were added must subscribe again to receive messages
-  subscribedAt: hasCurrentWebhookSubscription(account) ? account.metadata.automationSubscribedAt : null,
+  // Accounts subscribed before DMs were added must subscribe again to receive messages.
+  // Polled platforms (YouTube) have nothing to subscribe to, so they are ready once connected.
+  subscribedAt: hasCurrentWebhookSubscription(account)
+    ? account.metadata?.automationSubscribedAt || account.createdAt
+    : null,
 });
 
 // @desc    Instagram accounts and Facebook Pages available for automation, with readiness status
