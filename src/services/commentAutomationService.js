@@ -8,8 +8,10 @@ import { findAccountsForEntry, getOwnIds, getProvider, supportsDm } from './soci
 
 const normalizeText = (value) => String(value || '').toLowerCase().normalize('NFKC');
 
-export const ruleMatchesComment = (rule, { mediaId, text }) => {
+export const ruleMatchesComment = (rule, { mediaId, text, commentedAt }) => {
   if (!rule.enabled) return false;
+  const activeSince = rule.enabledAt || rule.createdAt;
+  if (commentedAt && activeSince && new Date(commentedAt) < new Date(activeSince)) return false;
   if (rule.mediaScope === 'specific' && !rule.mediaIds.includes(String(mediaId))) return false;
   if (rule.triggerType === 'any') return true;
 
@@ -141,6 +143,7 @@ export const processStoredComment = async ({ socialAccountId, socialCommentId } 
     parentId: comment.parentId,
     mediaId: comment.mediaId,
     text: comment.text,
+    commentedAt: comment.commentedAt,
     fromId: comment.commenterId,
     fromUsername: comment.username,
     fromName: comment.name,

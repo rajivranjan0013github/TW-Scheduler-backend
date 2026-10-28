@@ -28,6 +28,11 @@ const AutomationRuleSchema = new mongoose.Schema({
     type: Boolean,
     default: true,
   },
+  // Comments posted before this moment never trigger the rule, so turning it on
+  // doesn't reply to old comments or ones left while it was off.
+  enabledAt: {
+    type: Date,
+  },
   // 'all' fires on every post of the account, 'specific' only on mediaIds
   mediaScope: {
     type: String,
@@ -70,6 +75,10 @@ const AutomationRuleSchema = new mongoose.Schema({
     type: Date,
   },
 }, { timestamps: true });
+
+AutomationRuleSchema.pre('save', function setEnabledAt() {
+  if (this.enabled && (this.isNew || this.isModified('enabled'))) this.enabledAt = new Date();
+});
 
 AutomationRuleSchema.index({ socialAccountId: 1, enabled: 1 });
 

@@ -22,6 +22,34 @@ test('keyword rules match whole words case-insensitively', () => {
   assert.equal(ruleMatchesComment(baseRule, { mediaId: '1', text: 'nice video' }), false);
 });
 
+test('rules only fire on comments posted after they were turned on', () => {
+  const rule = { ...baseRule, createdAt: new Date('2026-10-01T10:00:00Z'), enabledAt: new Date('2026-10-20T10:00:00Z') };
+  assert.equal(ruleMatchesComment(rule, { mediaId: '1', text: 'link', commentedAt: new Date('2026-10-20T10:05:00Z') }), true);
+  assert.equal(ruleMatchesComment(rule, { mediaId: '1', text: 'link', commentedAt: new Date('2026-10-20T09:55:00Z') }), false);
+  assert.equal(ruleMatchesComment(rule, { mediaId: '1', text: 'link', commentedAt: new Date('2026-10-05T10:00:00Z') }), false);
+  // Rules saved before enabledAt existed fall back to their creation time
+  const legacy = { ...baseRule, createdAt: new Date('2026-10-01T10:00:00Z') };
+  assert.equal(ruleMatchesComment(legacy, { mediaId: '1', text: 'link', commentedAt: new Date('2026-09-30T10:00:00Z') }), false);
+  assert.equal(ruleMatchesComment(legacy, { mediaId: '1', text: 'link', commentedAt: new Date('2026-10-02T10:00:00Z') }), true);
+});
+
+test('turning a rule on records when it became active', async () => {
+  const { default: AutomationRule } = await import('../src/models/AutomationRule.js');
+  const setEnabledAt = AutomationRule.schema.s.hooks._pres.get('save').find((hook) => hook.fn.name === 'setEnabledAt').fn;
+  const rule = new AutomationRule({ userId: '507f1f77bcf86cd799439011', socialAccountId: '507f1f77bcf86cd799439012', name: 'Test' });
+  const before = Date.now();
+  setEnabledAt.call(rule);
+  assert.ok(rule.enabledAt.getTime() >= before);
+
+  // Re-enabling after a pause moves the start forward; edits that keep it off don't set it
+  const paused = AutomationRule.hydrate({ _id: '507f1f77bcf86cd799439013', name: 'Old', enabled: false, enabledAt: new Date('2026-01-01') });
+  setEnabledAt.call(paused);
+  assert.equal(paused.enabledAt.toISOString(), '2026-01-01T00:00:00.000Z');
+  paused.enabled = true;
+  setEnabledAt.call(paused);
+  assert.ok(paused.enabledAt.getTime() >= before);
+});
+
 test('rules respect media scope, trigger type and enabled flag', () => {
   const specific = { ...baseRule, mediaScope: 'specific', mediaIds: ['42'] };
   assert.equal(ruleMatchesComment(specific, { mediaId: '42', text: 'link' }), true);
