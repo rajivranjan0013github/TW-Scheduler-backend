@@ -100,6 +100,7 @@ export const markAccountReauthRequired = async (account, reason = 'Reauthorizati
     tokenStatus: 'reauth_required',
     tokenRefreshError: reason,
     tokenLastCheckedAt: new Date(),
+    ...(account.platform === 'youtube' ? { providerDataDeletionPendingAt: new Date() } : {}),
   };
 
   if (typeof account.set === 'function') {
@@ -231,7 +232,7 @@ const refreshYoutubeAuthorizedData = async (account) => {
 
 export const ensureFreshAccountToken = async (account, { force = false } = {}) => {
   if (!account || account.accessToken?.startsWith('mock-')) return account;
-  if (account.isConnected === false) {
+  if (account.isConnected === false || account.providerDataDeletionPendingAt) {
     throw new Error(`Account "${account.name}" requires reauthorization.`);
   }
 
@@ -242,7 +243,7 @@ export const ensureFreshAccountToken = async (account, { force = false } = {}) =
       const freshAccount = force || status !== 'healthy'
         ? await refreshYoutubeToken(account)
         : await markAccountHealthy(account);
-      return refreshYoutubeAuthorizedData(freshAccount);
+      return await refreshYoutubeAuthorizedData(freshAccount);
     }
 
     if (account.platform === 'instagram' && account.authProvider === 'instagram') {

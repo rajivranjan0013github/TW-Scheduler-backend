@@ -17,6 +17,8 @@ import { connectRedis } from './src/config/redis.js';
 import { initQueue } from './src/queues/publisherQueue.js';
 import { initWorker, publishPostJob } from './src/queues/publisherWorker.js';
 import { initAutomationQueue } from './src/queues/automationQueue.js';
+import { startEngagementRetention } from './src/services/engagementRetentionService.js';
+import { startRevokedAccountCleanup } from './src/services/revokedAccountCleanupService.js';
 
 // Import route files
 import authRoutes from './src/routes/auth.js';
@@ -217,10 +219,13 @@ export const startServer = async () => {
   // 2. Connect Redis
   connectRedis();
 
+  await startEngagementRetention();
+
   // 3. Initialize background worker & queue engines
   await initQueue();
   initWorker();
   await initAutomationQueue();
+  await startRevokedAccountCleanup();
   startCreatorAutoCheckInterval();
 
   // 4. Listen on PORT

@@ -1,4 +1,5 @@
 import SocialComment from '../models/SocialComment.js';
+import { youtubeEngagementExpiry } from '../utils/engagementRetention.js';
 
 export const markParentReplied = (account, parentId) => SocialComment.updateOne(
   { socialAccountId: account._id, commentId: parentId },
@@ -25,6 +26,7 @@ export const recordOwnReply = async (account, { commentId, parentId, mediaId = '
         commentedAt,
         isOwn: true,
         unseen: false,
+        ...youtubeEngagementExpiry(account.platform),
       },
     },
     { upsert: true }

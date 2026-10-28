@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import Media from '../models/Media.js';
 import Campaign from '../models/Campaign.js';
+import User from '../models/User.js';
 
 import Folder from '../models/Folder.js';
 
@@ -267,6 +268,16 @@ export const analyzeMediaVideo = async (mediaId, { mode: explicitMode = null, ca
   if (!media) {
     console.warn(`[videoAiService] Media ${mediaId} not found.`);
     return null;
+  }
+
+  // Creators (account handlers) are not offered AI features, so their uploads are never sent to Gemini
+  const uploader = await User.findById(media.userId).select('userType').lean();
+  if (uploader?.userType === 'account_handler') {
+    if (media.aiStatus === 'processing') {
+      media.aiStatus = 'none';
+      await media.save().catch(() => {});
+    }
+    return media;
   }
 
   if (!apiKey) {

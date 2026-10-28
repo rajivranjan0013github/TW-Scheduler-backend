@@ -68,6 +68,18 @@ const stubModels = ({ user = null, accounts = [] } = {}) => {
 
 const ids = (filter) => JSON.stringify(filter);
 
+test('a failed dependent deletion keeps the account reference available for retry', async () => {
+  const accountId = new mongoose.Types.ObjectId();
+  const { deletes, restore } = stubModels({ accounts: [{ _id: accountId, platform: 'youtube' }] });
+  try {
+    SocialComment.deleteMany = async () => { throw new Error('Temporary database failure'); };
+    await assert.rejects(purgeSocialAccounts([accountId], { revokeProviderAccess: false }), /Temporary database failure/);
+    assert.equal(deletes.has('SocialAccount'), false, 'Account reference must survive a partial purge');
+  } finally {
+    restore();
+  }
+});
+
 test('disconnecting a social account erases its comments, DMs and automation data', async () => {
   const accountId = new mongoose.Types.ObjectId();
   const { deletes, restore } = stubModels({ accounts: [{ _id: accountId, platform: 'instagram' }] });

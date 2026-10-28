@@ -37,6 +37,10 @@ const UserSchema = new mongoose.Schema({
     type: String,
     select: false,
   },
+  policyConsent: {
+    version: String,
+    acceptedAt: Date,
+  },
 }, {
   timestamps: true,
   toJSON: {

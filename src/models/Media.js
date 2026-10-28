@@ -100,11 +100,15 @@ const MediaSchema = new mongoose.Schema({
     default: '',
     index: true,
   },
+  // Defaults keep single-file saves (video editor, carousel sets, folder covers)
+  // sorting by recency alongside batch uploads.
   uploadBatchCreatedAt: {
     type: Date,
+    default: Date.now,
   },
   uploadOrder: {
     type: Number,
+    default: 0,
   },
   tags: [String],
   size: {

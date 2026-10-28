@@ -59,6 +59,11 @@ const SocialAccountSchema = new mongoose.Schema({
   tokenLastCheckedAt: {
     type: Date,
   },
+  providerDataDeletionPendingAt: {
+    type: Date,
+    default: null,
+    index: true,
+  },
   providerDataRefreshedAt: {
     type: Date,
     default: null,

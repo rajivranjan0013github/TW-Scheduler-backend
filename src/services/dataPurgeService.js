@@ -23,6 +23,7 @@ import User from '../models/User.js';
 import { deleteFile, getStorageKeyFromUrl } from './r2Service.js';
 import { revokeMetaPermissions } from './metaService.js';
 import { revokeYoutubeToken } from './youtubeService.js';
+import { purgeQueuedAutomations } from '../queues/automationQueue.js';
 
 const uniqueStrings = (values = []) => [...new Set(values.map(String).filter(Boolean))];
 const anyOf = (clauses) => (clauses.length ? { $or: clauses } : { _id: null });
@@ -91,6 +92,10 @@ export const purgeSocialAccounts = async (accountIds = [], { revokeProviderAcces
   const persistedIds = accounts.map((account) => account._id);
   if (persistedIds.length === 0) return { accountsDeleted: 0, revocationFailures: 0 };
 
+  // Stop new automation work and finish active jobs before erasing their records.
+  await SocialAccount.updateMany({ _id: { $in: persistedIds } }, { $set: { isConnected: false } });
+  await purgeQueuedAutomations(accounts);
+
   const channelIds = await CampaignChannel.find({
     socialAccountId: { $in: persistedIds },
   }).distinct('_id');
@@ -125,8 +130,10 @@ export const purgeSocialAccounts = async (accountIds = [], { revokeProviderAcces
       { socialAccountIds: { $in: persistedIds } },
       { $pull: { socialAccountIds: { $in: persistedIds } } },
     ),
-    SocialAccount.deleteMany({ _id: { $in: persistedIds } }),
   ]);
+  // Keep the account reference until every dependent deletion succeeds, so retries
+  // can still locate records after a partial failure.
+  await SocialAccount.deleteMany({ _id: { $in: persistedIds } });
 
   return {
     accountsDeleted: persistedIds.length,
@@ -143,6 +150,8 @@ export const purgeUserData = async (userId, { revokeProviderAccess = true } = {}
     Campaign.find({ createdBy: userId }).select('_id iconUrl screenshots').lean(),
   ]);
   const accountIds = accounts.map((account) => account._id);
+  await SocialAccount.updateMany({ _id: { $in: accountIds } }, { $set: { isConnected: false } });
+  await purgeQueuedAutomations(accounts);
   const ownedCampaignIds = ownedCampaigns.map((campaign) => campaign._id);
   const media = await Media.find({
     $or: [
@@ -212,7 +221,6 @@ export const purgeUserData = async (userId, { revokeProviderAccess = true } = {}
         ...(accountIds.length ? [{ socialAccountId: { $in: accountIds } }] : []),
         ...(ownedCampaignIds.length ? [{ campaignId: { $in: ownedCampaignIds } }] : []),
     ])),
-    SocialAccount.deleteMany({ userId }),
   ]);
 
   await CampaignChannel.updateMany(
@@ -264,6 +272,7 @@ export const purgeUserData = async (userId, { revokeProviderAccess = true } = {}
   if (ownedCampaignIds.length) {
     await Campaign.deleteMany({ _id: { $in: ownedCampaignIds } });
   }
+  await SocialAccount.deleteMany({ userId });
   await User.deleteOne({ _id: userId });
 
   return {

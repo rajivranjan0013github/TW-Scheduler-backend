@@ -11,6 +11,8 @@ import { protect } from '../middleware/auth.js';
 import { storeRemoteAvatarForUser } from '../services/avatarStorageService.js';
 import { purgeSocialAccounts, purgeUserData } from '../services/dataPurgeService.js';
 import DataDeletionRequest, { hashDeletionCode } from '../models/DataDeletionRequest.js';
+import { LEGAL_POLICY_VERSION } from '../config/legalPolicy.js';
+import { recordPolicyConsent } from '../services/policyConsentService.js';
 
 const router = express.Router();
 
@@ -134,6 +136,24 @@ router.get('/me', protect, (req, res) => {
   res.status(200).json(req.user);
 });
 
+// Acceptance is explicit, versioned, and recorded for the authenticated user only.
+router.post('/policy-consent', protect, async (req, res) => {
+  if (!getDBStatus()) return res.status(503).json({ message: 'Policy acceptance is temporarily unavailable. Please try again.' });
+  if (req.get('x-handler-preview-user-id')) {
+    return res.status(403).json({ message: 'Sign in as yourself to accept the updated policies.' });
+  }
+  if (req.body?.version !== LEGAL_POLICY_VERSION || req.body?.accepted !== true) {
+    return res.status(400).json({ message: 'Review the current Privacy Policy and Terms and confirm your acceptance.', policyVersion: LEGAL_POLICY_VERSION });
+  }
+  try {
+    const user = await recordPolicyConsent(req.user._id, req.body);
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    return res.status(200).json(user);
+  } catch {
+    return res.status(500).json({ message: 'Could not save your acceptance. Please try again.' });
+  }
+});
+
 // @desc    Update current user details
 // @route   PUT /api/auth/me
 // @access  Private
@@ -151,6 +171,8 @@ router.put('/me', protect, async (req, res) => {
     }
 
     if (name) user.name = name;
+    // New accounts can only finish onboarding as a creator; other user types are assigned internally.
+    if (!user.userType && req.body.userType === 'account_handler') user.userType = 'account_handler';
     if (avatar) {
       user.avatar = avatar;
       await storeRemoteAvatarForUser(user, avatar);

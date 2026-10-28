@@ -4,6 +4,7 @@ import SocialComment from '../models/SocialComment.js';
 import { withAccount } from './socialProviders/index.js';
 import { COMMENT_SCOPE } from './socialProviders/youtube.js';
 import { recordOwnReply } from './ownReplyStore.js';
+import { youtubeEngagementExpiry } from '../utils/engagementRetention.js';
 
 // Comments can show up in the API a little after their publish time; re-check this window each poll
 const POLL_OVERLAP_MS = 10 * 60 * 1000;
@@ -42,11 +43,13 @@ export const collectNewYoutubeComments = async (account, threads, { lastPolledAt
             platform: 'youtube',
             mediaId: item.mediaId || thread.mediaId,
             parentId: item.parentId || '',
-            text: item.text.slice(0, 2200),
+            text: item.text.slice(0, 10000),
+            commenterId: item.fromId || '',
             username: item.username,
             name: '',
             commentedAt,
             unseen: isNew,
+            ...youtubeEngagementExpiry('youtube'),
           },
         },
         { upsert: true }

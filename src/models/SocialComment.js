@@ -29,6 +29,8 @@ const SocialCommentSchema = new mongoose.Schema({
     type: String,
     default: '',
   },
+  commenterId: { type: String, default: '' },
+  youtubeDataExpiresAt: { type: Date },
   // Instagram @handle; empty on Facebook, which only exposes a display name
   username: {
     type: String,
@@ -60,5 +62,6 @@ const SocialCommentSchema = new mongoose.Schema({
 
 SocialCommentSchema.index({ socialAccountId: 1, commentId: 1 }, { unique: true });
 SocialCommentSchema.index({ socialAccountId: 1, commentedAt: -1 });
+SocialCommentSchema.index({ youtubeDataExpiresAt: 1 }, { expireAfterSeconds: 0 });
 
 export default mongoose.models.SocialComment || mongoose.model('SocialComment', SocialCommentSchema);

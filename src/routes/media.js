@@ -1542,6 +1542,10 @@ router.post('/upload', protect, resolveHandlerPreview, authorize('owner', 'admin
       .populate('socialAccountIds', 'name username platform avatarUrl isConnected');
 
     if (mediaType === 'video') {
+      if (!thumbnailUrl) {
+        // Buffer extraction failed; retry in the background from the stored URL
+        ensureMediaThumbnail(media._id).catch(() => { });
+      }
       media.aiStatus = 'processing';
       await media.save();
       const explicitMode = aiMode === 'app_showcase' || aiMode === 'reaction' ? aiMode : undefined;

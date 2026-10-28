@@ -8,7 +8,11 @@ import AutomationRule from '../models/AutomationRule.js';
 import AutomationEvent from '../models/AutomationEvent.js';
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
+import User from '../models/User.js';
+import { currentPolicyConsentFilter } from '../config/legalPolicy.js';
+import { requireCurrentPolicyConsent } from '../middleware/policyConsent.js';
 import SocialComment from '../models/SocialComment.js';
+import { visibleEngagementFilter } from '../utils/engagementRetention.js';
 import { recordOwnReply, syncRecentComments } from '../services/commentFeedService.js';
 import {
   getReplyWindowClosesAt,
@@ -43,8 +47,9 @@ const sendProviderError = (res, req, error) => {
 const MAX_KEYWORDS = 30;
 const MAX_REPLIES = 10;
 const MAX_MEDIA_IDS = 100;
+const PRIVATE_REPLY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
-router.use(protect, resolveHandlerPreview, (req, res, next) => {
+router.use(protect, resolveHandlerPreview, requireCurrentPolicyConsent, (req, res, next) => {
   if (!getDBStatus()) {
     return res.status(503).json({ message: 'Database disconnected.' });
   }
@@ -62,7 +67,7 @@ const getManageableAccountQuery = async (req) => {
   }).select('socialAccountId').lean();
   const assignedIds = assignedChannels.map((channel) => channel.socialAccountId).filter(Boolean);
 
-  return {
+  const accessible = {
     platform: { $in: AUTOMATION_PLATFORMS },
     isConnected: true,
     $or: [
@@ -70,6 +75,9 @@ const getManageableAccountQuery = async (req) => {
       { _id: { $in: assignedIds } },
     ],
   };
+  const ownerIds = await SocialAccount.distinct('userId', accessible);
+  const consentingOwnerIds = await User.distinct('_id', { _id: { $in: ownerIds }, ...currentPolicyConsentFilter() });
+  return { ...accessible, userId: { $in: consentingOwnerIds } };
 };
 
 const findManageableAccount = async (req, accountId) => {
@@ -245,6 +253,11 @@ router.post('/comments/:commentId/dm', async (req, res) => {
     if (await AutomationEvent.exists({ ...eventFilter, dmStatus: 'sent' })) {
       return res.status(409).json({ message: 'A DM was already sent for this comment.' });
     }
+    // Private replies are only allowed within 7 days of the comment; comments we haven't stored are left to the platform
+    const storedComment = await SocialComment.findOne({ socialAccountId: account._id, commentId }).select('commentedAt').lean();
+    if (storedComment?.commentedAt && Date.now() - new Date(storedComment.commentedAt).getTime() >= PRIVATE_REPLY_WINDOW_MS) {
+      return res.status(400).json({ message: 'DMs can only be sent within 7 days of the comment.' });
+    }
 
     await sendPrivateReply(account, commentId, message);
     await AutomationEvent.findOneAndUpdate(
@@ -285,7 +298,7 @@ router.get('/comments/recent', async (req, res) => {
     if (!accountIds) return res.status(404).json({ message: 'Account not found.' });
     const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
 
-    const feedFilter = { socialAccountId: { $in: accountIds }, isOwn: { $ne: true } };
+    const feedFilter = { socialAccountId: { $in: accountIds }, isOwn: { $ne: true }, ...visibleEngagementFilter() };
     const [comments, unseenCount] = await Promise.all([
       SocialComment.find(feedFilter).sort({ commentedAt: -1 }).limit(limit).lean(),
       SocialComment.countDocuments({ ...feedFilter, unseen: true }),
@@ -294,6 +307,7 @@ router.get('/comments/recent', async (req, res) => {
     // The account's own replies, shown inside the thread of the comment they answer
     const threadIdOf = (comment) => comment.parentId || comment.commentId;
     const ownReplies = await SocialComment.find({
+      ...visibleEngagementFilter(),
       socialAccountId: { $in: accountIds },
       isOwn: true,
       parentId: { $in: [...new Set(comments.map(threadIdOf))] },
@@ -569,7 +583,7 @@ router.get('/events', async (req, res) => {
   try {
     const accountIds = await getManageableAccountIds(req);
     const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
-    const filter = { socialAccountId: { $in: accountIds } };
+    const filter = { socialAccountId: { $in: accountIds }, ...visibleEngagementFilter() };
     if (req.query.ruleId && mongoose.isValidObjectId(req.query.ruleId)) filter.ruleId = req.query.ruleId;
     const events = await AutomationEvent.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
     res.status(200).json(events);

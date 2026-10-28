@@ -1,7 +1,11 @@
 import AutomationRule from '../models/AutomationRule.js';
 import AutomationEvent from '../models/AutomationEvent.js';
+import SocialAccount from '../models/SocialAccount.js';
+import SocialComment from '../models/SocialComment.js';
+import { visibleEngagementFilter, youtubeEngagementExpiry } from '../utils/engagementRetention.js';
 import { ensureFreshAccountToken, handleProviderAuthFailure } from './tokenHealthService.js';
 import { findAccountsForEntry, getOwnIds, getProvider, supportsDm } from './socialProviders/index.js';
+import { hasAccountPolicyConsent } from './policyConsentService.js';
 
 const normalizeText = (value) => String(value || '').toLowerCase().normalize('NFKC');
 
@@ -34,7 +38,7 @@ const pickRandom = (items) => items[Math.floor(Math.random() * items.length)];
  * Handles one incoming comment: finds the first matching enabled rule for each account
  * that owns the commented post, replies publicly and/or sends a private reply DM.
  */
-export const processComment = async (comment) => {
+export const processComment = async (comment, { socialAccountId } = {}) => {
   // Replies inside a thread (including our own public replies) never trigger automations
   if (comment.parentId) return { handled: 0, reason: 'reply_comment' };
 
@@ -43,6 +47,7 @@ export const processComment = async (comment) => {
   let handled = 0;
 
   for (const account of accounts) {
+    if (socialAccountId && String(account._id) !== String(socialAccountId)) continue;
     if ([...getOwnIds(account), comment.entryId].includes(comment.fromId)) continue;
 
     const rules = await AutomationRule.find({ socialAccountId: account._id, enabled: true }).sort({ createdAt: 1 });
@@ -56,6 +61,7 @@ export const processComment = async (comment) => {
         userId: rule.userId,
         socialAccountId: account._id,
         platform,
+        ...youtubeEngagementExpiry(platform),
         commentId: comment.commentId,
         mediaId: comment.mediaId,
         commenterId: comment.fromId,
@@ -118,4 +124,27 @@ export const processComment = async (comment) => {
   }
 
   return { handled };
+};
+
+// Queue payloads contain only record references, never comment text or profiles.
+export const processStoredComment = async ({ socialAccountId, socialCommentId } = {}) => {
+  if (!socialAccountId || !socialCommentId) return { handled: 0 };
+  const account = await SocialAccount.findOne({ _id: socialAccountId, isConnected: true });
+  if (!account) return { handled: 0 };
+  if (!await hasAccountPolicyConsent(account)) return { handled: 0, reason: 'policy_consent_required' };
+  const comment = await SocialComment.findOne({
+    _id: socialCommentId, socialAccountId, ...visibleEngagementFilter(),
+  });
+  if (!comment || comment.isOwn) return { handled: 0 };
+  return processComment({
+    platform: account.platform,
+    entryId: String(account.accountId),
+    commentId: comment.commentId,
+    parentId: comment.parentId,
+    mediaId: comment.mediaId,
+    text: comment.text,
+    fromId: comment.commenterId,
+    fromUsername: comment.username,
+    fromName: comment.name,
+  }, { socialAccountId });
 };

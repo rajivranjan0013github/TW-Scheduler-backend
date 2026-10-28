@@ -16,6 +16,7 @@ import PostMetricSnapshot from '../models/PostMetricSnapshot.js';
 import PostMetricDailySnapshot from '../models/PostMetricDailySnapshot.js';
 import { recordStoredMetricSnapshots, healStaleSyncStatuses } from '../queues/metricSyncWorker.js';
 import { protect, authorize, resolveHandlerPreview } from '../middleware/auth.js';
+import { requireCurrentPolicyConsent } from '../middleware/policyConsent.js';
 import { getYoutubeAuthUrl, exchangeYoutubeCodeForAccount, fetchYoutubeVideos } from '../services/youtubeService.js';
 import { purgeSocialAccounts } from '../services/dataPurgeService.js';
 import { findUnassignedAccounts, assertAccountNotAssignedElsewhere } from '../services/unassignedChannelService.js';
@@ -269,19 +270,29 @@ const providerAccountMatches = (existingAccount, accountPayload) => {
 };
 
 const saveConnectedAccount = async ({ reauthorizationAccount, filter, payload }) => {
+  // Do not let a reconnect revive a record that privacy cleanup is deleting.
+  // A fresh connection can be created after the old authorized data is erased.
+  const existing = reauthorizationAccount || (payload.platform === 'youtube' ? await SocialAccount.findOne(filter) : null);
+  if (existing?.platform === 'youtube' && (existing.providerDataDeletionPendingAt || (existing.isConnected === false && existing.tokenStatus === 'reauth_required'))) {
+    const error = new Error('We are removing data for the revoked YouTube connection. Please try connecting again in a few minutes.');
+    error.statusCode = 409;
+    throw error;
+  }
   if (reauthorizationAccount) {
-    return SocialAccount.findByIdAndUpdate(
-      reauthorizationAccount._id,
+    const account = await SocialAccount.findOneAndUpdate(
+      { _id: reauthorizationAccount._id, ...(payload.platform === 'youtube' ? { providerDataDeletionPendingAt: null } : {}) },
       {
         ...payload,
         userId: reauthorizationAccount.userId,
       },
       { returnDocument: 'after', runValidators: true }
     );
+    if (!account) throw new Error('The channel connection changed. Please start connecting again.');
+    return account;
   }
 
   return SocialAccount.findOneAndUpdate(
-    filter,
+    { ...filter, ...(payload.platform === 'youtube' ? { providerDataDeletionPendingAt: null } : {}) },
     payload,
     { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true, runValidators: true }
   );
@@ -1278,7 +1289,7 @@ router.get('/insights', protect, async (req, res) => {
 // @desc    Get YouTube OAuth URL
 // @route   GET /api/accounts/youtube/auth-url
 // @access  Private (Owner, Admin)
-router.get('/youtube/auth-url', protect, resolveHandlerPreview, async (req, res) => {
+router.get('/youtube/auth-url', protect, resolveHandlerPreview, requireCurrentPolicyConsent, async (req, res) => {
   try {
     const redirectUri = process.env.YOUTUBE_REDIRECT_URI || 'https://thousandpost.com/auth/youtube/callback';
     const state = await createOAuthState({
@@ -1298,7 +1309,7 @@ router.get('/youtube/auth-url', protect, resolveHandlerPreview, async (req, res)
 // @desc    Get Facebook OAuth URL
 // @route   GET /api/accounts/facebook/auth-url
 // @access  Private (Owner, Admin)
-router.get('/facebook/auth-url', protect, resolveHandlerPreview, async (req, res) => {
+router.get('/facebook/auth-url', protect, resolveHandlerPreview, requireCurrentPolicyConsent, async (req, res) => {
   try {
     const appId = process.env.META_APP_ID;
     const redirectUri = process.env.META_REDIRECT_URI || 'https://thousandpost.com/auth/facebook/callback';
@@ -1337,7 +1348,7 @@ router.get('/facebook/auth-url', protect, resolveHandlerPreview, async (req, res
 // @desc    Get Instagram OAuth URL
 // @route   GET /api/accounts/instagram/auth-url
 // @access  Private (Owner, Admin)
-router.get('/instagram/auth-url', protect, resolveHandlerPreview, async (req, res) => {
+router.get('/instagram/auth-url', protect, resolveHandlerPreview, requireCurrentPolicyConsent, async (req, res) => {
   try {
     const appId = process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID;
     let redirectUri = process.env.INSTAGRAM_REDIRECT_URI || 'https://thousandpost.com/auth/instagram/callback';
@@ -1376,7 +1387,7 @@ router.get('/instagram/auth-url', protect, resolveHandlerPreview, async (req, re
 // @desc    Callback from YouTube OAuth to connect a channel
 // @route   POST /api/accounts/youtube-callback
 // @access  Private (Owner, Admin)
-router.post('/youtube-callback', protect, resolveHandlerPreview, async (req, res) => {
+router.post('/youtube-callback', protect, resolveHandlerPreview, requireCurrentPolicyConsent, async (req, res) => {
   const { code, state } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
@@ -1470,7 +1481,7 @@ router.delete('/:id', protect, resolveHandlerPreview, async (req, res) => {
 // @desc    Callback from Facebook OAuth to connect accounts
 // @route   POST /api/accounts/facebook-callback
 // @access  Private (Owner, Admin)
-router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, res) => {
+router.post('/facebook-callback', protect, resolveHandlerPreview, requireCurrentPolicyConsent, async (req, res) => {
   const { code, state } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });
@@ -1736,7 +1747,7 @@ router.post('/facebook-callback', protect, resolveHandlerPreview, async (req, re
 // @desc    Callback from Instagram OAuth to connect a professional Instagram account directly
 // @route   POST /api/accounts/instagram-callback
 // @access  Private (Owner, Admin)
-router.post('/instagram-callback', protect, resolveHandlerPreview, async (req, res) => {
+router.post('/instagram-callback', protect, resolveHandlerPreview, requireCurrentPolicyConsent, async (req, res) => {
   const { code, state } = req.body;
   if (!code) {
     return res.status(400).json({ message: 'Authorization code is required' });

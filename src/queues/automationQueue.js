@@ -1,9 +1,15 @@
 import { Queue, Worker } from 'bullmq';
 import { getRedisConnection } from '../config/redis.js';
 import { getDBStatus } from '../config/db.js';
-import { processComment } from '../services/commentAutomationService.js';
+import { processComment, processStoredComment } from '../services/commentAutomationService.js';
 import { pollYoutubeComments } from '../services/youtubeCommentPoller.js';
 import { isBackgroundSyncEnabled } from './publisherQueue.js';
+import SocialAccount from '../models/SocialAccount.js';
+import SocialComment from '../models/SocialComment.js';
+import { findAccountsForEntry, getOwnIds } from '../services/socialProviders/index.js';
+import { removeAutomationJobsForAccounts } from '../services/automationJobPrivacy.js';
+
+const localJobs = new Set();
 
 let automationQueue = null;
 let automationWorker = null;
@@ -60,14 +66,25 @@ export const initAutomationQueue = async () => {
     defaultJobOptions: {
       attempts: 3,
       backoff: { type: 'exponential', delay: 10000 },
-      removeOnComplete: { age: 24 * 3600, count: 5000 },
-      removeOnFail: { age: 7 * 24 * 3600, count: 5000 },
+      removeOnComplete: true,
+      removeOnFail: true,
     },
   });
 
-  automationWorker = new Worker('comment-automation-queue', async (job) => (
-    processComment(job.data.comment)
-  ), {
+  // Remove retained payloads left by previous versions before accepting new work.
+  for (const job of await automationQueue.getJobs(['completed', 'failed'])) {
+    if (job) await job.remove();
+  }
+
+  automationWorker = new Worker('comment-automation-queue', async (job) => {
+    if (!job.data.comment) return processStoredComment(job.data);
+    // Allow already queued legacy work to finish, then erase its raw payload.
+    try {
+      return await processComment(job.data.comment);
+    } finally {
+      await job.updateData({});
+    }
+  }, {
     connection,
     concurrency: Math.max(1, Number(process.env.AUTOMATION_CONCURRENCY) || 3),
     // Stay well under Meta's messaging limits across all accounts
@@ -80,19 +97,47 @@ export const initAutomationQueue = async () => {
 };
 
 export const enqueueComment = async (comment) => {
-  if (automationQueue) {
-    // jobId dedupes Meta's webhook retries before they ever reach the worker
-    await automationQueue.add('comment', { comment }, {
-      jobId: `${comment.platform || 'instagram'}-comment-${comment.commentId}`,
-      delay: getHumanizedDelayMs(),
-    });
-    return;
-  }
-
   if (!getDBStatus()) return;
-  setTimeout(() => {
-    processComment(comment).catch((error) => {
-      console.error(`[Automation] Comment ${comment.commentId} failed:`, error.message);
-    });
-  }, getHumanizedDelayMs());
+  if (comment.parentId) return;
+  const accounts = await findAccountsForEntry(comment.platform || 'instagram', comment.entryId);
+  for (const account of accounts) {
+    if (getOwnIds(account).includes(comment.fromId)) continue;
+    const stored = await SocialComment.findOne({ socialAccountId: account._id, commentId: comment.commentId }).select('_id');
+    if (!stored || !await SocialAccount.exists({ _id: account._id, isConnected: true })) continue;
+    const data = { socialAccountId: String(account._id), socialCommentId: String(stored._id) };
+    if (automationQueue) {
+      await automationQueue.add('comment', data, {
+        jobId: `comment-${stored._id}`,
+        delay: getHumanizedDelayMs(),
+      });
+      // Cover a disconnect that raced with insertion into Redis.
+      if (!await SocialAccount.exists({ _id: account._id, isConnected: true })) {
+        await removeAutomationJobsForAccounts(automationQueue, [account]);
+      }
+      continue;
+    }
+    const localJob = { data, timer: null, running: null };
+    localJobs.add(localJob);
+    localJob.timer = setTimeout(() => {
+      localJob.timer = null;
+      localJob.running = processStoredComment(data)
+        .catch((error) => console.error('[Automation] Comment processing failed:', error.message))
+        .finally(() => localJobs.delete(localJob));
+    }, getHumanizedDelayMs());
+  }
+};
+
+export const purgeQueuedAutomations = async (accounts) => {
+  const accountIds = new Set(accounts.map((account) => String(account._id)));
+  const running = [];
+  for (const job of localJobs) {
+    if (!accountIds.has(job.data.socialAccountId)) continue;
+    if (job.timer) {
+      clearTimeout(job.timer);
+      localJobs.delete(job);
+    }
+    if (job.running) running.push(job.running);
+  }
+  await Promise.all(running);
+  await removeAutomationJobsForAccounts(automationQueue, accounts);
 };
