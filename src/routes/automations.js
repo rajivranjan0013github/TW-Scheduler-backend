@@ -23,28 +23,21 @@ import {
   fetchMediaComments,
   fetchRecentMedia,
   hasAutomationScopes,
-  hasCurrentWebhookSubscription,
   isValidObjectId,
   replyToComment,
   sendPrivateReply,
   subscribeAccountToWebhooks,
   supportsDm,
 } from '../services/socialProviders/index.js';
+import {
+  applyRuleUpdate,
+  buildRulePayload,
+  sendProviderError,
+  serializeAccount,
+} from '../services/automationRules.js';
 
 const router = express.Router();
 
-/**
- * Meta / YouTube rejected the call. Answered with 424 rather than 502: proxies like nginx and
- * Cloudflare replace 502 bodies with their own error page, which hides the provider's reason.
- */
-const sendProviderError = (res, req, error) => {
-  console.error(`[Automations] ${req.method} ${req.path} failed:`, error.message, error.data?.error || '');
-  res.status(error.statusCode && error.statusCode < 500 ? error.statusCode : 424).json({ message: error.message });
-};
-
-const MAX_KEYWORDS = 30;
-const MAX_REPLIES = 10;
-const MAX_MEDIA_IDS = 100;
 const PRIVATE_REPLY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 router.use(protect, resolveHandlerPreview, (req, res, next) => {
@@ -84,59 +77,6 @@ const findManageableAccount = async (req, accountId) => {
 const getManageableAccountIds = async (req) => (
   (await SocialAccount.find(await getManageableAccountQuery(req)).select('_id').lean()).map((account) => account._id)
 );
-
-const cleanStringList = (value, { max, maxLength }) => (
-  Array.isArray(value) ? value : []
-)
-  .map((item) => String(item ?? '').trim().slice(0, maxLength))
-  .filter(Boolean)
-  .filter((item, index, list) => list.indexOf(item) === index)
-  .slice(0, max);
-
-// YouTube has no DMs, so rules there can only reply publicly
-const buildRulePayload = (body = {}, platform = 'instagram') => {
-  const canDm = supportsDm(platform);
-  const payload = {
-    name: String(body.name || '').trim().slice(0, 120),
-    enabled: body.enabled !== false,
-    mediaScope: body.mediaScope === 'specific' ? 'specific' : 'all',
-    mediaIds: cleanStringList(body.mediaIds, { max: MAX_MEDIA_IDS, maxLength: 64 }),
-    triggerType: body.triggerType === 'any' ? 'any' : 'keywords',
-    keywords: cleanStringList(body.keywords, { max: MAX_KEYWORDS, maxLength: 60 }),
-    commentReplies: cleanStringList(body.commentReplies, { max: MAX_REPLIES, maxLength: 300 }),
-    sendDm: canDm && Boolean(body.sendDm),
-    dmMessage: canDm ? String(body.dmMessage || '').trim().slice(0, 1000) : '',
-  };
-
-  if (!payload.name) return { error: 'Give the automation a name.' };
-  if (payload.mediaScope === 'specific' && payload.mediaIds.length === 0) {
-    return { error: 'Pick at least one post, or apply the automation to all posts.' };
-  }
-  if (payload.triggerType === 'keywords' && payload.keywords.length === 0) {
-    return { error: 'Add at least one keyword, or trigger on every comment.' };
-  }
-  if (payload.sendDm && !payload.dmMessage) return { error: 'Write the DM message.' };
-  if (!payload.sendDm && payload.commentReplies.length === 0) {
-    return { error: canDm ? 'Add a comment reply or turn on the DM.' : 'Add at least one comment reply.' };
-  }
-  return { payload };
-};
-
-const serializeAccount = (account) => ({
-  _id: account._id,
-  platform: account.platform,
-  name: account.name,
-  username: account.username,
-  avatarUrl: account.avatarUrl,
-  tokenStatus: account.tokenStatus,
-  hasAutomationScopes: hasAutomationScopes(account),
-  supportsDm: supportsDm(account.platform),
-  // Accounts subscribed before DMs were added must subscribe again to receive messages.
-  // Polled platforms (YouTube) have nothing to subscribe to, so they are ready once connected.
-  subscribedAt: hasCurrentWebhookSubscription(account)
-    ? account.metadata?.automationSubscribedAt || account.createdAt
-    : null,
-});
 
 // @desc    Instagram accounts and Facebook Pages available for automation, with readiness status
 // @route   GET /api/automations/accounts
@@ -523,6 +463,8 @@ router.post('/rules', async (req, res) => {
     const rule = await AutomationRule.create({
       ...payload,
       userId: req.user._id,
+      // In an admin preview req.user is the handler; record the admin who actually made it
+      createdBy: req.authenticatedUser?._id || req.user._id,
       socialAccountId: account._id,
       platform: account.platform,
     });
@@ -546,14 +488,8 @@ router.patch('/rules/:id', async (req, res) => {
     const rule = await findManageableRule(req);
     if (!rule) return res.status(404).json({ message: 'Automation not found.' });
 
-    const keys = Object.keys(req.body || {});
-    if (keys.length === 1 && keys[0] === 'enabled') {
-      rule.enabled = Boolean(req.body.enabled);
-    } else {
-      const { payload, error } = buildRulePayload({ ...rule.toObject(), ...req.body }, rule.platform);
-      if (error) return res.status(400).json({ message: error });
-      rule.set(payload);
-    }
+    const { error } = applyRuleUpdate(rule, req.body || {}, req.authenticatedUser?._id || req.user._id);
+    if (error) return res.status(400).json({ message: error });
     await rule.save();
     res.status(200).json(rule);
   } catch (error) {

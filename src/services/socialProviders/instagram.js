@@ -63,12 +63,27 @@ const normalizeComment = (comment) => ({
   timestamp: comment.timestamp || null,
 });
 
+// Nested replies (and the /replies edge) come back without an author; only a direct read has it
+const fillReplyAuthors = (replies, accessToken) => Promise.all(replies.map(async (reply) => {
+  if (reply.username || reply.from?.id) return;
+  try {
+    const data = await graphRequest(`${reply.id}?fields=username,from{id,username}`, { accessToken });
+    reply.username = data.username;
+    reply.from = data.from;
+  } catch {
+    // Left without an author, the reply is treated as someone else's
+  }
+}));
+
 export const fetchMediaComments = async (account, mediaId, limit) => {
+  const accessToken = account.getDecryptedAccessToken();
   const data = await graphRequest(
     `${mediaId}/comments?fields=id,text,username,from{id,username},timestamp,replies{id,text,username,from{id,username},timestamp}&limit=${limit}`,
-    { accessToken: account.getDecryptedAccessToken() }
+    { accessToken }
   );
-  return (data.data || []).map((comment) => ({
+  const comments = data.data || [];
+  await fillReplyAuthors(comments.flatMap((comment) => comment.replies?.data || []), accessToken);
+  return comments.map((comment) => ({
     ...normalizeComment(comment),
     replies: (comment.replies?.data || []).map(normalizeComment),
   }));

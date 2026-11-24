@@ -2,6 +2,7 @@ import jwt from 'jsonwebtoken';
 import { getDBStatus } from '../config/db.js';
 import { mockStore } from '../models/mockStore.js';
 import User from '../models/User.js';
+import { canPreviewHandler } from '../services/handlerPreviewAccess.js';
 
 export const protect = async (req, res, next) => {
   let token;
@@ -63,6 +64,9 @@ export const resolveHandlerPreview = async (req, res, next) => {
     }
     if (previewUser.userType !== 'account_handler') {
       return res.status(400).json({ message: 'The selected user is not an account handler.' });
+    }
+    if (isConnected && !(await canPreviewHandler(authenticatedUser, previewUser))) {
+      return res.status(403).json({ message: 'You can only preview handlers who work in your campaigns.' });
     }
 
     req.authenticatedUser = authenticatedUser;

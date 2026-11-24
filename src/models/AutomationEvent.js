@@ -66,6 +66,8 @@ const AutomationEventSchema = new mongoose.Schema({
 // Meta retries webhook deliveries, so a comment must only ever be handled once per account
 AutomationEventSchema.index({ platform: 1, socialAccountId: 1, commentId: 1 }, { unique: true });
 AutomationEventSchema.index({ userId: 1, createdAt: -1 });
+// Admin activity views filter by the accounts in scope
+AutomationEventSchema.index({ socialAccountId: 1, createdAt: -1 });
 AutomationEventSchema.index({ youtubeDataExpiresAt: 1 }, { expireAfterSeconds: 0 });
 
 export default mongoose.models.AutomationEvent || mongoose.model('AutomationEvent', AutomationEventSchema);

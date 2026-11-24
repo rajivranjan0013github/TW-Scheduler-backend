@@ -74,6 +74,17 @@ const AutomationRuleSchema = new mongoose.Schema({
   lastTriggeredAt: {
     type: Date,
   },
+  // Who created / last changed the rule. Differs from userId when an admin manages it.
+  createdBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null,
+  },
+  updatedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null,
+  },
 }, { timestamps: true });
 
 AutomationRuleSchema.pre('save', function setEnabledAt() {

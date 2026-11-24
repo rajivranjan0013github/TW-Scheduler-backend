@@ -50,13 +50,37 @@ const normalizeComment = (comment) => ({
   timestamp: comment.created_time || null,
 });
 
+const commentsPath = (postId, limit, fields) => (
+  `${postId}/comments?filter=toplevel&order=reverse_chronological&limit=${limit}`
+    + `&fields=${fields},comments.limit(25){${fields}}`
+);
+
+// Meta withholds `from` for some commenters, and then fails the whole list with #100
+const isWithheldFieldError = (error) => error?.data?.error?.code === 100;
+
+// Looks up `from` one comment at a time, leaving it out where Meta withholds it
+const fillCommenters = async (comments, accessToken) => {
+  const items = comments.flatMap((comment) => [comment, ...(comment.comments?.data || [])]);
+  await Promise.all(items.map(async (item) => {
+    try {
+      item.from = (await graphRequest(`${item.id}?fields=from{id,name}`, { accessToken })).from;
+    } catch (error) {
+      if (!isWithheldFieldError(error)) throw error;
+    }
+  }));
+};
+
 export const fetchMediaComments = async (account, postId, limit) => {
-  const data = await graphRequest(
-    `${postId}/comments?filter=toplevel&order=reverse_chronological&limit=${limit}`
-      + '&fields=id,message,from{id,name},created_time,comments.limit(25){id,message,from{id,name},created_time}',
-    { accessToken: account.getDecryptedAccessToken() }
-  );
-  return (data.data || []).map((comment) => ({
+  const accessToken = account.getDecryptedAccessToken();
+  let comments;
+  try {
+    comments = (await graphRequest(commentsPath(postId, limit, 'id,message,from{id,name},created_time'), { accessToken })).data || [];
+  } catch (error) {
+    if (!isWithheldFieldError(error)) throw error;
+    comments = (await graphRequest(commentsPath(postId, limit, 'id,message,created_time'), { accessToken })).data || [];
+    await fillCommenters(comments, accessToken);
+  }
+  return comments.map((comment) => ({
     ...normalizeComment(comment),
     replies: (comment.comments?.data || []).map(normalizeComment),
   }));

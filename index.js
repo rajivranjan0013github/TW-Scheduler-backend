@@ -30,6 +30,7 @@ import aiRoutes from './src/routes/ai.js';
 import bulkAgentRoutes from './src/routes/bulkAgent.js';
 import webhookRoutes from './src/routes/webhooks.js';
 import automationRoutes from './src/routes/automations.js';
+import adminAutomationRoutes from './src/routes/adminAutomations.js';
 import { protect } from './src/middleware/auth.js';
 import ScheduledPost from './src/models/ScheduledPost.js';
 import rateLimit from 'express-rate-limit';
@@ -158,6 +159,8 @@ app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/accounts', oauthLimiter, accountRoutes);
 app.use('/api/media', mediaRoutes);
 app.use('/api/scheduler', schedulerRoutes);
+// Mounted before /api/admin so its own auth runs first for these paths
+app.use('/api/admin/automations', adminAutomationRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/bulk-agent', bulkAgentRoutes);

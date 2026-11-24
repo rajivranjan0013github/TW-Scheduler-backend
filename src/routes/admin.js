@@ -19,6 +19,7 @@ import { healStaleSyncStatuses } from '../queues/metricSyncWorker.js';
 import { requestAccountSync } from '../queues/publisherQueue.js';
 import { ensureDefaultCampaignFolders } from '../services/campaignFolderService.js';
 import { purgeUserData } from '../services/dataPurgeService.js';
+import { getCampaignAccessQuery } from '../utils/campaignAccess.js';
 
 const router = express.Router();
 const VALID_ROLES = ['owner', 'admin', 'editor', 'viewer'];
@@ -29,18 +30,6 @@ const dateTimeFormatters = new Map();
 
 const toKey = (value) => value?.toString();
 const normalizeEmail = (email = '') => email.trim().toLowerCase();
-
-const getCampaignAccessQuery = (req, { forceWorkspaceScope = false } = {}) => {
-  if (req.user?.role === 'owner' && !forceWorkspaceScope) return {};
-
-  const userEmail = normalizeEmail(req.user?.email || '');
-  return {
-    $or: [
-      { mainEmail: userEmail },
-      { createdBy: req.user._id },
-    ],
-  };
-};
 
 const findAccessibleCampaign = (req, campaignId) => {
   return Campaign.findOne({

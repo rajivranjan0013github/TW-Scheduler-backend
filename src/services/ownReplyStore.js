@@ -16,16 +16,19 @@ export const recordOwnReply = async (account, { commentId, parentId, mediaId = '
   await SocialComment.updateOne(
     { socialAccountId: account._id, commentId: String(commentId) },
     {
+      // $set also repairs a reply stored earlier as someone else's comment (its author was missing then)
+      $set: {
+        username: account.username || '',
+        name: account.name || '',
+        isOwn: true,
+        unseen: false,
+      },
       $setOnInsert: {
         platform: account.platform,
         mediaId,
         parentId: String(parentId),
         text: String(text || '').slice(0, 2200),
-        username: account.username || '',
-        name: account.name || '',
         commentedAt,
-        isOwn: true,
-        unseen: false,
         ...youtubeEngagementExpiry(account.platform),
       },
     },
