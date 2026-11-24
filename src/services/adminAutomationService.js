@@ -133,6 +133,25 @@ export const buildEventFilter = (accountIds, { status, ruleId, before } = {}, no
   return filter;
 };
 
+/**
+ * Comments feed filters: others' comments only, status (unreplied | replied), a text or
+ * commenter search `q`, and `before` (commentedAt cursor for paging).
+ */
+export const buildCommentFilter = (accountIds, { status, q, before } = {}, now = new Date()) => {
+  const conditions = [visibleEngagementFilter(now)];
+  const search = String(q || '').trim().slice(0, 100);
+  if (search) {
+    const pattern = { $regex: escapeRegex(search), $options: 'i' };
+    conditions.push({ $or: [{ text: pattern }, { username: pattern }, { name: pattern }] });
+  }
+  const filter = { socialAccountId: { $in: accountIds }, isOwn: { $ne: true }, $and: conditions };
+  if (status === 'unreplied') filter.ownerReplied = { $ne: true };
+  if (status === 'replied') filter.ownerReplied = true;
+  const beforeDate = before ? new Date(before) : null;
+  if (beforeDate && !Number.isNaN(beforeDate.getTime())) filter.commentedAt = { $lt: beforeDate };
+  return filter;
+};
+
 const countIf = (field, value) => ({ $sum: { $cond: [{ $eq: [`$${field}`, value] }, 1, 0] } });
 
 const eventStats = async (accountIds, since, now) => {

@@ -5,6 +5,8 @@ import { protect, authorize } from '../middleware/auth.js';
 import AutomationRule from '../models/AutomationRule.js';
 import AutomationEvent from '../models/AutomationEvent.js';
 import SocialAccount from '../models/SocialAccount.js';
+import SocialComment from '../models/SocialComment.js';
+import { visibleEngagementFilter } from '../utils/engagementRetention.js';
 import { fetchRecentMedia } from '../services/socialProviders/index.js';
 import {
   applyRuleUpdate,
@@ -13,6 +15,7 @@ import {
   serializeAccount,
 } from '../services/automationRules.js';
 import {
+  buildCommentFilter,
   buildEventFilter,
   buildRuleFilter,
   cleanAccountIds,
@@ -250,6 +253,76 @@ router.get('/events', async (req, res) => {
     res.status(200).json({
       events: events.map((event) => ({ ...event, ruleName: namesById.get(toKey(event.ruleId)) || '' })),
       nextBefore: events.length === limit ? events[events.length - 1].createdAt : null,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @desc    Comments others left on every account in scope, newest first, read-only.
+//          Paged with ?before=<timestamp of the last item>. Doesn't clear the handlers' "new" marks.
+// @route   GET /api/admin/automations/comments?campaignId&handlerId&accountId&platform&status&q&before&limit
+// @access  Private (Owner, Admin)
+router.get('/comments', async (req, res) => {
+  try {
+    const { accounts } = await loadScopedAccounts(req);
+    const accountIds = accounts.map((account) => account._id);
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
+    const comments = await SocialComment.find(buildCommentFilter(accountIds, req.query))
+      .sort({ commentedAt: -1 })
+      .limit(limit)
+      .lean();
+
+    // The account's own replies, shown inside the thread of the comment they answer
+    const threadIdOf = (comment) => comment.parentId || comment.commentId;
+    const ownReplies = comments.length ? await SocialComment.find({
+      ...visibleEngagementFilter(),
+      socialAccountId: { $in: accountIds },
+      isOwn: true,
+      parentId: { $in: [...new Set(comments.map(threadIdOf))] },
+    }).sort({ commentedAt: 1 }).lean() : [];
+    const repliesFor = (comment) => ownReplies
+      .filter((reply) => (
+        toKey(reply.socialAccountId) === toKey(comment.socialAccountId)
+        && reply.parentId === threadIdOf(comment)
+        && (!comment.parentId || new Date(reply.commentedAt) >= new Date(comment.commentedAt))
+      ))
+      .map((reply) => ({ id: reply.commentId, text: reply.text, timestamp: reply.commentedAt }));
+
+    // Which automation (if any) answered each comment
+    const events = comments.length ? await AutomationEvent.find({
+      socialAccountId: { $in: accountIds },
+      commentId: { $in: comments.map((comment) => comment.commentId) },
+    }).select('socialAccountId commentId ruleId replyStatus dmStatus').lean() : [];
+    const ruleIds = [...new Set(events.map((event) => toKey(event.ruleId)).filter(Boolean))];
+    const rules = ruleIds.length ? await AutomationRule.find({ _id: { $in: ruleIds } }).select('name').lean() : [];
+    const ruleNames = new Map(rules.map((rule) => [toKey(rule._id), rule.name]));
+    const eventsByComment = new Map(events.map((event) => [`${event.socialAccountId}:${event.commentId}`, event]));
+
+    res.status(200).json({
+      comments: comments.map((comment) => {
+        const event = eventsByComment.get(`${comment.socialAccountId}:${comment.commentId}`);
+        return {
+          id: comment.commentId,
+          socialAccountId: comment.socialAccountId,
+          platform: comment.platform,
+          mediaId: comment.mediaId,
+          parentId: comment.parentId,
+          text: comment.text,
+          username: comment.username,
+          name: comment.name,
+          timestamp: comment.commentedAt,
+          ownerReplied: comment.ownerReplied,
+          dmSent: event?.dmStatus === 'sent',
+          automation: event ? {
+            ruleName: ruleNames.get(toKey(event.ruleId)) || '',
+            replyStatus: event.replyStatus,
+            dmStatus: event.dmStatus,
+          } : null,
+          replies: repliesFor(comment),
+        };
+      }),
+      nextBefore: comments.length === limit ? comments[comments.length - 1].commentedAt : null,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });

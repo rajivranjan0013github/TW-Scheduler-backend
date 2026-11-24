@@ -10,6 +10,7 @@ import { authorize } from '../src/middleware/auth.js';
 import { requireAdminCampaign, requireAdminPanelUser } from '../src/routes/adminAutomations.js';
 import { applyRuleUpdate } from '../src/services/automationRules.js';
 import {
+  buildCommentFilter,
   buildEventFilter,
   buildRuleFilter,
   cleanAccountIds,
@@ -261,3 +262,23 @@ test('the whole batch is refused when the form does not work for one account', (
   assert.equal(paused.docs[0].enabledAt, undefined);
 });
 
+
+test('comment feed filter: others\' comments in scope, status, search and paging', () => {
+  const accountIds = [id()];
+  const now = new Date('2026-01-10T00:00:00Z');
+  const base = buildCommentFilter(accountIds, {}, now);
+  assert.deepEqual(base.socialAccountId, { $in: accountIds });
+  assert.deepEqual(base.isOwn, { $ne: true });
+  assert.equal(base.ownerReplied, undefined);
+  assert.equal(base.$and.length, 1);
+
+  assert.deepEqual(buildCommentFilter(accountIds, { status: 'unreplied' }, now).ownerReplied, { $ne: true });
+  assert.equal(buildCommentFilter(accountIds, { status: 'replied' }, now).ownerReplied, true);
+
+  const searched = buildCommentFilter(accountIds, { q: ' a.b ' }, now);
+  assert.deepEqual(searched.$and[1].$or[0], { text: { $regex: 'a\\.b', $options: 'i' } });
+
+  const paged = buildCommentFilter(accountIds, { before: '2026-01-05T00:00:00Z' }, now);
+  assert.deepEqual(paged.commentedAt, { $lt: new Date('2026-01-05T00:00:00Z') });
+  assert.equal(buildCommentFilter(accountIds, { before: 'nope' }, now).commentedAt, undefined);
+});
